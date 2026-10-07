@@ -86,6 +86,19 @@ export const uploadCatalogueImage = async (folder, file) => {
   return { url: uploaded.url, path: uploaded.path };
 };
 
+/**
+ * Save one product picture (bytes) in the public bucket under a stable name, so the same picture is stored only once.
+ * @returns {Promise<string>} its public URL
+ */
+export const uploadPublicImage = async (folder, name, buffer, mime) => {
+  if (!/^image\/(png|jpe?g|webp|gif)$/.test(mime)) throw new Error('Unsupported picture type.');
+  const ext = mime.split('/')[1].replace('jpeg', 'jpg');
+  const path = `${folder}/${name}.${ext}`;
+  const { error } = await supabaseAdmin.storage.from(BUCKET).upload(path, buffer, { contentType: mime, upsert: true });
+  if (error) throw new Error(`Upload failed: ${error.message}`);
+  return supabaseAdmin.storage.from(BUCKET).getPublicUrl(path).data.publicUrl;
+};
+
 /** Best-effort delete from a bucket; never throws (a leftover file is harmless). */
 export const removeStoredFile = async (bucket, path) => {
   if (!path) return;

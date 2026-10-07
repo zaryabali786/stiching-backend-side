@@ -29,8 +29,8 @@ const html = `
 <p>Order number: <b>SP-482913</b></p>
 <table>
   <tr><th>Item</th><th>Qty</th><th>Price</th></tr>
-  <tr><td><a href="https://pk.sapphireonline.pk/products/embroidered-lawn-3-piece">Embroidered Lawn Suit 3 Piece - U3PE-24</a></td><td>2</td><td>Rs. 8,990</td></tr>
-  <tr><td>Printed Cambric Shirt 2 Piece - 2PDY-11</td><td>1</td><td>Rs. 5,490</td></tr>
+  <tr><td><img src="https://picsum.photos/seed/lawn-suit/300/400.jpg" width="120" alt="Embroidered Lawn Suit 3 Piece"><br><a href="https://pk.sapphireonline.pk/products/embroidered-lawn-3-piece">Embroidered Lawn Suit 3 Piece - U3PE-24</a></td><td>2</td><td>Rs. 8,990</td></tr>
+  <tr><td><img src="https://picsum.photos/seed/cambric-shirt/300/400.jpg" width="120" alt="Printed Cambric Shirt 2 Piece"><br>Printed Cambric Shirt 2 Piece - 2PDY-11</td><td>1</td><td>Rs. 5,490</td></tr>
   <tr><td>Shipping</td><td></td><td>Rs. 250</td></tr>
   <tr><td><b>Total</b></td><td></td><td><b>Rs. 23,720</b></td></tr>
 </table>`;

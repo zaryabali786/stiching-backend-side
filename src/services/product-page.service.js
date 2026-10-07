@@ -91,6 +91,48 @@ const safeGet = async (raw, accept = 'text/html,application/xhtml+xml') => {
   throw new Error('Too many redirects.');
 };
 
+const IMAGE_TYPES = /^image\/(jpeg|png|webp|gif)$/;
+
+/**
+ * Download one picture from a public web address (same safety rules as product pages: public hosts only, redirects
+ * re-checked, size capped).
+ * @returns {Promise<{ buffer: Buffer, mime: string }>}
+ */
+export const downloadImage = async (raw, maxBytes = 6 * 1024 * 1024) => {
+  let current = raw;
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    const url = await assertPublicUrl(current);
+    const res = await fetch(url, {
+      redirect: 'manual',
+      headers: { 'user-agent': UA, accept: 'image/jpeg,image/png,image/webp,image/gif;q=0.9,*/*;q=0.1' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
+      current = new URL(res.headers.get('location'), url).toString();
+      continue;
+    }
+    if (!res.ok) throw new Error(`The picture returned ${res.status}.`);
+    const mime = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!IMAGE_TYPES.test(mime)) throw new Error('That link is not a supported picture.');
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('The picture was empty.');
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error('The picture is too large.');
+      }
+      chunks.push(value);
+    }
+    return { buffer: Buffer.concat(chunks), mime };
+  }
+  throw new Error('Too many redirects.');
+};
+
 // ─────────── HTML parsing ───────────
 
 export const decodeEntities = (s = '') =>

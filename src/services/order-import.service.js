@@ -6,6 +6,7 @@ import { extractOrderWithAi, isAiConfigured, isAiReadable, normaliseExtracted } 
 import { brandFromHost, decodeEntities, readProductLink } from './product-page.service.js';
 import { isDocumentType, uploadDocumentBuffer, withSignedUrl } from './storage.service.js';
 import { notifyUser } from './notification.service.js';
+import { attachProductImages } from './email-images.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
 
 /**
@@ -242,7 +243,7 @@ export const normaliseInboundEmail = (b = {}) => {
       date: b.Date || null,
       mailboxHash: b.MailboxHash || null,
       messageId: b.MessageID || null,
-      attachments: (b.Attachments || []).map((a) => ({ name: a.Name, mime: String(a.ContentType || '').split(';')[0].toLowerCase(), base64: a.Content })),
+      attachments: (b.Attachments || []).map((a) => ({ name: a.Name, mime: String(a.ContentType || '').split(';')[0].toLowerCase(), base64: a.Content, cid: String(a.ContentID || '').replace(/^<|>$/g, '') })),
     };
   }
   return {
@@ -254,7 +255,7 @@ export const normaliseInboundEmail = (b = {}) => {
     date: b.date || null,
     mailboxHash: b.mailboxHash || null,
     messageId: b.messageId || b['message-id'] || null,
-    attachments: (b.attachments || []).map((a) => ({ name: a.filename || a.name, mime: String(a.contentType || a.content_type || a.type || '').split(';')[0].toLowerCase(), base64: a.content || a.data })),
+    attachments: (b.attachments || []).map((a) => ({ name: a.filename || a.name, mime: String(a.contentType || a.content_type || a.type || '').split(';')[0].toLowerCase(), base64: a.content || a.data, cid: String(a.cid || a.contentId || a.content_id || a['content-id'] || '').replace(/^<|>$/g, '') })),
   };
 };
 
@@ -524,6 +525,9 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
     extracted = basicEmailDraft(email, bodyText);
     error = 'We saved this email. Automatic product reading is not switched on yet — add the products by hand.';
   }
+
+  // product pictures: from the email, or from the products' own pages; saved with the order
+  if (extractedBy === 'ai' && extracted.items.length) await attachProductImages(userId, email, extracted);
 
   await updateImport(importId, { status, extracted, extracted_by: extractedBy, error, attachments: stored });
   emitTo(rooms.user(userId), 'mailbox:update', { id: inboxId });
