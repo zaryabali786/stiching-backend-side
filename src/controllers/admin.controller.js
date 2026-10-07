@@ -148,7 +148,8 @@ export const getAdminOrders = catchAsync(async (req, res) => {
   if (req.query.status && ORDER_STATUSES.includes(req.query.status)) query = query.eq('status', req.query.status);
   // the partner switcher wins over the filter box: it is the tenant the admin is working in
   const partnerFilter = activePartnerOf(req.access) || req.query.partner_id;
-  if (partnerFilter) query = query.eq('partner_id', partnerFilter);
+  if (partnerFilter === 'none') query = query.is('partner_id', null); // orders waiting for the admin to choose a partner
+  else if (partnerFilter) query = query.eq('partner_id', partnerFilter);
   if (q.search) query = query.or(ilikeAny(['reference', 'customer_name', 'customer_code', 'brand', 'brand_order_number', 'tracking_number'], q.search));
 
   const groups = ['awaiting_parcel', 'production', 'invoice', 'payment', 'warehouse', 'shipped'];

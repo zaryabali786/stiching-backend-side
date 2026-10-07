@@ -302,7 +302,10 @@ export const createClientOrder = catchAsync(async (req, res) => {
   }
 
   await addEvent(order.id, 'submitted', `Order created with ${units.length} article(s) from ${order.brand}`, req.userId);
-  await notifyStaff({
+  if (!order.partner_id) {
+    // manual mode (or no partner can take it): the admin must choose a partner before anyone can receive the parcel
+    await notifyAdmins({ type: 'alert', title: `New order ${order.reference} needs a partner`, body: `${order.customer_name} (${order.customer_code}) · ${units.length} article(s) from ${order.brand}. Choose which partner receives it.`, link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
+  } else await notifyStaff({
     type: 'order',
     title: `New order ${order.reference}`,
     body: `${order.customer_name} (${order.customer_code}) · ${units.length} article(s) from ${order.brand}${order.international_shipping ? ' · international (express)' : ' · local (standard)'}. Parcel expected${order.tracking_number ? ` · tracking ${order.tracking_number}` : ''}.`,

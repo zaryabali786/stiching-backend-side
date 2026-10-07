@@ -26,6 +26,8 @@ import {
   resetAdminPartnerUserPassword,
   deactivateAdminPartnerUser,
   assignOrderToPartner,
+  getOrderAssignment,
+  setOrderAssignment,
 } from '../controllers/admin-partners.controller.js';
 import {
   getPriceItems,
@@ -75,6 +77,8 @@ router.patch('/users/:id/active', setUserActive);
 
 // Partners & reports
 router.get('/permissions', getPermissionCatalogue);
+router.get('/settings/order-assignment', getOrderAssignment);
+router.put('/settings/order-assignment', setOrderAssignment);
 router.get('/partners', listPartners);
 router.post('/partners', createPartner);
 router.get('/partners/:id', getPartner);

@@ -7,7 +7,7 @@ import { invalidatePartner } from '../services/access.service.js';
 import { invalidatePartnerUsers } from '../middlewares/auth.middleware.js';
 import { getTeamWithLoad } from '../services/team.service.js';
 import { createUser, listUsers, updateUser, resetPassword, deactivateUser, USER_COLUMNS } from '../services/partner-users.service.js';
-import { notifyUser } from '../services/notification.service.js';
+import { notifyUser, notifyPartner } from '../services/notification.service.js';
 import { addEvent, getOrderOr404, STATUS_LABELS } from '../services/order.service.js';
 
 const actorOf = (req) => ({ profile: req.profile, access: req.access });
@@ -221,9 +221,38 @@ export const deactivateAdminPartnerUser = catchAsync(async (req, res) => {
 
 // ───────────────────────── orders <-> partners ─────────────────────────
 
+const ASSIGNMENT_MODES = ['auto', 'manual'];
+
+/** The current rule for new orders. Without the settings table (migration 0008 not run yet) it is 'auto'. */
+export const readAssignmentMode = async () => {
+  const { data, error } = await supabaseAdmin.from('platform_settings').select('value').eq('key', 'order_assignment').maybeSingle();
+  if (error) return 'auto';
+  return ASSIGNMENT_MODES.includes(data?.value?.mode) ? data.value.mode : 'auto';
+};
+
+const assignmentPayload = async () => {
+  const [mode, unassigned] = await Promise.all([
+    readAssignmentMode(),
+    supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).is('partner_id', null).not('status', 'in', '(delivered,cancelled)'),
+  ]);
+  return { mode, unassigned_orders: unassigned.count || 0 };
+};
+
+/** GET /api/admin/settings/order-assignment */
+export const getOrderAssignment = catchAsync(async (req, res) => ApiResponse.success(res, await assignmentPayload()));
+
+/** PUT /api/admin/settings/order-assignment  body: { mode: 'auto' | 'manual' }: applies to orders created from now on */
+export const setOrderAssignment = catchAsync(async (req, res) => {
+  const mode = req.body?.mode;
+  if (!ASSIGNMENT_MODES.includes(mode)) throw new BadRequestError("Mode must be 'auto' or 'manual'.");
+  const { error } = await supabaseAdmin.from('platform_settings').upsert({ key: 'order_assignment', value: { mode }, updated_by: req.userId, updated_at: new Date().toISOString() });
+  if (error) throw new BadRequestError('Could not save. Run the latest database update (0008) first.');
+  return ApiResponse.success(res, await assignmentPayload(), mode === 'auto' ? 'New orders now go to the least busy partner.' : 'New orders now wait for you to choose a partner.');
+});
+
 /**
  * POST /api/admin/orders/:id/partner  body: { partner_id }
- * Move an order that has not started production to another partner.
+ * Move an order that has not started production to another partner (or give an unassigned order its partner).
  */
 export const assignOrderToPartner = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.id);
@@ -239,5 +268,6 @@ export const assignOrderToPartner = catchAsync(async (req, res) => {
   }
   unwrap(await supabaseAdmin.from('orders').update({ partner_id: partner.id, updated_at: new Date().toISOString() }).eq('id', order.id));
   await addEvent(order.id, order.status, `Assigned to partner ${partner.name}`, req.userId);
+  await notifyPartner({ type: 'order', title: `New order ${order.reference}`, body: `${order.customer_name || 'A customer'} · assigned to ${partner.name}. Parcel expected.`, link: `/partner/receiving?search=${order.customer_code || order.reference}`, orderId: order.id, partnerId: partner.id }, req.userId, { module: 'receiving' });
   return ApiResponse.success(res, { partner_id: partner.id, partner_name: partner.name }, `Order ${order.reference} now belongs to ${partner.name}.`);
 });
