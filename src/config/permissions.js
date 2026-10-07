@@ -19,7 +19,8 @@ export const PARTNER_MODULES = [
   { id: 'warehouse', label: 'Warehouse', description: 'Dispatch route, direct shipping, transfers', actions: ['view', 'update'] },
   { id: 'teams', label: 'Teams', description: 'Masters and tailors, capacity', actions: ['view', 'update'] },
   { id: 'earnings', label: 'Earnings', description: 'What the partner earns per invoice', actions: ['view'] },
-  { id: 'messages', label: 'Messages', description: 'Chat with customers', actions: ['view', 'update'] },
+  { id: 'messages', label: 'Messages', description: 'Chat with customers about the articles of the partner’s own orders', actions: ['view', 'update'] },
+  { id: 'general_messages', label: 'General messages', description: 'Customer chats about the order itself (not tied to one article). Admin only unless the admin enables it', actions: ['view', 'update'] },
   { id: 'catalogue', label: 'Catalogue', description: 'Brands, couriers, article types and articles', actions: ['view', 'update'] },
   { id: 'users', label: 'Users', description: 'Create and manage the partner’s own users', actions: ['view', 'create', 'update'] },
 ];
@@ -41,6 +42,8 @@ export const normalizePermissions = (list) => {
   for (const p of list) {
     const [module, action] = p.split('.');
     if (action !== 'view') out.add(`${module}.view`);
+    // general chats are a part of Messages: without Messages there is nothing to open them from
+    if (module === 'general_messages') out.add(`messages.${action === 'update' ? 'update' : 'view'}`).add('messages.view');
   }
   return ALL_PERMISSIONS.filter((p) => out.has(p)); // stable order
 };

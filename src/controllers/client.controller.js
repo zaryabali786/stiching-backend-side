@@ -10,6 +10,7 @@ import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
 import { resolveOrderRefs, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
 import { createMessage } from '../services/chat.service.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
+import { linkImportToOrder } from '../services/order-import.service.js';
 import { readProductLink } from '../services/product-page.service.js';
 import { cleanMeasurements as cleanMeasurementsRaw, cleanNearestSize as cleanNearestRaw, sizeSnapshotOf, withSizeSnapshot } from '../utils/measurements.js';
 
@@ -96,7 +97,9 @@ export const getClientOverview = catchAsync(async (req, res) => {
     .select('id, reference, brand, status, created_at, packed_at, shipped_at, delivered_at, units:order_units!order_units_order_id_fkey(id, size_chart:size_charts(person_name, name))')
     .eq('customer_id', req.userId);
   if (period === 'year') q = q.gte('created_at', `${new Date().getUTCFullYear()}-01-01`);
-  const orders = unwrap(await q);
+  const allOrders = unwrap(await q);
+  const drafts = allOrders.filter((o) => o.status === 'draft');
+  const orders = allOrders.filter((o) => o.status !== 'draft');
 
   const finished = new Set(['packed', 'invoice_issued', 'awaiting_payment', 'paid', 'at_admin_warehouse', 'partner_dispatch', 'shipped', 'delivered']);
   const inProgress = new Set(STATUS_GROUPS.production);
@@ -148,6 +151,7 @@ export const getClientOverview = catchAsync(async (req, res) => {
       .slice(0, 5),
     actionNeeded: orders
       .filter((o) => ['awaiting_payment', 'invoice_issued', 'customer_approval'].includes(o.status))
+      .concat(drafts)
       .map((o) => ({ id: o.id, reference: o.reference, brand: o.brand, status: o.status, status_label: STATUS_LABELS[o.status] })),
     unreadNotifications: unread || 0,
   });
@@ -162,13 +166,14 @@ export const getClientOrders = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 10, sortable: ['created_at', 'reference'] });
   let query = supabaseAdmin
     .from('orders')
-    .select('id, reference, brand, brand_order_number, tracking_number, status, has_issue, created_at, destination_city, destination_country, units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
+    .select('id, reference, brand, brand_order_number, tracking_number, status, has_issue, import_source, created_at, destination_city, destination_country, units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
     .eq('customer_id', req.userId)
     .order(q.sort, { ascending: q.ascending })
     .range(q.from, q.to);
 
   const status = req.query.status;
-  if (status && STATUS_GROUPS[status]) query = query.in('status', STATUS_GROUPS[status]);
+  if (status === 'active') query = query.in('status', ['draft', ...STATUS_GROUPS.active]);
+  else if (status && STATUS_GROUPS[status]) query = query.in('status', STATUS_GROUPS[status]);
   else if (status && STATUS_LABELS[status]) query = query.eq('status', status);
   if (q.search) query = query.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
 
@@ -262,7 +267,7 @@ export const createClientOrder = catchAsync(async (req, res) => {
         customer_notes: note,
         priority: 'normal',
         due_date: due.toISOString().slice(0, 10),
-        destination_country: (body.destination_country || p.country || '').trim() || null,
+        destination_country: (body.destination_country || p.country || '').trim() || (refs.international_shipping === false ? 'Pakistan' : null),
         destination_city: (body.destination_city || p.city || '').trim() || null,
         destination_address: (body.destination_address || p.address || '').trim() || null,
       })
@@ -302,17 +307,26 @@ export const createClientOrder = catchAsync(async (req, res) => {
   }
 
   await addEvent(order.id, 'submitted', `Order created with ${units.length} article(s) from ${order.brand}`, req.userId);
+  await announceNewOrder(order, units.length, req.userId);
+  if (body.import_id) await linkImportToOrder(req.userId, order.id, body.import_id); // order made from an email / invoice / links draft
+
+  const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
+  return ApiResponse.created(res, await orderDetailResponse(full), `Order ${order.reference} created.`);
+});
+
+/** A new order (or a draft the customer just submitted) reaches the partner and admin, and the customer is told what to do next. */
+const announceNewOrder = async (order, unitsCount, userId) => {
   if (!order.partner_id) {
     // manual mode (or no partner can take it): the admin must choose a partner before anyone can receive the parcel
-    await notifyAdmins({ type: 'alert', title: `New order ${order.reference} needs a partner`, body: `${order.customer_name} (${order.customer_code}) · ${units.length} article(s) from ${order.brand}. Choose which partner receives it.`, link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
+    await notifyAdmins({ type: 'alert', title: `New order ${order.reference} needs a partner`, body: `${order.customer_name} (${order.customer_code}) · ${unitsCount} article(s) from ${order.brand}. Choose which partner receives it.`, link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
   } else await notifyStaff({
     type: 'order',
     title: `New order ${order.reference}`,
-    body: `${order.customer_name} (${order.customer_code}) · ${units.length} article(s) from ${order.brand}${order.international_shipping ? ' · international (express)' : ' · local (standard)'}. Parcel expected${order.tracking_number ? ` · tracking ${order.tracking_number}` : ''}.`,
+    body: `${order.customer_name} (${order.customer_code}) · ${unitsCount} article(s) from ${order.brand}${order.international_shipping ? ' · international (express)' : ' · local (standard)'}. Parcel expected${order.tracking_number ? ` · tracking ${order.tracking_number}` : ''}.`,
     link: { admin: `/admin/orders?ref=${order.reference}`, partner_staff: `/partner/receiving?search=${order.customer_code}` },
     orderId: order.id,
   }, null, { module: 'receiving' });
-  await notifyUser(req.userId, {
+  await notifyUser(userId, {
     type: 'order',
     title: `Order ${order.reference} created`,
     body: `Ship your parcel to our address with your code ${order.customer_code} on the label so we can match it.`,
@@ -320,9 +334,7 @@ export const createClientOrder = catchAsync(async (req, res) => {
     orderId: order.id,
   });
 
-  const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
-  return ApiResponse.created(res, await orderDetailResponse(full), `Order ${order.reference} created.`);
-});
+};
 
 /**
  * PATCH /api/client/orders/:id — editable only while the parcel has not arrived (status submitted).
@@ -330,11 +342,13 @@ export const createClientOrder = catchAsync(async (req, res) => {
  */
 export const updateClientOrder = catchAsync(async (req, res) => {
   const order = await loadOwnOrder(req);
-  if (order.status !== 'submitted') throw new ForbiddenError('This order can no longer be edited because the parcel has arrived.');
+  // a draft made from an email is completed here: saving it submits it, like a newly created order
+  const isDraft = order.status === 'draft';
+  if (order.status !== 'submitted' && !isDraft) throw new ForbiddenError('This order can no longer be edited because the parcel has arrived.');
   const body = req.body || {};
 
   const patch = {};
-  if (body.brand_id !== undefined || body.courier_id !== undefined || body.international_shipping !== undefined || body.tracking_number !== undefined) {
+  if (isDraft || body.brand_id !== undefined || body.courier_id !== undefined || body.international_shipping !== undefined || body.tracking_number !== undefined) {
     // validate the shipping block as a whole, filling gaps from the current order
     Object.assign(
       patch,
@@ -392,10 +406,22 @@ export const updateClientOrder = catchAsync(async (req, res) => {
       await saveUnitArticles(unitId, picks[i].rows);
     }
   }
-  await addEvent(order.id, 'submitted', 'Order details updated by customer', req.userId);
+  if (isDraft) {
+    const { count } = await supabaseAdmin.from('order_units').select('id', { count: 'exact', head: true }).eq('order_id', order.id);
+    if (!count) throw new BadRequestError('Add at least one article.');
+    // the partner is chosen by the database as the status leaves "draft" (Settings > Orders)
+    const submitted = unwrap(await supabaseAdmin.from('orders').update({ status: 'submitted', updated_at: new Date().toISOString() }).eq('id', order.id).eq('status', 'draft').select('*').single(), 'Could not submit the order');
+    await addEvent(order.id, 'submitted', `Draft submitted with ${count} article(s) from ${submitted.brand}`, req.userId);
+    if (submitted.customer_notes) {
+      await createMessage({ order: submitted, profile: req.profile, kind: 'text', body: submitted.customer_notes, clientMsgId: `order-note-${order.id}`, silent: true }).catch((err) => console.warn('[Order] note message failed:', err.message));
+    }
+    await announceNewOrder(submitted, count, req.userId);
+  } else {
+    await addEvent(order.id, 'submitted', 'Order details updated by customer', req.userId);
+  }
 
   const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
-  return ApiResponse.success(res, await orderDetailResponse(full), 'Order updated.');
+  return ApiResponse.success(res, await orderDetailResponse(full), isDraft ? `Order ${full.reference} submitted.` : 'Order updated.');
 });
 
 // ─────────────────────────────── Product link preview ───────────────────────────────
@@ -417,6 +443,17 @@ export const previewProduct = catchAsync(async (req, res) => {
 
   const r = await readProductLink(url);
   return ApiResponse.success(res, { url: r.url, ok: r.ok, title: r.title, image_url: r.image_url, brand: r.brand, error: r.error });
+});
+
+/**
+ * DELETE /api/client/orders/:id — discard a draft made from an email. The email's order draft becomes available again.
+ */
+export const deleteClientDraft = catchAsync(async (req, res) => {
+  const order = await loadOwnOrder(req);
+  if (order.status !== 'draft') throw new ForbiddenError('Only a draft can be discarded. Cancel a submitted order instead.');
+  await supabaseAdmin.from('order_imports').update({ status: 'ready', order_id: null, updated_at: new Date().toISOString() }).eq('order_id', order.id);
+  unwrap(await supabaseAdmin.from('orders').delete().eq('id', order.id).eq('status', 'draft'), 'Could not discard the draft');
+  return ApiResponse.success(res, null, 'Draft discarded.');
 });
 
 export const cancelClientOrder = catchAsync(async (req, res) => {

@@ -2,9 +2,10 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { AppError, BadRequestError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { unwrap } from '../utils/db.js';
 import { documentExists, signedDocumentUrl } from './storage.service.js';
-import { notifyUser, notifyAdmins, notifyPartner } from './notification.service.js';
+import { notifyUser, notifyAdmins, notifyPartner, partnerRecipients } from './notification.service.js';
 import { resolveAccess } from './access.service.js';
-import { emitTo, rooms } from '../realtime/io.js';
+import { loadProfile } from '../middlewares/auth.middleware.js';
+import { emitTo, getIO, rooms } from '../realtime/io.js';
 
 /**
  * Customer <-> partner conversation per order (text + voice).
@@ -43,16 +44,58 @@ export const assertConversationAccess = async (profile, orderId, { write = false
     const access = await resolveAccess(profile);
     if (!access.permissions.has(write ? 'messages.update' : 'messages.view')) throw new ForbiddenError('You do not have permission to use messages.');
     if (!access.partnerId || order.partner_id !== access.partnerId) throw new ForbiddenError('This order belongs to another partner.');
+    // chats about the order itself ("General") are for the admin unless the admin enabled them for this partner and user
+    order._general = { read: access.permissions.has('general_messages.view'), write: access.permissions.has('general_messages.update') };
   } else {
     throw new ForbiddenError('You cannot use order messages.');
   }
   return order;
 };
 
-/** Tell the admins and the order's own partner (never any other partner) that an inbox changed. */
-const emitToStaffOf = (order, event, payload) => {
+/** May this person read the General (not article-specific) chat of this order? Customers and admins always can. */
+export const canReadGeneral = (order, profile) => profile.role !== 'partner_staff' || order._general?.read === true;
+export const canWriteGeneral = (order, profile) => profile.role !== 'partner_staff' || order._general?.write === true;
+
+/** Hide General messages from a query on order_messages (partners without the General permission). */
+const withoutGeneral = (query) => query.not('unit_id', 'is', null);
+
+/**
+ * Deliver an event to the sockets of an order's conversation room, one by one, re-checking each person NOW:
+ * someone who joined earlier but has since lost the messages permission, or whose order moved to another partner,
+ * stops receiving. `general` events (not about one article) also need the General permission.
+ */
+const emitToConversation = async (order, event, payload, { general = false } = {}) => {
+  const io = getIO();
+  if (!io) return;
+  try {
+    const sockets = await io.in(rooms.order(order.id)).fetchSockets();
+    await Promise.all(
+      sockets.map(async (s) => {
+        const profile = await loadProfile(s.data.userId).catch(() => null);
+        if (!profile || profile.is_active === false) return;
+        if (profile.role === 'customer' && profile.id !== order.customer_id) return;
+        if (profile.role === 'partner_staff') {
+          const access = await resolveAccess(profile);
+          if (!access.partnerId || access.partnerId !== order.partner_id || !access.permissions.has('messages.view')) return;
+          if (general && !access.permissions.has('general_messages.view')) return;
+        }
+        s.emit(event, payload);
+      }),
+    );
+  } catch (err) {
+    console.warn('[Socket] conversation emit failed:', err.message);
+  }
+};
+
+/**
+ * Tell the admins and the people of the order's own partner who may read it (never another partner) that an inbox changed.
+ * Recipients are worked out now, per person, so a permission given or taken away takes effect immediately.
+ */
+const emitToStaffOf = async (order, event, payload, { general = false } = {}) => {
   emitTo(rooms.admins, event, payload);
-  if (order.partner_id) emitTo(rooms.partner(order.partner_id), event, payload);
+  if (!order.partner_id) return;
+  const people = await partnerRecipients(order.partner_id, general ? ['messages', 'general_messages'] : 'messages');
+  for (const p of people) emitTo(rooms.user(p.id), event, payload);
 };
 
 // ───────────────────────── rate limit ─────────────────────────
@@ -109,7 +152,7 @@ const scopeFilter = (query, unitId) => {
   return query.eq('unit_id', unitId);
 };
 
-export const listMessages = async (orderId, { limit = 30, before = null, unitId } = {}) => {
+export const listMessages = async (orderId, { limit = 30, before = null, unitId, general = true } = {}) => {
   const size = Math.min(100, Math.max(1, parseInt(limit, 10) || 30));
   let query = supabaseAdmin
     .from('order_messages')
@@ -118,6 +161,10 @@ export const listMessages = async (orderId, { limit = 30, before = null, unitId 
     .order('created_at', { ascending: false })
     .order('id', { ascending: false })
     .limit(size + 1);
+  if (!general) {
+    if (unitId === 'general') throw new ForbiddenError('General messages are only visible to the admin unless the admin enables them for you.');
+    query = withoutGeneral(query);
+  }
   query = scopeFilter(query, unitId);
   if (before) {
     const [at, id] = String(before).split('|');
@@ -173,7 +220,6 @@ const recentUnreadNotification = async ({ orderId, title, userId = null }) => {
 const notifyOtherSide = async (order, profile, message, unit) => {
   const title = `New message on ${order.reference}${unit ? ` · ${unit.unit_title}` : ''}`;
   if (profile.role === 'customer') {
-    if (await recentUnreadNotification({ orderId: order.id, title })) return;
     const q = unit ? `?unit=${unit.id}` : '';
     const note = {
       type: 'update',
@@ -182,9 +228,11 @@ const notifyOtherSide = async (order, profile, message, unit) => {
       link: { admin: `/admin/messages/${order.id}${q}`, partner_staff: `/partner/messages/${order.id}${q}` },
       orderId: order.id,
       partnerId: order.partner_id,
+      dedupe: true, // one unread "New message" per person and order is enough
     };
     // the admins, and only the people of the order's own partner who may read messages
-    await Promise.all([notifyAdmins(note), notifyPartner(note, null, { module: 'messages' })]);
+    // General chats also need the General permission
+    await Promise.all([notifyAdmins(note), notifyPartner(note, null, { module: unit ? 'messages' : ['messages', 'general_messages'] })]);
   } else if (!(await recentUnreadNotification({ orderId: order.id, title, userId: order.customer_id }))) {
     await notifyUser(order.customer_id, {
       type: 'update',
@@ -209,6 +257,7 @@ export const createMessage = async ({ order, profile, kind, body, audio, clientM
     if (!data) throw new BadRequestError('That article is not part of this order.');
     unit = data;
   }
+  if (!unit && !canWriteGeneral(order, profile)) throw new ForbiddenError('You can only message about an article. General messages are handled by the admin.');
   const clientId = clientMsgId ? String(clientMsgId).slice(0, 80) : null;
 
   const findExisting = async () => {
@@ -236,9 +285,10 @@ export const createMessage = async ({ order, profile, kind, body, audio, clientM
   }
 
   const message = await shapeMessage(insert.data);
-  emitTo(rooms.order(order.id), 'message:new', message);
+  const general = !unit;
+  await emitToConversation(order, 'message:new', message, { general });
   emitTo(rooms.user(order.customer_id), 'inbox:update', { orderId: order.id });
-  emitToStaffOf(order, 'inbox:update', { orderId: order.id });
+  await emitToStaffOf(order, 'inbox:update', { orderId: order.id }, { general });
   if (!silent) await notifyOtherSide(order, profile, message, unit).catch((err) => console.warn('[Chat] notify failed:', err.message));
   return { message, duplicate: false };
 };
@@ -249,16 +299,18 @@ export const createMessage = async ({ order, profile, kind, body, audio, clientM
 export const markConversationRead = async (order, profile, unitId) => {
   const fromRoles = profile.role === 'customer' ? ['partner_staff', 'admin'] : ['customer'];
   const readAt = new Date().toISOString();
-  const { data, error } = await scopeFilter(
-    supabaseAdmin.from('order_messages').update({ read_at: readAt }).eq('order_id', order.id).in('sender_role', fromRoles).is('read_at', null),
-    unitId
-  ).select('id');
+  const general = canReadGeneral(order, profile);
+  if (!general && unitId === 'general') throw new ForbiddenError('General messages are only visible to the admin unless the admin enables them for you.');
+  let update = supabaseAdmin.from('order_messages').update({ read_at: readAt }).eq('order_id', order.id).in('sender_role', fromRoles).is('read_at', null);
+  if (!general) update = withoutGeneral(update);
+  const { data, error } = await scopeFilter(update, unitId).select('id');
   if (error) throw new AppError(`Could not update messages: ${error.message}`, 500);
   const count = data?.length || 0;
   if (count) {
-    emitTo(rooms.order(order.id), 'message:read', { orderId: order.id, unitId: unitId && unitId !== 'general' && unitId !== 'all' ? unitId : null, general: unitId === 'general', readerRole: senderRole(profile), readAt, count });
+    const generalScope = unitId === 'general';
+    await emitToConversation(order, 'message:read', { orderId: order.id, unitId: unitId && unitId !== 'general' && unitId !== 'all' ? unitId : null, general: generalScope, readerRole: senderRole(profile), readAt, count }, { general: generalScope });
     emitTo(rooms.user(profile.id), 'inbox:update', { orderId: order.id });
-    if (isStaffRole(profile.role)) emitToStaffOf(order, 'inbox:update', { orderId: order.id });
+    if (isStaffRole(profile.role)) await emitToStaffOf(order, 'inbox:update', { orderId: order.id }, { general: generalScope });
   }
   return count;
 };
@@ -269,16 +321,19 @@ export const markConversationRead = async (order, profile, unitId) => {
  * Number of conversations that have a customer message nobody on staff has opened yet.
  * A partner only counts the conversations of its own orders (`partnerId`); an admin counts all.
  */
-export const unreadConversationCount = async (partnerId) => {
+export const unreadConversationCount = async (partnerId, { excludeGeneral = false } = {}) => {
   let query = supabaseAdmin.from('order_messages').select('order_id, order:orders!order_messages_order_id_fkey!inner(partner_id)').eq('sender_role', 'customer').is('read_at', null).limit(2000);
   if (partnerId) query = query.eq('order.partner_id', partnerId);
+  if (excludeGeneral) query = withoutGeneral(query);
   const { data } = await query;
   return new Set((data || []).map((r) => r.order_id)).size;
 };
 
-export const unreadByOrder = async (orderIds) => {
+export const unreadByOrder = async (orderIds, { excludeGeneral = false } = {}) => {
   if (!orderIds.length) return {};
-  const { data } = await supabaseAdmin.from('order_messages').select('order_id').in('order_id', orderIds).eq('sender_role', 'customer').is('read_at', null).limit(5000);
+  let query = supabaseAdmin.from('order_messages').select('order_id').in('order_id', orderIds).eq('sender_role', 'customer').is('read_at', null).limit(5000);
+  if (excludeGeneral) query = withoutGeneral(query);
+  const { data } = await query;
   const counts = {};
   for (const r of data || []) counts[r.order_id] = (counts[r.order_id] || 0) + 1;
   return counts;
@@ -290,9 +345,9 @@ export const unreadByOrder = async (orderIds) => {
  * The chats of one order: "General" plus one per article, each with its unread count and last message,
  * so the app can show tabs / a picker with badges.
  */
-const buildScopes = (units, rows, profile) => {
+const buildScopes = (units, rows, profile, { general = true } = {}) => {
   const fromRoles = profile.role === 'customer' ? ['partner_staff', 'admin'] : ['customer'];
-  const scopes = [{ unit_id: null, title: 'General', line_no: 0, image_url: null }, ...units.map((u) => ({ unit_id: u.id, title: u.unit_title, line_no: u.line_no, image_url: u.product_image_url || null }))];
+  const scopes = [...(general ? [{ unit_id: null, title: 'General', line_no: 0, image_url: null }] : []), ...units.map((u) => ({ unit_id: u.id, title: u.unit_title, line_no: u.line_no, image_url: u.product_image_url || null }))];
   return scopes.map((s) => {
     const mine = rows.filter((m) => (m.unit_id ?? null) === s.unit_id);
     const last = mine[0];
@@ -311,7 +366,10 @@ export const conversationScopes = async (order, profile) => {
     supabaseAdmin.from('order_units').select('id, unit_title, line_no, product_image_url').eq('order_id', order.id).order('line_no', { ascending: true }),
     supabaseAdmin.from('order_messages').select('unit_id, sender_role, read_at, kind, body, created_at').eq('order_id', order.id).order('created_at', { ascending: false }).limit(500),
   ]);
-  return buildScopes(unwrap(units, 'Could not load the articles'), unwrap(msgs, 'Could not load the conversations'), profile);
+  const general = canReadGeneral(order, profile);
+  // without the General permission the General chat is not offered and its messages are not even counted
+  const rows = unwrap(msgs, 'Could not load the conversations').filter((m) => general || m.unit_id);
+  return buildScopes(unwrap(units, 'Could not load the articles'), rows, profile, { general });
 };
 
 /** The customer's own orders that have any conversation, each with its chats (one query per table, not per order). */

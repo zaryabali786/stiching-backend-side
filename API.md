@@ -432,6 +432,22 @@ customer reviews it and submits `POST /orders` with `import_id`. The order then 
 - Product links are read from the page (JSON-LD / Open Graph / Shopify), with AI as a fallback when configured. Only public http(s) hosts are fetched.
 - Forwarded emails (Postmark): set `INBOUND_EMAIL_ADDRESS` (the server's inbound address, `<hash>@inbound.postmarkapp.com`) and `INBOUND_EMAIL_SECRET`. In Postmark → your server → Inbound stream → Settings, set the webhook URL to `https://inbound:<INBOUND_EMAIL_SECRET>@<public-api-host>/api/inbound/email`. Each customer's personal address is `<hash>+<token>@inbound.postmarkapp.com`. The customer is notified (link `/app/orders/new?import=<id>`) once the email has been read; Postmark retries are de-duplicated. Local test without Postmark: `npm run email:test -- customer@v360.test`.
 
+### Inbox: a personal shopping email for every customer (migration 0010)
+Every customer gets an address at sign-up (`profile.mailbox_address`, e.g. `a1b2c3d4e5f60718@mail.yourdomain.com`) to type at any shop's checkout. Everything sent there is stored and shown in the customer app's **Inbox**; order-like emails also get an order draft (an `order_imports` row, `source: 'email'`) that prefills `/app/orders/new?import=<id>`. Submitting that order with `import_id` marks the draft used.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/client/inbox?page&limit&unread=1&search=` | emails, newest first: `{ id, from, subject, preview, received_at, is_read, import_id, draft: { status, brand, items } \| null }`; `meta.unread` = unread total |
+| GET | `/client/inbox/address` | `{ address, enabled, unread }` (token created on first call) |
+| GET | `/client/inbox/unread-count` | `{ unread }` |
+| POST | `/client/inbox/read-all` | marks everything read |
+| GET | `/client/inbox/:id` | full email `{ …, text, html, draft: OrderImport \| null }`; marks it read |
+| DELETE | `/client/inbox/:id` | deletes the email (and its draft unless already used) |
+
+Socket.IO to the customer's `user:<id>` room: `mailbox:new { id, subject, from, import_id }` when an email arrives, `mailbox:update { id }` when its order draft has finished reading.
+
+Setup with your own domain (recommended): in the DNS of a **subdomain** such as `mail.yourdomain.com` add an MX record to the inbound provider (Postmark: `inbound.postmarkapp.com`, priority 10) and set the Postmark inbound domain to that subdomain; keep the root domain's MX (e.g. Titan) untouched. Then set `INBOUND_EMAIL_DOMAIN=mail.yourdomain.com` (plus `INBOUND_EMAIL_SECRET`) and the webhook URL as above. Without `INBOUND_EMAIL_DOMAIN`, addresses fall back to `<hash>+<token>@inbound.postmarkapp.com` (`INBOUND_EMAIL_ADDRESS`). Existing customers keep their token, so their address just changes shape. Only order-like emails (subject/body mentions an order, invoice, shipment, tracking …) are read by the AI; the rest stay in the Inbox only.
+
 `OrderDetail = Order & { status_label, units: Unit[] (sorted by line_no), events: [{id,status,note,created_at}], invoice: Invoice|null (issued/paid only, lines without partner_amount), shipment: Shipment|null, payments: Payment[] }`
 
 `Order` columns: `id, reference ('SA-1001'), customer_id, customer_name, customer_code, brand, brand_order_number, tracking_number, status, has_issue, customer_notes, admin_notes, destination_country, destination_city, destination_address, shipping_service, priority, due_date, weight_kg, import_source ('manual'|'invoice'|'link'|'email'), import_id, brand_order_total, brand_order_currency, brand_invoice (StoredFile; signed url in detail responses), partner_route, transfer_id, approval_photos:[{url,type,name}], change_request, received_at, packed_at, paid_at, shipped_at, delivered_at, created_at, updated_at`
@@ -571,3 +587,15 @@ can never switch tenant with it. Without the header an admin sees all partners.
 
 Partner users carry `staff_type`: `master`, `tailor` or `staff` (set with `staff_type` on `POST/PATCH /partner/users`).
 It is a label and a starting point for permissions; access is still `permissions`, always within the partner's modules.
+
+## Order messages: who sees what
+
+- A chat is either about one **article** (`unit_id`) or **General** (about the order itself, `unit_id` null).
+- A partner reads/writes only the chats of **its own orders**, and only with `messages.view` / `messages.update`.
+- **General** chats are admin-only. A partner (and each of its users) gets them only with `general_messages.view`
+  (`.update` to reply), which the admin enables per partner (Partners > Modules) and the partner then hands to its users.
+  Without it the API answers 403 for the General chat, hides it from scopes, the inbox, unread counts and previews, and the
+  socket never sends it.
+- Sockets are checked per person on every event (`message:new`, `message:read`, `inbox:update`), so a permission taken
+  away or an order moved to another partner stops delivery immediately, without reconnecting.
+- `notification:new` now carries the saved notification: `{ notification: { id, title, body, link, ... } }`.

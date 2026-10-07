@@ -6,6 +6,8 @@ import { identityFromCode, isGoogleEnabled } from '../services/google-auth.servi
 import { resolveAccess, accessPayload } from '../services/access.service.js';
 import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { randomBytes } from 'node:crypto';
+import { notifyAdmins } from '../services/notification.service.js';
+import { addressForToken, getForwardAddress } from '../services/order-import.service.js';
 
 const toTokens = (session) => ({
   tokenType: 'Bearer',
@@ -21,8 +23,45 @@ const toTokens = (session) => ({
  */
 const publicProfile = async (profile) => {
   const access = await resolveAccess(profile);
-  const { permissions: _stored, ...rest } = profile;
-  return { ...rest, ...accessPayload(profile, access) };
+  const { permissions: _stored, inbound_email_token: token, ...rest } = profile;
+  // Customers get a personal shopping address (their Inbox); the secret token itself is not sent on.
+  // One created before this feature existed gets theirs the first time they load their profile.
+  let mailbox = {};
+  if (profile.role === 'customer') {
+    let address = addressForToken(token);
+    if (!address) address = await getForwardAddress(profile.id).then((r) => r.address, () => null);
+    mailbox = { mailbox_address: address };
+  }
+  return { ...rest, ...mailbox, ...accessPayload(profile, access) };
+};
+
+/**
+ * First Google sign-in from the admin-side login: the person becomes the owner of a new partner of their own.
+ * The partner starts with NO modules, so it sees and receives nothing until an admin enables what it may use
+ * (Admin > Partners > Modules). An admin can also promote the person to Admin (Settings > Team & roles).
+ */
+const makeGooglePartner = async (profile, who) => {
+  const base = (who.name || who.email.split('@')[0]).trim().slice(0, 80) || 'New partner';
+  let partner = null;
+  for (const name of [base, `${base} (${randomBytes(2).toString('hex')})`, `${base} (${randomBytes(3).toString('hex')})`]) {
+    const { data, error } = await supabaseAdmin.from('partners').insert({ name, permissions: [], status: 'active', created_by: profile.id }).select('*').single();
+    if (!error) { partner = data; break; }
+    if (error.code !== '23505') throw error; // 23505 = that name is taken: try the next one
+  }
+  if (!partner) throw new BadRequestError('Could not set up your partner account. Please try again.');
+  const { data, error } = await supabaseAdmin
+    .from('profiles')
+    .update({ role: 'partner_staff', partner_id: partner.id, partner_role: 'owner', permissions: [], job_title: 'Owner', requested_role: null, must_change_password: false, updated_at: new Date().toISOString() })
+    .eq('id', profile.id)
+    .select('*')
+    .single();
+  if (error) {
+    await supabaseAdmin.from('partners').delete().eq('id', partner.id);
+    throw error;
+  }
+  invalidateProfile(profile.id);
+  await notifyAdmins({ type: 'alert', title: `New partner signed up: ${partner.name}`, body: `${who.email} signed in with Google and was created as a partner with no modules. Enable what they may use, or make them an admin.`, link: '/admin/partners' });
+  return data;
 };
 
 /** A partner user cannot sign in while their partner is switched off. */
@@ -30,6 +69,15 @@ const assertPartnerActive = async (profile) => {
   if (profile.role !== 'partner_staff') return;
   const access = await resolveAccess(profile);
   if (!access.partner || access.partner.status !== 'active') throw new ForbiddenError('Your partner account is switched off. Contact the platform admin.');
+};
+
+/** Every new customer gets a personal shopping address at sign-up. A failure must never block the sign-up (it is created on first Inbox visit instead). */
+const giveShoppingAddress = async (userId) => {
+  try {
+    await getForwardAddress(userId);
+  } catch (err) {
+    console.warn('[Auth] could not create the shopping address:', err.message);
+  }
 };
 
 const profileFromBody = (body) => ({
@@ -59,6 +107,7 @@ export const register = catchAsync(async (req, res) => {
     profile: profileFromBody(req.body),
   });
 
+  await giveShoppingAddress(user.id);
   const profile = await UserModel.getProfile(user.id);
   const { session } = await UserModel.authenticate({ email: email.trim().toLowerCase(), password });
   return ApiResponse.created(res, { user: await publicProfile(profile), tokens: session ? toTokens(session) : null }, 'Account created successfully.');
@@ -91,16 +140,17 @@ export const googleLogin = catchAsync(async (req, res) => {
   let profile = await UserModel.findProfileByEmail(who.email);
   let created = false;
   if (!profile) {
-    // staff accounts are created by an admin / a partner; only customers can start with Google
-    if (portal === 'staff') throw new ForbiddenError('There is no staff account for this Google email. Ask your admin or partner to create one.');
     // Google proves the email, so there is no password to ask for: set an unguessable one (they can use "forgot password" later)
     const user = await UserModel.create({
       email: who.email,
       password: randomBytes(32).toString('base64url'),
       profile: { full_name: who.name, avatar_url: who.picture },
     });
+    await giveShoppingAddress(user.id);
     profile = await UserModel.getProfile(user.id);
     created = true;
+    // Google from the admin-side login: a new person becomes a Partner (never an Admin, which only an admin can grant)
+    if (portal === 'staff') profile = await makeGooglePartner(profile, who);
   }
   if (profile.is_active === false) throw new UnauthorizedError('This account has been deactivated. Contact the platform admin.');
   await assertPartnerActive(profile);

@@ -11,6 +11,7 @@ export const ORDER_STATUSES = [
 ];
 
 export const STATUS_LABELS = {
+  draft: 'Draft · complete and submit',
   submitted: 'Submitted · awaiting parcel',
   received: 'Parcel received',
   assigned: 'Assigned to a team',
@@ -31,6 +32,8 @@ export const STATUS_LABELS = {
 
 // Status groups used for filters and counts across portals
 export const STATUS_GROUPS = {
+  // made automatically from an email; only the customer sees it until they submit it
+  draft: ['draft'],
   awaiting_parcel: ['submitted'],
   production: ['received', 'assigned', 'cutting', 'stitching', 'qc_passed', 'customer_approval'],
   invoice: ['packed'],
@@ -74,6 +77,8 @@ const TERMINAL = ['delivered', 'cancelled'];
  */
 export const checkTransition = (from, to) => {
   if (from === to) return { ok: true };
+  // only the customer can submit a draft (PATCH /client/orders/:id); no staff action may move it
+  if (from === 'draft') return { ok: false, reason: 'This order is still a draft the customer has not submitted.' };
   if (!(to in STATUS_RANK) && to !== 'cancelled') return { ok: false, reason: `"${to}" is not an order status.` };
   if (TERMINAL.includes(from)) return { ok: false, reason: `The order is already ${STATUS_LABELS[from].toLowerCase()} and its status cannot change.` };
   if (to === 'cancelled') {

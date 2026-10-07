@@ -6,6 +6,7 @@ import {
   createClientOrder,
   updateClientOrder,
   cancelClientOrder,
+  deleteClientDraft,
   approveClientOrder,
   requestChanges,
   payClientOrder,
@@ -30,6 +31,7 @@ import {
   lookupArticles,
   addBrandAsCustomer,
 } from '../controllers/catalogue.controller.js';
+import { getInbox, getMailbox, getUnreadCount, getEmail, readAll, removeEmail } from '../controllers/inbox.controller.js';
 import { previewProduct } from '../controllers/client.controller.js';
 import { getMessages, postMessage, uploadVoice, readMessages, uploadVoiceNote, getConversationScopes, getMyConversations } from '../controllers/chat.controller.js';
 import { createPaymentIntent, confirmPayment } from '../controllers/payment.controller.js';
@@ -43,6 +45,7 @@ router.post('/orders', createClientOrder);
 router.get('/orders/:id', getClientOrder);
 router.patch('/orders/:id', updateClientOrder);
 router.post('/orders/:id/cancel', cancelClientOrder);
+router.delete('/orders/:id', deleteClientDraft);
 router.post('/orders/:id/approve', approveClientOrder);
 router.post('/orders/:id/request-changes', requestChanges);
 router.post('/orders/:id/payment-intent', createPaymentIntent);
@@ -58,6 +61,14 @@ router.post('/imports/invoice', importInvoice);
 router.post('/imports/links', importLinks);
 router.get('/imports/:id', getImport);
 router.delete('/imports/:id', deleteImport);
+
+// Inbox: every email that reaches the customer's personal shopping address
+router.get('/inbox', getInbox);
+router.get('/inbox/address', getMailbox);
+router.get('/inbox/unread-count', getUnreadCount);
+router.post('/inbox/read-all', readAll);
+router.get('/inbox/:id', getEmail);
+router.delete('/inbox/:id', removeEmail);
 
 // Order form lookups: active rows only, searchable and paginated on the server, never any price
 router.get('/brands', lookupBrands);

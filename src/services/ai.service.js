@@ -2,16 +2,25 @@ import { config } from '../config/env.js';
 
 /**
  * Reads brand order details (invoice PDF / screenshot / confirmation email / product page text)
- * with Claude, returning a normalised draft. Uses the Messages API with a forced tool call so
+ * with Claude or GPT (AI_PROVIDER), returning a normalised draft. Both use a forced tool / function call so
  * the answer is always structured JSON.
  */
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
+const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const AI_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
-export const isAiConfigured = () => !!config.ai.apiKey;
+/** Which service reads the documents: the chosen AI_PROVIDER if its key is set, else whichever key exists. */
+const provider = () => {
+  const { provider: want, apiKey, openaiKey } = config.ai;
+  if (want === 'openai') return openaiKey ? 'openai' : null;
+  if (want === 'anthropic') return apiKey ? 'anthropic' : null;
+  return apiKey ? 'anthropic' : openaiKey ? 'openai' : null;
+};
 
-/** File types Claude can read directly. */
+export const isAiConfigured = () => !!provider();
+
+/** File types the AI can read directly. */
 export const isAiReadable = (mime) => mime === 'application/pdf' || AI_IMAGE_TYPES.has(mime);
 
 const ORDER_TOOL = {
@@ -63,13 +72,21 @@ const SYSTEM = [
  * @param {string} [instruction]
  */
 export const extractOrderWithAi = async (inputs, instruction = 'Extract the order details from this.') => {
-  if (!isAiConfigured()) throw new Error('AI reading is not configured (ANTHROPIC_API_KEY is missing).');
+  const which = provider();
+  if (!which) throw new Error('AI reading is not configured (set OPENAI_API_KEY or ANTHROPIC_API_KEY).');
+  const raw = which === 'openai' ? await askOpenAi(inputs, instruction) : await askClaude(inputs, instruction);
+  return normaliseExtracted(raw);
+};
 
+/** Claude: Messages API with a forced tool call. Returns the tool input. */
+const askClaude = async (inputs, instruction) => {
   const content = [];
   for (const part of inputs) {
     if (part.type === 'pdf') content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: part.data } });
     else if (part.type === 'image' && AI_IMAGE_TYPES.has(part.mime)) content.push({ type: 'image', source: { type: 'base64', media_type: part.mime, data: part.data } });
-    else if (part.type === 'text' && part.text) content.push({ type: 'text', text: `<document>\n${part.text.slice(0, 60_000)}\n</document>` });
+    else if (part.type === 'text' && part.text) content.push({ type: 'text', text: `<document>
+${part.text.slice(0, 60_000)}
+</document>` });
   }
   if (!content.length) throw new Error('Nothing readable was provided.');
   content.push({ type: 'text', text: instruction });
@@ -97,7 +114,47 @@ export const extractOrderWithAi = async (inputs, instruction = 'Extract the orde
   if (!res.ok) throw new Error(`AI request failed (${res.status}): ${body?.error?.message || res.statusText}`);
   const call = (body.content || []).find((c) => c.type === 'tool_use' && c.name === ORDER_TOOL.name);
   if (!call) throw new Error('AI returned no order details.');
-  return normaliseExtracted(call.input);
+  return call.input;
+};
+
+/** GPT: Chat Completions with a forced function call. Returns the parsed arguments. */
+const askOpenAi = async (inputs, instruction) => {
+  const content = [];
+  for (const part of inputs) {
+    if (part.type === 'pdf') content.push({ type: 'file', file: { filename: 'document.pdf', file_data: `data:application/pdf;base64,${part.data}` } });
+    else if (part.type === 'image' && AI_IMAGE_TYPES.has(part.mime)) content.push({ type: 'image_url', image_url: { url: `data:${part.mime};base64,${part.data}` } });
+    else if (part.type === 'text' && part.text) content.push({ type: 'text', text: `<document>
+${part.text.slice(0, 60_000)}
+</document>` });
+  }
+  if (!content.length) throw new Error('Nothing readable was provided.');
+  content.push({ type: 'text', text: instruction });
+
+  const res = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${config.ai.openaiKey}` },
+    body: JSON.stringify({
+      model: config.ai.openaiModel,
+      max_tokens: 4096,
+      messages: [
+        { role: 'system', content: SYSTEM },
+        { role: 'user', content },
+      ],
+      tools: [{ type: 'function', function: { name: ORDER_TOOL.name, description: ORDER_TOOL.description, parameters: ORDER_TOOL.input_schema } }],
+      tool_choice: { type: 'function', function: { name: ORDER_TOOL.name } },
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`AI request failed (${res.status}): ${body?.error?.message || res.statusText}`);
+  const args = body.choices?.[0]?.message?.tool_calls?.find((c) => c.function?.name === ORDER_TOOL.name)?.function?.arguments;
+  if (!args) throw new Error('AI returned no order details.');
+  try {
+    return JSON.parse(args);
+  } catch {
+    throw new Error('AI returned order details that could not be read.');
+  }
 };
 
 // ─────────── normalisation shared by every import source ───────────

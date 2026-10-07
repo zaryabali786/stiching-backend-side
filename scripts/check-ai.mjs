@@ -6,7 +6,7 @@ import 'dotenv/config';
 import { extractOrderWithAi, isAiConfigured } from '../src/services/ai.service.js';
 
 if (!isAiConfigured()) {
-  console.error('ANTHROPIC_API_KEY is not set in backend/.env.');
+  console.error('Neither OPENAI_API_KEY nor ANTHROPIC_API_KEY is set in backend/.env.');
   process.exit(1);
 }
 

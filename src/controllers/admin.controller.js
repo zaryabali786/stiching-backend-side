@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '../config/supabase.js';
-import { catchAsync, ApiResponse, BadRequestError, ForbiddenError } from '../utils/error.helper.js';
+import { catchAsync, ApiResponse, BadRequestError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
 import { unwrap, unwrapOne, todayISO, startOfMonthISO, daysAgoISO, sum, round2 } from '../utils/db.js';
 import { STATUS_GROUPS, STATUS_LABELS, ORDER_STATUSES, setOrderStatus, addEvent, getOrderOr404, syncReceiving, articleDisplayStatus } from '../services/order.service.js';
@@ -28,8 +28,8 @@ export const getAdminOverview = catchAsync(async (req, res) => {
 
   const inPartner = (query, column) => inActivePartner(req.access, query, column);
   const [periodOrders, statusRows, awaitingInvoices, delayedCards, inTransit, issueOrders] = await Promise.all([
-    inPartner(supabaseAdmin.from('orders').select('id, created_at, destination_country, status').gte('created_at', since).neq('status', 'cancelled')),
-    inPartner(supabaseAdmin.from('orders').select('status, has_issue, shipped_at').neq('status', 'cancelled')),
+    inPartner(supabaseAdmin.from('orders').select('id, created_at, destination_country, status').gte('created_at', since).not('status', 'in', '(cancelled,draft)')),
+    inPartner(supabaseAdmin.from('orders').select('status, has_issue, shipped_at').not('status', 'in', '(cancelled,draft)')),
     inPartner(supabaseAdmin.from('invoices').select('total_pkr, order:orders!invoices_order_id_fkey!inner(partner_id)').eq('status', 'issued'), 'order.partner_id'),
     inPartner(supabaseAdmin.from('job_cards').select('order_id').lt('due_date', todayISO()).neq('stage', 'packed')),
     inPartner(supabaseAdmin.from('transfers').select('id, code, orders:orders!orders_transfer_id_fkey(id)').eq('status', 'in_transit')),
@@ -132,10 +132,10 @@ export const getAdminOrders = catchAsync(async (req, res) => {
   const group = req.query.group || 'all';
 
   const scope = (query) => {
-    if (group === 'issues') return query.eq('has_issue', true).not('status', 'in', '(cancelled,delivered)');
-    if (STATUS_GROUPS[group]) return query.in('status', STATUS_GROUPS[group]);
+    if (group === 'issues') return query.eq('has_issue', true).not('status', 'in', '(cancelled,delivered,draft)');
+    if (group !== 'draft' && STATUS_GROUPS[group]) return query.in('status', STATUS_GROUPS[group]);
     if (group === 'cancelled') return query.eq('status', 'cancelled');
-    return query;
+    return query.neq('status', 'draft');
   };
 
   let query = scope(
@@ -153,7 +153,7 @@ export const getAdminOrders = catchAsync(async (req, res) => {
   if (q.search) query = query.or(ilikeAny(['reference', 'customer_name', 'customer_code', 'brand', 'brand_order_number', 'tracking_number'], q.search));
 
   const groups = ['awaiting_parcel', 'production', 'invoice', 'payment', 'warehouse', 'shipped'];
-  const countOrders = () => inActivePartner(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }));
+  const countOrders = () => inActivePartner(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).neq('status', 'draft'));
   const [result, ...counts] = await Promise.all([
     query,
     countOrders(),
@@ -169,7 +169,7 @@ export const getAdminOrders = catchAsync(async (req, res) => {
 });
 
 export const getAdminOrder = catchAsync(async (req, res) => {
-  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select(ADMIN_ORDER_DETAIL).eq('id', req.params.id)).maybeSingle(), 'Order not found');
+  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select(ADMIN_ORDER_DETAIL).eq('id', req.params.id).neq('status', 'draft')).maybeSingle(), 'Order not found');
   return ApiResponse.success(res, await signNoteAudio({
     ...order,
     status_label: STATUS_LABELS[order.status],
@@ -199,7 +199,7 @@ export const getAdminOrder = catchAsync(async (req, res) => {
  * GET /api/admin/orders/by-ref/:reference
  */
 export const getAdminOrderByRef = catchAsync(async (req, res) => {
-  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select('id').ilike('reference', req.params.reference)).maybeSingle(), 'Order not found');
+  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select('id').ilike('reference', req.params.reference).neq('status', 'draft')).maybeSingle(), 'Order not found');
   req.params.id = order.id;
   return getAdminOrder(req, res);
 });
@@ -209,6 +209,7 @@ export const getAdminOrderByRef = catchAsync(async (req, res) => {
  */
 export const updateAdminOrder = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.id);
+  if (order.status === 'draft') throw new NotFoundError('Order not found'); // a draft is private to its customer until they submit it
   const b = req.body || {};
   const patch = {};
   if (b.admin_notes !== undefined) patch.admin_notes = String(b.admin_notes || '').slice(0, 4000) || null;
@@ -297,7 +298,7 @@ export const getAdminCustomers = catchAsync(async (req, res) => {
     const paid = orders.length
       ? unwrap(await supabaseAdmin.from('invoices').select('order_id, total_pkr').eq('status', 'paid').in('order_id', orders.map((o) => o.id)))
       : [];
-    for (const o of orders) {
+    for (const o of orders.filter((x) => x.status !== 'draft')) {
       const s = (stats[o.customer_id] ||= { total_orders: 0, active_orders: 0, total_spent_pkr: 0, last_order_at: null });
       s.total_orders++;
       if (STATUS_GROUPS.active.includes(o.status)) s.active_orders++;
@@ -316,7 +317,7 @@ export const getAdminCustomers = catchAsync(async (req, res) => {
 export const getAdminCustomer = catchAsync(async (req, res) => {
   const customer = unwrapOne(await supabaseAdmin.from('profiles').select('*').eq('id', req.params.id).maybeSingle(), 'Customer not found');
   const [orders, sizes] = await Promise.all([
-    supabaseAdmin.from('orders').select('id, reference, brand, status, created_at, units:order_units!order_units_order_id_fkey(count)').eq('customer_id', customer.id).order('created_at', { ascending: false }).limit(50),
+    supabaseAdmin.from('orders').select('id, reference, brand, status, created_at, units:order_units!order_units_order_id_fkey(count)').eq('customer_id', customer.id).neq('status', 'draft').order('created_at', { ascending: false }).limit(50),
     supabaseAdmin.from('size_charts').select('id, name, person_name, variation, measurements, notes, updated_at').eq('user_id', customer.id),
   ]);
   return ApiResponse.success(res, {
@@ -347,6 +348,18 @@ export const getUsers = catchAsync(async (req, res) => {
   return sendPage(res, unwrap(result), q, result.count);
 });
 
+/** The partner a Google sign-up created and then left behind (no users, team, orders or modules) is removed with its owner's promotion. */
+const dropPartnerIfEmpty = async (partnerId) => {
+  if (!partnerId) return;
+  const head = (table) => supabaseAdmin.from(table).select('id', { count: 'exact', head: true }).eq('partner_id', partnerId);
+  const [users, team, orders, partner] = await Promise.all([
+    head('profiles'), head('team_members'), head('orders'),
+    supabaseAdmin.from('partners').select('permissions, is_default').eq('id', partnerId).maybeSingle(),
+  ]);
+  const empty = !users.count && !team.count && !orders.count && !(partner.data?.permissions || []).length && !partner.data?.is_default;
+  if (empty) await supabaseAdmin.from('partners').delete().eq('id', partnerId);
+};
+
 /**
  * PATCH /api/admin/users/:id/role  body: { role }
  */
@@ -356,9 +369,12 @@ export const setUserRole = catchAsync(async (req, res) => {
   if (!['customer', 'admin'].includes(role)) throw new BadRequestError('Role must be customer or admin.');
   if (req.params.id === req.userId) throw new ForbiddenError('You cannot change your own role.');
   const current = unwrapOne(await supabaseAdmin.from('profiles').select('id, role, partner_role').eq('id', req.params.id).maybeSingle(), 'User not found');
-  if (current.partner_role === 'owner') throw new BadRequestError('This is a partner owner. Switch the partner off or change its owner instead.');
+  // an owner can be promoted to admin (e.g. someone who signed up with Google), but not demoted to a customer while they own a partner
+  if (current.partner_role === 'owner' && role !== 'admin') throw new BadRequestError('This is a partner owner. Switch the partner off or change its owner instead.');
+  const { data: before } = await supabaseAdmin.from('profiles').select('partner_id, partner_role').eq('id', req.params.id).maybeSingle();
   // leaving a partner removes every partner link and permission
-  const updated = await UserModel.setRole(req.params.id, role, { partner_id: null, partner_role: null, permissions: [], job_title: null });
+  const updated = await UserModel.setRole(req.params.id, role, { partner_id: null, partner_role: null, permissions: [], job_title: null, staff_type: null });
+  if (before?.partner_role === 'owner') await dropPartnerIfEmpty(before.partner_id);
   await notifyUser(updated.id, {
     type: 'update',
     title: 'Your access was updated',
@@ -389,7 +405,7 @@ export const getAdminReports = catchAsync(async (req, res) => {
   const since = startOfMonthISO(months - 1);
   const [invoices, orders] = await Promise.all([
     inActivePartner(req.access, supabaseAdmin.from('invoices').select('total_pkr, partner_total_pkr, discount_pkr, paid_at, order:orders!invoices_order_id_fkey!inner(partner_id), lines:invoice_lines(kind, customer_amount, partner_amount)').eq('status', 'paid').gte('paid_at', since), 'order.partner_id'),
-    inActivePartner(req.access, supabaseAdmin.from('orders').select('brand, destination_country, created_at, packed_at, shipped_at, status').gte('created_at', since)),
+    inActivePartner(req.access, supabaseAdmin.from('orders').select('brand, destination_country, created_at, packed_at, shipped_at, status').neq('status', 'draft').gte('created_at', since)),
   ]);
   const inv = unwrap(invoices);
   const ords = unwrap(orders);

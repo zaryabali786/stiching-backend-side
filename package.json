@@ -17,7 +17,9 @@
     "db:bundle": "node scripts/build-sql.mjs",
     "admin:create": "node scripts/create-admin.mjs",
     "test:rbac": "node scripts/e2e-rbac.mjs",
-    "audit:routes": "node scripts/audit-routes.mjs"
+    "audit:routes": "node scripts/audit-routes.mjs",
+    "test:roles": "node scripts/e2e-roles-invoice.mjs",
+    "test:messages": "node scripts/e2e-messages-realtime.mjs"
   },
   "keywords": [],
   "author": "",

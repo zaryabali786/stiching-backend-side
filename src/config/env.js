@@ -29,6 +29,10 @@ export const config = {
   },
   // Reading brand invoices / forwarded emails (optional — without a key customers fill details in by hand)
   ai: {
+    // 'anthropic' (Claude) or 'openai' (GPT). Unset: Claude when its key is set, otherwise GPT.
+    provider: (process.env.AI_PROVIDER || '').trim().toLowerCase(),
+    openaiKey: (process.env.OPENAI_API_KEY || '').trim(),
+    openaiModel: (process.env.OPENAI_MODEL || 'gpt-4o-mini').trim(),
     apiKey: process.env.ANTHROPIC_API_KEY || '',
     model: process.env.AI_MODEL || 'claude-opus-5-5',
     // Only needed when the API key is not scoped to a single workspace (Anthropic Console -> Workspaces -> ID)
@@ -47,7 +51,9 @@ export const config = {
   },
   // Forwarded brand emails: customers forward to  <local>+<token>@<domain>  built from this address.
   // Your inbound-mail provider posts each email to  POST /api/inbound/email  with INBOUND_EMAIL_SECRET.
+  // With INBOUND_EMAIL_DOMAIN (your own mail subdomain, MX pointed at the provider) each customer gets <token>@<domain>.
   inboundEmail: {
+    domain: process.env.INBOUND_EMAIL_DOMAIN || '',
     address: process.env.INBOUND_EMAIL_ADDRESS || '',
     secret: process.env.INBOUND_EMAIL_SECRET || '',
   },

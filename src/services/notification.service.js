@@ -8,13 +8,33 @@ import { loadPartner } from './access.service.js';
  */
 const insertMany = async (rows) => {
   if (!rows.length) return;
-  const { error } = await supabaseAdmin.from('notifications').insert(rows);
+  const { data, error } = await supabaseAdmin.from('notifications').insert(rows).select('*');
   if (error) {
     console.warn('[Notifications] insert failed:', error.message);
     return;
   }
+  rows = rows.map((r, i) => ({ ...r, saved: data?.[i] ?? null }));
   // nudge open apps to refresh their bell right away (they also poll as a fallback)
-  for (const userId of new Set(rows.map((r) => r.user_id))) emitTo(rooms.user(userId), 'notification:new', {});
+  // (the rows are pushed too, so open apps can add them to the list immediately)
+  for (const row of rows) emitTo(rooms.user(row.user_id), 'notification:new', { notification: row.saved ?? null });
+};
+
+/**
+ * `dedupe: true` on a notification: a person who already has the same unread one for this order (same title, last 15 minutes)
+ * is skipped, so a busy chat does not pile up copies. Decided per person, never for everybody at once.
+ */
+const skipRecent = async (rows, n) => {
+  if (!n.dedupe || !n.orderId || !rows.length) return rows;
+  const { data } = await supabaseAdmin
+    .from('notifications')
+    .select('user_id')
+    .eq('order_id', n.orderId)
+    .eq('title', n.title)
+    .is('read_at', null)
+    .gte('created_at', new Date(Date.now() - 15 * 60_000).toISOString())
+    .in('user_id', rows.map((r) => r.user_id));
+  const already = new Set((data || []).map((d) => d.user_id));
+  return rows.filter((r) => !already.has(r.user_id));
 };
 
 const toRow = (userId, n) => ({
@@ -54,7 +74,7 @@ export const notifyRoles = async (roles, notification, excludeUserId = null) => 
       const link = typeof notification.link === 'object' ? notification.link?.[p.role] : notification.link;
       return toRow(p.id, { ...notification, link });
     });
-  await insertMany(rows);
+  await insertMany(await skipRecent(rows, notification));
 };
 
 /**
@@ -79,7 +99,7 @@ export const partnerRecipients = async (partnerId, module = null) => {
   return (data || []).filter((u) => {
     if (!module) return true;
     const perms = u.partner_role === 'owner' ? ceiling : new Set((u.permissions || []).filter((p) => ceiling.has(p)));
-    return perms.has(`${module}.view`);
+    return [].concat(module).every((m) => perms.has(`${m}.view`));
   });
 };
 
@@ -100,7 +120,7 @@ export const notifyPartner = async (notification, excludeUserId = null, { module
   const rows = people
     .filter((p) => p.id !== excludeUserId)
     .map((p) => toRow(p.id, { ...notification, link: typeof notification.link === 'object' ? notification.link?.partner_staff : notification.link }));
-  await insertMany(rows);
+  await insertMany(await skipRecent(rows, notification));
 };
 
 /** The owning partner's people plus every admin. */

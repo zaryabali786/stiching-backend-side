@@ -11,8 +11,8 @@ import { getForwardAddress } from '../src/services/order-import.service.js';
 
 const customerEmail = process.argv[2] || 'customer@v360.test';
 const api = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}/api`;
-if (!process.env.INBOUND_EMAIL_ADDRESS || !process.env.INBOUND_EMAIL_SECRET) {
-  console.error('Set INBOUND_EMAIL_ADDRESS (e.g. orders@in.example.com) and INBOUND_EMAIL_SECRET in backend/.env first.');
+if (!(process.env.INBOUND_EMAIL_DOMAIN || process.env.INBOUND_EMAIL_ADDRESS) || !process.env.INBOUND_EMAIL_SECRET) {
+  console.error('Set INBOUND_EMAIL_DOMAIN (e.g. mail.example.com) or INBOUND_EMAIL_ADDRESS, and INBOUND_EMAIL_SECRET in backend/.env first.');
   process.exit(1);
 }
 
@@ -37,14 +37,16 @@ const html = `
 
 // Same shape as Postmark's inbound webhook JSON
 const to = address;
+// Postmark only sets MailboxHash for  local+hash@domain  addresses
+const mailboxHash = to.includes('+') ? to.split('+')[1].split('@')[0] : '';
 const payload = {
   From: `${profile.full_name} <${customerEmail}>`,
   FromName: profile.full_name,
   FromFull: { Email: customerEmail, Name: profile.full_name },
   To: to,
-  ToFull: [{ Email: to, Name: '', MailboxHash: to.split('+')[1].split('@')[0] }],
+  ToFull: [{ Email: to, Name: '', MailboxHash: mailboxHash }],
   OriginalRecipient: to,
-  MailboxHash: to.split('+')[1].split('@')[0],
+  MailboxHash: mailboxHash,
   Subject: 'Fwd: Order #SP-482913 confirmed',
   MessageID: crypto.randomUUID(),
   Date: new Date().toUTCString(),
@@ -61,5 +63,5 @@ const res = await fetch(`${api}/inbound/email`, {
   body: JSON.stringify(payload),
 });
 console.log(`POST /inbound/email to ${address} ->`, res.status, JSON.stringify(await res.json()));
-console.log('Open the customer app → New order → Forward email to see it (reading takes a few seconds).');
+console.log('Open the customer app → Inbox to see it (reading the order takes a few seconds).');
 process.exit(0);

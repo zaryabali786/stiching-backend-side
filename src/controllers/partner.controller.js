@@ -365,7 +365,7 @@ const WAREHOUSE_SELECT = `
   id, reference, brand, status, customer_name, customer_code, destination_city, destination_country, destination_address,
   shipping_service, weight_kg, partner_route, packed_at, paid_at, created_at,
   units:order_units!order_units_order_id_fkey(count),
-  invoice:invoices!invoices_order_id_fkey(id, number, status, issued_at, total_pkr, currency, total_foreign),
+  invoice:invoices!invoices_order_id_fkey(id, number, status, issued_at, total_pkr, currency, total_foreign, lines:invoice_lines(kind, label)),
   transfer:transfers!orders_transfer_id_fkey(id, code, status),
   shipment:shipments!shipments_order_id_fkey(id, status, courier, tracking_number, shipped_from)
 `;
@@ -557,7 +557,7 @@ export const getPartnerBadges = catchAsync(async (req, res) => {
     can(req.access, 'quality.view') ? scoped(req.access, supabaseAdmin.from('job_cards').select('id', { count: 'exact', head: true }).eq('stage', 'qc').eq('qc_passed', false)) : zero,
     can(req.access, 'warehouse.view') ? scoped(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).eq('status', 'paid').is('partner_route', null)) : zero,
     can(req.access, 'warehouse.view') ? scoped(req.access, supabaseAdmin.from('transfers').select('id', { count: 'exact', head: true }).eq('status', 'open')) : zero,
-    can(req.access, 'messages.view') ? unreadConversationCount(scopeOf(req.access)) : 0,
+    can(req.access, 'messages.view') ? unreadConversationCount(scopeOf(req.access), { excludeGeneral: !can(req.access, 'general_messages.view') }) : 0,
   ]);
   return ApiResponse.success(res, {
     messages,

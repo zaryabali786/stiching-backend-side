@@ -244,6 +244,14 @@ async function main() {
   // ───────────────────────── Conversation (REST) ─────────────────────────
   section('Conversation over REST');
   const oid = o1.id;
+  // The order goes to whichever partner is least busy: give it to the partner this test signs in as, and let that partner
+  // read General chats (admin-only by default) because this test talks about the order as a whole.
+  const myPartner = partner.user.partner_id;
+  const before = (await supabaseAdmin.from('partners').select('permissions').eq('id', myPartner).single()).data.permissions;
+  generalRestore = { id: myPartner, permissions: before };
+  await call(A, 'PATCH', `/admin/partners/${myPartner}`, { permissions: [...new Set([...before, 'messages.view', 'messages.update', 'general_messages.view', 'general_messages.update'])] });
+  await call(A, 'POST', `/admin/orders/${oid}/partner`, { partner_id: myPartner });
+  await new Promise((r) => setTimeout(r, 16_000)); // permission caches are short-lived
   const first = (await call(C, 'GET', `/client/orders/${oid}/messages`)).data;
   expect(first.length === 1 && first[0].body === 'E2E: please call before cutting' && first[0].sender_role === 'customer', 'the order note became the first message');
   const sent = (await call(C, 'POST', `/client/orders/${oid}/messages`, { kind: 'text', body: 'Hello from the customer', client_msg_id: 'e2e-1' })).data;
@@ -446,9 +454,12 @@ async function purge() {
   await supabaseAdmin.from('brands').delete().like('name', 'E2E%');
 }
 
+let generalRestore = null;
+
 async function cleanup() {
   section('Cleanup');
   try {
+    if (generalRestore) await supabaseAdmin.from('partners').update({ permissions: generalRestore.permissions }).eq('id', generalRestore.id);
     await purge();
     ok('all E2E test orders and catalogue rows removed');
   } catch (e) {

@@ -120,11 +120,28 @@ const cleanRate = (b, partial) => {
   return out;
 };
 
-export const createShippingRate = catchAsync(async (req, res) =>
-  ApiResponse.created(res, unwrap(await supabaseAdmin.from('shipping_rates').insert(cleanRate(req.body || {}, false)).select('*').single()), 'Shipping rate added.'));
+/**
+ * A courier named in the shipping price list must also exist in the courier catalogue (Catalogue > Couriers), because the
+ * partner picks it from there when marking a parcel as shipped. Added if missing (matched ignoring case); never changed.
+ */
+export const ensureCourier = async (name) => {
+  const clean = String(name || '').trim().slice(0, 80);
+  if (!clean) return;
+  const { data } = await supabaseAdmin.from('couriers').select('id').ilike('name', clean.replace(/[\\%_]/g, '\\$&')).limit(1).maybeSingle();
+  if (!data) await supabaseAdmin.from('couriers').insert({ name: clean });
+};
 
-export const updateShippingRate = catchAsync(async (req, res) =>
-  ApiResponse.success(res, unwrapOne(await supabaseAdmin.from('shipping_rates').update({ ...cleanRate(req.body || {}, true), updated_at: new Date().toISOString() }).eq('id', req.params.id).select('*').maybeSingle(), 'Rate not found'), 'Shipping rate updated.'));
+export const createShippingRate = catchAsync(async (req, res) => {
+  const rate = unwrap(await supabaseAdmin.from('shipping_rates').insert(cleanRate(req.body || {}, false)).select('*').single());
+  await ensureCourier(rate.courier);
+  return ApiResponse.created(res, rate, 'Shipping rate added.');
+});
+
+export const updateShippingRate = catchAsync(async (req, res) => {
+  const rate = unwrapOne(await supabaseAdmin.from('shipping_rates').update({ ...cleanRate(req.body || {}, true), updated_at: new Date().toISOString() }).eq('id', req.params.id).select('*').maybeSingle(), 'Rate not found');
+  await ensureCourier(rate.courier);
+  return ApiResponse.success(res, rate, 'Shipping rate updated.');
+});
 
 export const deleteShippingRate = catchAsync(async (req, res) => {
   const { count } = await supabaseAdmin.from('shipments').select('id', { count: 'exact', head: true }).eq('shipping_rate_id', req.params.id);
@@ -136,6 +153,16 @@ export const deleteShippingRate = catchAsync(async (req, res) => {
   return ApiResponse.success(res, null, 'Shipping rate deleted.');
 });
 
+/**
+ * The country shipping is priced for. A local order (not international) may have no destination saved when the customer's
+ * profile had no country, so it is Pakistan; otherwise rates would never match and the invoice offered no shipping.
+ */
+const shipCountry = (order) => String(order.destination_country || '').trim() || (order.international_shipping === false ? 'Pakistan' : '');
+
+/** What a rate costs for a parcel of this weight (base rate + every started kg over the rate's weight allowance). */
+const ratePrice = (rate, weightKg) =>
+  round2(Number(rate.base_rate) + Math.max(0, Math.ceil(Number(weightKg || 0) - Number(rate.max_weight_kg))) * Number(rate.per_extra_kg));
+
 /** Rates that serve a country, priced for a weight. */
 const ratesFor = async (country, weightKg, service) => {
   const all = unwrap(await supabaseAdmin.from('shipping_rates').select('*').eq('is_active', true));
@@ -145,7 +172,7 @@ const ratesFor = async (country, weightKg, service) => {
   return matching
     .map((r) => ({
       ...r,
-      price_pkr: round2(Number(r.base_rate) + Math.max(0, Math.ceil(w - Number(r.max_weight_kg))) * Number(r.per_extra_kg)),
+      price_pkr: ratePrice(r, w),
       recommended: false,
     }))
     .sort((a, b) => (a.service === service ? 0 : 1) - (b.service === service ? 0 : 1) || a.price_pkr - b.price_pkr)
@@ -267,16 +294,16 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
   const invoice = one(order.invoice);
   const [priceItems, shippingOptions] = await Promise.all([
     supabaseAdmin.from('price_items').select('*').eq('is_active', true).order('category').order('name'),
-    ratesFor(order.destination_country, order.weight_kg, order.shipping_service),
+    ratesFor(shipCountry(order), order.weight_kg, order.shipping_service),
   ]);
   const items = unwrap(priceItems);
-  const currency = invoice?.currency || currencyFor(order.destination_country);
+  const currency = invoice?.currency || currencyFor(shipCountry(order));
 
   // Suggest the FX rate last used for this currency (admin confirms it; it is locked at issue)
   const { data: lastFx } = await supabaseAdmin.from('invoices').select('fx_rate').eq('currency', currency).neq('status', 'draft').order('issued_at', { ascending: false }).limit(1).maybeSingle();
 
   return ApiResponse.success(res, {
-    order: { ...order, invoice: undefined, status_label: STATUS_LABELS[order.status] },
+    order: { ...order, destination_country: order.destination_country || shipCountry(order) || null, invoice: undefined, status_label: STATUS_LABELS[order.status] },
     invoice: invoice ? { ...invoice, lines: (invoice.lines || []).sort((a, b) => a.sort_order - b.sort_order) } : null,
     suggestedLines: invoice ? null : await suggestLines(order, items, shippingOptions),
     priceItems: items,
@@ -335,12 +362,37 @@ export const saveInvoiceDraft = catchAsync(async (req, res) => {
       sort_order: i,
     };
   });
+  // A shipping item picked from the shipping price list: the SERVER prices it (never the browser), so the invoice carries
+  // exactly what the list says today. The amount is copied onto the line, so later list changes leave this invoice alone.
+  let shippingRateId = null;
+  if (b.shipping_rate_id) {
+    const rate = unwrapOne(await supabaseAdmin.from('shipping_rates').select('*').eq('id', b.shipping_rate_id).maybeSingle(), 'Shipping item not found');
+    if (!rate.is_active) throw new BadRequestError(`${rate.courier} · ${rate.zone} is switched off in the shipping price list.`);
+    shippingRateId = rate.id;
+    const weight = order.weight_kg;
+    const rest = lines.filter((l) => l.kind !== 'shipping');
+    const shippingLine = {
+      kind: 'shipping',
+      label: `${rate.courier} · ${rate.zone}`.slice(0, 160),
+      description: [weight ? `${weight} kg` : null, rate.transit_time].filter(Boolean).join(' · ') || null,
+      unit_id: null,
+      price_item_id: null,
+      quantity: 1,
+      customer_amount: ratePrice(rate, weight),
+      partner_amount: 0,
+    };
+    // shipping sits before duties (DDP) when there is a duties line, otherwise at the end
+    const at = rest.findIndex((l) => l.kind === 'duties');
+    rest.splice(at === -1 ? rest.length : at, 0, shippingLine);
+    lines.length = 0;
+    lines.push(...rest.map((l, i) => ({ ...l, sort_order: i })));
+  }
   const totals = computeTotals(lines, fxRate);
 
   const existing = unwrap(await supabaseAdmin.from('invoices').select('*').eq('order_id', order.id).maybeSingle());
   if (existing && existing.status !== 'draft') throw new BadRequestError(`Invoice ${existing.number} is already ${existing.status}.`);
 
-  const payload = { order_id: order.id, currency, fx_rate: fxRate, notes: b.notes?.trim() || null, ...totals, updated_at: new Date().toISOString() };
+  const payload = { order_id: order.id, currency, fx_rate: fxRate, notes: b.notes?.trim() || null, ...(shippingRateId || b.shipping_rate_id === null ? { shipping_rate_id: shippingRateId } : {}), ...totals, updated_at: new Date().toISOString() };
   const invoice = existing
     ? unwrap(await supabaseAdmin.from('invoices').update(payload).eq('id', existing.id).select('*').single())
     : unwrap(await supabaseAdmin.from('invoices').insert({ ...payload, status: 'draft', created_by: req.userId }).select('*').single());

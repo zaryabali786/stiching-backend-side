@@ -2,13 +2,14 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError } from '../utils/error.helper.js';
 import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
 import { unwrap } from '../utils/db.js';
-import { scoped, scopeOf } from '../services/access.service.js';
+import { scoped, scopeOf, can } from '../services/access.service.js';
 import { STATUS_LABELS } from '../services/order.service.js';
 import { uploadAudio, signedDocumentUrl } from '../services/storage.service.js';
 import { uploadNoteVoice } from '../services/voice-note.service.js';
 import {
   MAX_VOICE_SECONDS,
   assertConversationAccess,
+  canReadGeneral,
   conversationScopes,
   customerConversations,
   createMessage,
@@ -27,7 +28,7 @@ import {
 /** GET /orders/:id/messages?limit=30&before=<nextCursor> — oldest -> newest within the page */
 export const getMessages = catchAsync(async (req, res) => {
   const order = await assertConversationAccess(req.profile, req.params.id);
-  const { items, hasMore, nextCursor } = await listMessages(order.id, { limit: req.query.limit, before: req.query.before, unitId: req.query.unit_id });
+  const { items, hasMore, nextCursor } = await listMessages(order.id, { limit: req.query.limit, before: req.query.before, unitId: req.query.unit_id, general: canReadGeneral(order, req.profile) });
   return ApiResponse.success(res, items, 'Success', 200, { hasMore, nextCursor, limit: items.length });
 });
 
@@ -101,10 +102,21 @@ export const getConversations = catchAsync(async (req, res) => {
   query = scoped(req.access, query); // a partner only sees the conversations of its own orders
   if (q.search) query = query.or(ilikeAny(['reference', 'customer_name', 'customer_code', 'brand'], q.search));
 
+  // General chats (about the order itself, not one article) are for the admin unless the admin enabled them for this person
+  const excludeGeneral = !can(req.access, 'general_messages.view');
+  if (excludeGeneral) {
+    let articleChats = supabaseAdmin.from('order_messages').select('order_id, order:orders!order_messages_order_id_fkey!inner(partner_id)').not('unit_id', 'is', null).limit(5000);
+    if (scopeOf(req.access) !== undefined) articleChats = articleChats.eq('order.partner_id', scopeOf(req.access));
+    const { data: withArticleChats } = await articleChats;
+    const idsWithChats = [...new Set((withArticleChats || []).map((r) => r.order_id))];
+    query = query.in('id', idsWithChats.length ? idsWithChats : ['00000000-0000-0000-0000-000000000000']);
+  }
+
   if (req.query.filter === 'unread') {
     // narrow to conversations with something unread before paging
     let unreadQuery = supabaseAdmin.from('order_messages').select('order_id, order:orders!order_messages_order_id_fkey!inner(partner_id)').eq('sender_role', 'customer').is('read_at', null).limit(2000);
     if (scopeOf(req.access) !== undefined) unreadQuery = unreadQuery.eq('order.partner_id', scopeOf(req.access));
+    if (excludeGeneral) unreadQuery = unreadQuery.not('unit_id', 'is', null);
     const { data } = await unreadQuery;
     const ids = [...new Set((data || []).map((r) => r.order_id))];
     query = query.in('id', ids.length ? ids : ['00000000-0000-0000-0000-000000000000']);
@@ -112,13 +124,14 @@ export const getConversations = catchAsync(async (req, res) => {
 
   const result = await query;
   const orders = unwrap(result, 'Could not load conversations');
-  const unread = await unreadByOrder(orders.map((o) => o.id));
+  const unread = await unreadByOrder(orders.map((o) => o.id), { excludeGeneral });
 
   // the chats of each order that have messages (General and/or single articles), so staff can open exactly one
   const ids = orders.map((o) => o.id);
   const chatsByOrder = {};
   if (ids.length) {
-    const msgs = unwrap(await supabaseAdmin.from('order_messages').select('order_id, unit_id, sender_role, read_at, kind, body, created_at').in('order_id', ids).order('created_at', { ascending: false }).limit(4000), 'Could not load conversations');
+    const msgs = unwrap(await supabaseAdmin.from('order_messages').select('order_id, unit_id, sender_role, read_at, kind, body, created_at').in('order_id', ids).order('created_at', { ascending: false }).limit(4000), 'Could not load conversations')
+      .filter((m) => !excludeGeneral || m.unit_id); // never even look at General messages without the permission
     const unitIds = [...new Set(msgs.map((m) => m.unit_id).filter(Boolean))];
     const units = unitIds.length ? unwrap(await supabaseAdmin.from('order_units').select('id, unit_title, line_no').in('id', unitIds)) : [];
     const unitMap = new Map(units.map((u) => [u.id, u]));
@@ -131,11 +144,20 @@ export const getConversations = catchAsync(async (req, res) => {
           title: m.unit_id ? unitMap.get(m.unit_id)?.unit_title || 'Article' : 'General',
           line_no: m.unit_id ? unitMap.get(m.unit_id)?.line_no ?? 99 : 0,
           unread: 0,
+          last_message_role: m.sender_role,
           last_message_at: m.created_at,
           last_message_preview: m.kind === 'voice' ? 'Voice message' : String(m.body || '').slice(0, 80),
         });
       }
       if (m.sender_role === 'customer' && !m.read_at) list.get(key).unread += 1;
+    }
+  }
+  // the last-message preview on the order also counts General chats; without the permission take it from the visible ones
+  const lastVisible = {};
+  if (excludeGeneral) {
+    for (const [orderId, list] of Object.entries(chatsByOrder)) {
+      const newest = [...list.values()].sort((a, b) => String(b.last_message_at).localeCompare(String(a.last_message_at)))[0];
+      if (newest) lastVisible[orderId] = newest;
     }
   }
   const rows = orders.map((o) => ({
@@ -147,12 +169,12 @@ export const getConversations = catchAsync(async (req, res) => {
     status_label: STATUS_LABELS[o.status],
     customer_name: o.customer_name,
     customer_code: o.customer_code,
-    last_message_at: o.last_message_at,
-    last_message_preview: o.last_message_preview,
-    last_message_role: o.last_message_role,
+    last_message_at: excludeGeneral ? lastVisible[o.id]?.last_message_at ?? null : o.last_message_at,
+    last_message_preview: excludeGeneral ? lastVisible[o.id]?.last_message_preview ?? null : o.last_message_preview,
+    last_message_role: excludeGeneral ? lastVisible[o.id]?.last_message_role ?? null : o.last_message_role,
     unread: unread[o.id] || 0,
   }));
-  return sendPage(res, rows, q, result.count, { unreadConversations: await unreadConversationCount(scopeOf(req.access)) });
+  return sendPage(res, rows, q, result.count, { unreadConversations: await unreadConversationCount(scopeOf(req.access), { excludeGeneral }) });
 });
 
 /**
@@ -180,4 +202,5 @@ export const uploadVoiceNote = catchAsync(async (req, res) =>
   ApiResponse.created(res, await uploadNoteVoice(req.userId, req.body?.audio), 'Voice note uploaded.'));
 
 /** GET /partner/conversations/unread-count */
-export const getUnreadCount = catchAsync(async (req, res) => ApiResponse.success(res, { unreadConversations: await unreadConversationCount(scopeOf(req.access)) }));
+export const getUnreadCount = catchAsync(async (req, res) =>
+  ApiResponse.success(res, { unreadConversations: await unreadConversationCount(scopeOf(req.access), { excludeGeneral: !can(req.access, 'general_messages.view') }) }));

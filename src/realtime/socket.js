@@ -64,10 +64,10 @@ export const initSocket = (httpServer) => {
     if (!profile) return socket.disconnect(true);
 
     socket.join(rooms.user(userId));
-    // staff inbox updates: admins hear about every order, a partner only about its own (and only with the messages permission)
+    // staff inbox updates: admins hear about every order. A partner's people get theirs on their own user room, sent by the
+    // chat service only to those who may read that chat right now (so a permission change needs no reconnect).
     const access = await resolveAccess(profile);
     if (access.isAdmin) socket.join(rooms.admins);
-    else if (access.partnerId && access.permissions.has('messages.view')) socket.join(rooms.partner(access.partnerId));
 
     /** Re-read the profile (30s cache) so a deactivated account stops working mid-connection. */
     const current = async () => {
