@@ -1,0 +1,42 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "db:check": "node scripts/check-db.mjs",
+    "seed": "node scripts/seed.mjs",
+    "test:flow": "node scripts/e2e-flow.mjs",
+    "migrate": "node scripts/migrate.mjs",
+    "email:test": "node scripts/simulate-email.mjs",
+    "ai:check": "node scripts/check-ai.mjs",
+    "test:catalogue": "node scripts/e2e-catalogue-chat.mjs",
+    "test:stripe": "node scripts/test-stripe.mjs",
+    "db:bundle": "node scripts/build-sql.mjs",
+    "admin:create": "node scripts/create-admin.mjs",
+    "test:rbac": "node scripts/e2e-rbac.mjs",
+    "audit:routes": "node scripts/audit-routes.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.5",
+    "express": "^5.2.1",
+    "ioredis": "^6.0.0",
+    "jose": "^6.2.12",
+    "morgan": "^1.12.1",
+    "pg": "^8.23.1",
+    "socket.io": "^4.8.4",
+    "stripe": "^23.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14",
+    "socket.io-client": "^4.8.4"
+  }
+}
