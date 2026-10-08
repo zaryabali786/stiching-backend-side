@@ -7,7 +7,7 @@ import { unwrap, unwrapOne, round2 } from '../utils/db.js';
 import { STATUS_GROUPS, STATUS_LABELS, setOrderStatus, addEvent, notifyPartnerAboutOrder, syncOrderFromCards, logUnitEvent, buildUnitTimeline } from '../services/order.service.js';
 import { notifyStaff, notifyAdmins, notifyPartner, notifyUser } from '../services/notification.service.js';
 import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
-import { resolveOrderRefs, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
+import { resolveOrderRefs, resolveOrderPartner, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
 import { createMessage } from '../services/chat.service.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
 import { linkImportToOrder } from '../services/order-import.service.js';
@@ -20,6 +20,7 @@ const ORDER_DETAIL_SELECT = `
   *,
   brand_ref:brands!orders_brand_id_fkey(id, name),
   courier:couriers!orders_courier_id_fkey(id, name, requires_tracking),
+  partner:partners!orders_partner_id_fkey(id, name, short_code, city, receiving_name, receiving_address, receiving_city, receiving_phone),
   units:order_units!order_units_order_id_fkey(
     *,
     size_chart:size_charts(id, name, person_name, variation, nearest_size, measurements, notes, notes_audio),
@@ -172,8 +173,7 @@ export const getClientOrders = catchAsync(async (req, res) => {
     .range(q.from, q.to);
 
   const status = req.query.status;
-  if (status === 'active') query = query.in('status', ['draft', ...STATUS_GROUPS.active]);
-  else if (status && STATUS_GROUPS[status]) query = query.in('status', STATUS_GROUPS[status]);
+  if (status && STATUS_GROUPS[status]) query = query.in('status', STATUS_GROUPS[status]);
   else if (status && STATUS_LABELS[status]) query = query.eq('status', status);
   if (q.search) query = query.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
 
@@ -185,6 +185,21 @@ export const getClientOrders = catchAsync(async (req, res) => {
     status_label: STATUS_LABELS[o.status],
   }));
   return sendPage(res, rows, q, result.count);
+});
+
+/** GET /api/client/orders/counts -> { all, draft, active, completed } for the tab bubbles. */
+export const getClientOrderCounts = catchAsync(async (req, res) => {
+  const count = async (statuses) => {
+    let q = supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).eq('customer_id', req.userId);
+    if (statuses) q = q.in('status', statuses);
+    const r = await q;
+    if (r.error) throw new Error('Could not count orders');
+    return r.count || 0;
+  };
+  const [all, draft, active, completed] = await Promise.all([
+    count(null), count(STATUS_GROUPS.draft), count(STATUS_GROUPS.active), count(STATUS_GROUPS.completed),
+  ]);
+  return ApiResponse.success(res, { all, draft, active, completed });
 });
 
 export const getClientOrder = catchAsync(async (req, res) => {
@@ -234,12 +249,13 @@ const cleanUnit = (u, i) => {
 export const createClientOrder = catchAsync(async (req, res) => {
   const body = req.body || {};
   const refs = await resolveOrderRefs(body);
+  const partnerId = await resolveOrderPartner(body.partner_id);
   if (!Array.isArray(body.units) || body.units.length === 0) throw new BadRequestError('Add at least one article.');
   if (body.units.length > 30) throw new BadRequestError('An order can have at most 30 articles.');
 
   const units = body.units.map(cleanUnit);
   const uploads = body.units.map((u) => (Array.isArray(u.reference_uploads) ? u.reference_uploads.slice(0, 4) : []));
-  const picks = await resolveUnitArticles(body.units);
+  const picks = await resolveUnitArticles(body.units, [], partnerId);
   const noteAudios = await Promise.all(body.units.map((u) => cleanVoiceNote(u.notes_audio, req.userId)));
 
   // Size charts must belong to this customer
@@ -263,6 +279,8 @@ export const createClientOrder = catchAsync(async (req, res) => {
         customer_name: p.full_name || p.email,
         customer_code: p.customer_code,
         ...refs,
+        // the partner the customer chose; null lets the admin's assignment rule decide
+        partner_id: partnerId,
         brand_order_number: body.brand_order_number?.trim() || null,
         customer_notes: note,
         priority: 'normal',
@@ -348,6 +366,11 @@ export const updateClientOrder = catchAsync(async (req, res) => {
   const body = req.body || {};
 
   const patch = {};
+  // the partner can only be chosen (or changed) while the order is still a draft: after that the customer has been told where to ship
+  if (isDraft && body.partner_id !== undefined) {
+    const chosen = await resolveOrderPartner(body.partner_id);
+    if (chosen) patch.partner_id = chosen;
+  }
   if (isDraft || body.brand_id !== undefined || body.courier_id !== undefined || body.international_shipping !== undefined || body.tracking_number !== undefined) {
     // validate the shipping block as a whole, filling gaps from the current order
     Object.assign(
@@ -380,7 +403,7 @@ export const updateClientOrder = catchAsync(async (req, res) => {
     // articles an existing piece already has stay valid even if the partner switched them off since
     const already = body.units.map((u) => new Set((existing.find((e) => e.id === u.id)?.picks || []).map((x) => x.article_id)));
     const cleaned = body.units.map(cleanUnit);
-    const picks = await resolveUnitArticles(body.units, already);
+    const picks = await resolveUnitArticles(body.units, already, patch.partner_id ?? order.partner_id ?? null);
     const noteAudios = await Promise.all(body.units.map((u) => cleanVoiceNote(u.notes_audio, req.userId)));
     const editCharts = await loadChartsFor(req.userId, [...new Set(cleaned.map((u) => u.size_chart_id).filter(Boolean))]);
 

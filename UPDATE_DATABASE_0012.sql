@@ -1,4 +1,4 @@
--- V360: run ONLY this if migrations 0001-0003 were already applied (it carries 0004 + 0005 + 0006 + 0007 + 0008 + 0009 + 0010 + 0011). Safe to run more than once.
+-- V360: run ONLY this if migrations 0001-0003 were already applied (it carries 0004 + 0005 + 0006 + 0007 + 0008 + 0009 + 0010 + 0011 + 0012). Safe to run more than once.
 -- ==============================================================================
 -- 0004_catalogue_chat.sql
 -- 1. Managed catalogues: brands, couriers, article types + articles (neckline, sleeves,
@@ -919,3 +919,27 @@ $$ LANGUAGE plpgsql SET search_path = public;
 DROP TRIGGER IF EXISTS trg_orders_default_partner ON public.orders;
 CREATE TRIGGER trg_orders_default_partner BEFORE INSERT OR UPDATE OF status ON public.orders
   FOR EACH ROW EXECUTE FUNCTION public.assign_default_partner();
+
+
+-- ==============================================================================
+-- 0012_banners.sql
+-- Home-page banners managed by the admin and shown to customers in the client app.
+-- Each banner has a picture and an optional link opened when the customer taps it.
+-- Safe to run more than once.
+-- ==============================================================================
+
+CREATE TABLE IF NOT EXISTS public.banners (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title       TEXT,
+  image_url   TEXT NOT NULL,
+  image_path  TEXT,
+  link_url    TEXT,
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS banners_active_order_idx ON public.banners (is_active, sort_order, created_at DESC);
+
+ALTER TABLE public.banners ENABLE ROW LEVEL SECURITY;

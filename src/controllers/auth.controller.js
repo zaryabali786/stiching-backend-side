@@ -1,6 +1,8 @@
 import UserModel from '../models/user.model.js';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
+import { loadClientTheme } from './theme.controller.js';
+import { loadPortalTheme } from './portal-theme.controller.js';
 import { catchAsync, BadRequestError, UnauthorizedError, ForbiddenError, ApiResponse } from '../utils/error.helper.js';
 import { identityFromCode, isGoogleEnabled } from '../services/google-auth.service.js';
 import { resolveAccess, accessPayload } from '../services/access.service.js';
@@ -226,7 +228,7 @@ export const changePassword = catchAsync(async (req, res) => {
 /**
  * GET /api/config — public platform settings (ship-to address etc.)
  */
-export const getPublicConfig = (req, res) =>
+export const getPublicConfig = catchAsync(async (req, res) =>
   ApiResponse.success(
     res,
     {
@@ -234,6 +236,9 @@ export const getPublicConfig = (req, res) =>
       // the publishable key is safe to expose; the secret key never leaves the server
       google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null },
       payments: { stripe: { enabled: !!config.stripe.secretKey && !!config.stripe.publishableKey, publishableKey: config.stripe.publishableKey || null } },
+      theme: await loadClientTheme(),
+      portalTheme: await loadPortalTheme(),
     },
     'Platform config'
-  );
+  )
+);

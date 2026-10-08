@@ -54,6 +54,12 @@ import {
   markParcelDelivered,
 } from '../controllers/finance.controller.js';
 
+import { listHomeArticles, getAdminHomeLayout, saveAdminHomeLayout, uploadHomeImage } from '../controllers/home-layout.controller.js';
+import { getClientTheme, setClientTheme, createClientPreset, deleteClientPreset } from '../controllers/theme.controller.js';
+import { getDashboard, getDashboardLayout, setDashboardLayout, resetDashboardLayout } from '../controllers/dashboard.controller.js';
+import { getPortalTheme, setPortalTheme, resetPortalTheme, createPortalPreset, deletePortalPreset } from '../controllers/portal-theme.controller.js';
+import { getBanners, createBanner, updateBanner, deleteBanner } from '../controllers/banner.controller.js';
+
 import { inActivePartnerOrder } from '../middlewares/ownership.middleware.js';
 
 const router = Router();
@@ -102,6 +108,33 @@ router.get('/shipping-rates', getShippingRates);
 router.post('/shipping-rates', createShippingRate);
 router.patch('/shipping-rates/:id', updateShippingRate);
 router.delete('/shipping-rates/:id', deleteShippingRate);
+
+// Customer app home page sections
+router.get('/home-layout', getAdminHomeLayout);
+router.get('/home-layout/articles', listHomeArticles);
+router.put('/home-layout', saveAdminHomeLayout);
+router.post('/home-layout/image', uploadHomeImage);
+
+// Customer app appearance (colours, fonts)
+router.get('/settings/client-theme', getClientTheme);
+router.put('/settings/client-theme', setClientTheme);
+router.post('/settings/client-theme/presets', createClientPreset);
+router.delete('/settings/client-theme/presets/:id', deleteClientPreset);
+router.get('/dashboard', getDashboard);
+router.get('/dashboard/layout', getDashboardLayout);
+router.put('/dashboard/layout', setDashboardLayout);
+router.delete('/dashboard/layout', resetDashboardLayout);
+router.get('/settings/portal-theme', getPortalTheme);
+router.put('/settings/portal-theme', setPortalTheme);
+router.delete('/settings/portal-theme', resetPortalTheme);
+router.post('/settings/portal-theme/presets', createPortalPreset);
+router.delete('/settings/portal-theme/presets/:id', deletePortalPreset);
+
+// Home-page banners
+router.get('/banners', getBanners);
+router.post('/banners', createBanner);
+router.patch('/banners/:id', updateBanner);
+router.delete('/banners/:id', deleteBanner);
 
 // Invoices
 router.get('/invoices', getAdminInvoices);

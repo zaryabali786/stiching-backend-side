@@ -59,7 +59,7 @@ export const resolveOrderRefs = async (body, { order = null } = {}) => {
  * @param {Set<string>[]} [alreadyPicked] per piece, the article ids it already has (edit)
  * @returns {{ rows: { article_type_id: string, article_id: string }[], design: Record<string,string> }[]} per piece
  */
-export const resolveUnitArticles = async (rawUnits, alreadyPicked = []) => {
+export const resolveUnitArticles = async (rawUnits, alreadyPicked = [], partnerId = null) => {
   const wanted = rawUnits.map((u) => {
     const ids = Array.isArray(u.article_ids) ? u.article_ids : [];
     if (ids.length > 40) throw new BadRequestError('Too many article choices for one piece.');
@@ -70,7 +70,7 @@ export const resolveUnitArticles = async (rawUnits, alreadyPicked = []) => {
   if (!all.length) return wanted.map(() => ({ rows: [], design: {} }));
 
   const found = unwrap(
-    await supabaseAdmin.from('articles').select('id, name, status, article_type_id, type:article_types(id, name, status)').in('id', all),
+    await supabaseAdmin.from('articles').select('id, name, status, article_type_id, partner_id, type:article_types(id, name, status, partner_id)').in('id', all),
     'Could not check the selected articles'
   );
   const byId = new Map(found.map((a) => [a.id, a]));
@@ -87,6 +87,10 @@ export const resolveUnitArticles = async (rawUnits, alreadyPicked = []) => {
       if (!keptFromBefore && (article.status !== 'active' || type?.status !== 'active')) {
         throw new BadRequestError(`"${article.name}" is not available any more. Please choose again.`);
       }
+      // a partner only offers its own articles and the shared ones
+      if (partnerId && ((article.partner_id && article.partner_id !== partnerId) || (type?.partner_id && type.partner_id !== partnerId))) {
+        throw new BadRequestError(`"${article.name}" is not offered by the partner you chose. Please choose again.`);
+      }
       if (seenTypes.has(article.article_type_id)) throw new BadRequestError(`Choose only one ${type?.name || 'option'} per piece.`);
       seenTypes.add(article.article_type_id);
       rows.push({ article_type_id: article.article_type_id, article_id: article.id });
@@ -102,4 +106,18 @@ export const saveUnitArticles = async (unitId, rows) => {
   unwrap(await supabaseAdmin.from('order_unit_articles').delete().eq('unit_id', unitId), 'Could not update the article choices');
   if (!rows.length) return;
   unwrap(await supabaseAdmin.from('order_unit_articles').insert(rows.map((r) => ({ ...r, unit_id: unitId }))), 'Could not save the article choices');
+};
+
+/**
+ * The stitching partner the customer chose. Returns its id, or null when the customer left it to the platform
+ * ("auto" / nothing): the assignment rule set by the admin then picks one when the order is submitted.
+ */
+export const resolveOrderPartner = async (value) => {
+  if (value === undefined || value === null || value === '' || value === 'auto') return null;
+  if (!isUuid(value)) throw new BadRequestError('Choose a valid stitching partner.');
+  const partner = unwrap(await supabaseAdmin.from('partners').select('id, status, is_listed, permissions').eq('id', value).maybeSingle(), 'Could not check the partner');
+  if (!partner || partner.status !== 'active' || !partner.is_listed || !(partner.permissions || []).includes('receiving.view')) {
+    throw new BadRequestError('That partner is not taking orders right now. Please choose another.');
+  }
+  return partner.id;
 };

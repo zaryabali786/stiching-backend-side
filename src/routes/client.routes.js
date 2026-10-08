@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   getClientOverview,
   getClientOrders,
+  getClientOrderCounts,
   getClientOrder,
   createClientOrder,
   updateClientOrder,
@@ -31,16 +32,23 @@ import {
   lookupArticles,
   addBrandAsCustomer,
 } from '../controllers/catalogue.controller.js';
+import { listClientPartners } from '../controllers/partner-directory.controller.js';
 import { getInbox, getMailbox, getUnreadCount, getEmail, readAll, removeEmail } from '../controllers/inbox.controller.js';
 import { previewProduct } from '../controllers/client.controller.js';
 import { getMessages, postMessage, uploadVoice, readMessages, uploadVoiceNote, getConversationScopes, getMyConversations } from '../controllers/chat.controller.js';
 import { createPaymentIntent, confirmPayment } from '../controllers/payment.controller.js';
 
+import { getClientHomeLayout } from '../controllers/home-layout.controller.js';
+import { getActiveBanners } from '../controllers/banner.controller.js';
+
 const router = Router();
 
 router.get('/overview', getClientOverview);
+router.get('/banners', getActiveBanners);
+router.get('/home-layout', getClientHomeLayout);
 
 router.get('/orders', getClientOrders);
+router.get('/orders/counts', getClientOrderCounts);
 router.post('/orders', createClientOrder);
 router.get('/orders/:id', getClientOrder);
 router.patch('/orders/:id', updateClientOrder);
@@ -71,6 +79,7 @@ router.get('/inbox/:id', getEmail);
 router.delete('/inbox/:id', removeEmail);
 
 // Order form lookups: active rows only, searchable and paginated on the server, never any price
+router.get('/partners', listClientPartners);
 router.get('/brands', lookupBrands);
 router.post('/brands', addBrandAsCustomer);
 router.get('/couriers', lookupCouriers);

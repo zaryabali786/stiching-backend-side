@@ -18,6 +18,41 @@ const cleanName = (value) => {
   return name;
 };
 
+/** The customer-facing profile of a partner and the address parcels are sent to. Only fields present in the body are returned. */
+const text = (v, max, label) => {
+  const out = String(v ?? '').replace(/\s+/g, ' ').trim();
+  if (out.length > max) throw new BadRequestError(`${label} must be ${max} characters or fewer.`);
+  return out || null;
+};
+const cleanProfileFields = (b) => {
+  const out = {};
+  if (b.short_code !== undefined) {
+    const code = String(b.short_code ?? '').trim().toUpperCase();
+    if (code && !/^[A-Z0-9]{1,6}$/.test(code)) throw new BadRequestError('The short code can have up to 6 letters or numbers, for example P3.');
+    out.short_code = code || null;
+  }
+  if (b.city !== undefined) out.city = text(b.city, 60, 'City');
+  if (b.tagline !== undefined) out.tagline = text(b.tagline, 120, 'Tagline');
+  if (b.turnaround_days !== undefined) {
+    const n = b.turnaround_days === null || b.turnaround_days === '' ? null : Number(b.turnaround_days);
+    if (n !== null && (!Number.isInteger(n) || n < 1 || n > 120)) throw new BadRequestError('Turnaround must be a whole number of days (1 to 120).');
+    out.turnaround_days = n;
+  }
+  if (b.is_listed !== undefined) out.is_listed = b.is_listed === true || b.is_listed === 'true';
+  if (b.receiving_name !== undefined) out.receiving_name = text(b.receiving_name, 100, 'Receiving name');
+  if (b.receiving_address !== undefined) out.receiving_address = text(b.receiving_address, 300, 'Receiving address');
+  if (b.receiving_city !== undefined) out.receiving_city = text(b.receiving_city, 60, 'Receiving city');
+  if (b.receiving_phone !== undefined) out.receiving_phone = text(b.receiving_phone, 40, 'Receiving phone');
+  return out;
+};
+
+const assertCodeFree = async (code, exceptId) => {
+  if (!code) return;
+  let q = supabaseAdmin.from('partners').select('id').ilike('short_code', code);
+  if (exceptId) q = q.neq('id', exceptId);
+  if ((await q.maybeSingle()).data) throw new ConflictError(`The short code ${code} is already used by another partner.`);
+};
+
 const cleanPerms = (list) => {
   try {
     return normalizePermissions(list ?? []);
@@ -114,8 +149,11 @@ export const createPartner = catchAsync(async (req, res) => {
   if (dupe.data) throw new ConflictError(`A partner called "${name}" already exists.`);
 
   const { count } = await supabaseAdmin.from('partners').select('id', { count: 'exact', head: true });
+  const profileFields = cleanProfileFields(b);
+  if (!profileFields.short_code) profileFields.short_code = `P${(count || 0) + 1}`;
+  await assertCodeFree(profileFields.short_code);
   const partner = unwrap(
-    await supabaseAdmin.from('partners').insert({ name, permissions, status: 'active', is_default: !count, created_by: req.userId }).select('*').single(),
+    await supabaseAdmin.from('partners').insert({ name, permissions, status: 'active', is_default: !count, created_by: req.userId, ...profileFields }).select('*').single(),
     'Could not create the partner'
   );
   let created;
@@ -157,6 +195,8 @@ export const updatePartner = catchAsync(async (req, res) => {
     patch.permissions = cleanPerms(b.permissions);
     if (!patch.permissions.length) throw new BadRequestError('Enable at least one module, or switch the partner off instead.');
   }
+  Object.assign(patch, cleanProfileFields(b));
+  if (patch.short_code) await assertCodeFree(patch.short_code, partner.id);
   if (b.is_default === false && partner.is_default) throw new BadRequestError('Make another partner the default instead.');
   if (!Object.keys(patch).length && b.is_default !== true) throw new BadRequestError('Nothing to update.');
 

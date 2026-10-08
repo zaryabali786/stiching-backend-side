@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../config/supabase.js';
-import { catchAsync, ApiResponse, BadRequestError, ConflictError, NotFoundError } from '../utils/error.helper.js';
+import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
+import { scopeOf } from '../services/access.service.js';
 import { parseListQuery, sendPage } from '../utils/pagination.js';
 import { unwrap, unwrapOne, round2 } from '../utils/db.js';
 import { uploadCatalogueImage, removeStoredFile } from '../services/storage.service.js';
@@ -12,6 +13,31 @@ import { uploadCatalogueImage, removeStoredFile } from '../services/storage.serv
  */
 
 const STATUSES = ['active', 'inactive'];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Who owns what: article types and articles belong to one partner, or to nobody (partner_id NULL = shared by every partner).
+ * A partner (or an admin working as a partner) sees the shared rows plus its own, and can only change its own.
+ * An admin without a selected partner sees and manages everything; what that admin creates is shared.
+ */
+const ownerOf = (req) => scopeOf(req.access) ?? null;
+const visibleToStaff = (req, query) => {
+  const scope = scopeOf(req.access);
+  return scope === undefined ? query : query.or(`partner_id.is.null,partner_id.eq.${scope}`);
+};
+const assertCanEdit = (req, row, what) => {
+  const scope = scopeOf(req.access);
+  if (scope !== undefined && row.partner_id !== scope) {
+    throw new ForbiddenError(row.partner_id ? `This ${what} belongs to another partner.` : `This ${what} is shared by every partner, so only the admin can change it. Add your own instead.`);
+  }
+};
+/** The customer's chosen partner (?partner_id=): shared rows plus that partner's. Without it every row is offered. */
+const partnerOfQuery = (req) => {
+  const id = String(req.query.partner_id || '');
+  if (!id) return null;
+  if (!UUID.test(id)) throw new BadRequestError('partner_id is not valid.');
+  return id;
+};
 
 const cleanName = (value, label, max) => {
   const name = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -46,7 +72,7 @@ const asBool = (value, fallback) => (value === undefined || value === null ? fal
 /** Case-insensitive exact-name lookup (the unique index is on lower(btrim(name))). */
 const findByName = async (table, name, scope = {}) => {
   let q = supabaseAdmin.from(table).select('id, name, status').ilike('name', name.replace(/[%_\\]/g, (c) => `\\${c}`));
-  for (const [k, v] of Object.entries(scope)) q = q.eq(k, v);
+  for (const [k, v] of Object.entries(scope)) q = v === null ? q.is(k, null) : q.eq(k, v);
   const { data } = await q.limit(5);
   return (data || []).find((r) => r.name.trim().toLowerCase() === name.toLowerCase()) || null;
 };
@@ -165,7 +191,7 @@ export const addBrandAsCustomer = catchAsync(async (req, res) => {
 
 // ═════════════════════════════ Article types ═════════════════════════════
 
-const TYPE_COLUMNS = 'id, name, status, sort_order, created_at, updated_at';
+const TYPE_COLUMNS = 'id, name, status, sort_order, partner_id, created_at, updated_at';
 
 /** GET /api/partner/article-types?search&status&page&limit — each row has `articles_count` */
 export const listArticleTypes = catchAsync(async (req, res) => {
@@ -176,7 +202,7 @@ export const listArticleTypes = catchAsync(async (req, res) => {
     .order(q.sort, { ascending: q.ascending })
     .order('name', { ascending: true })
     .range(q.from, q.to);
-  query = searchFilter(statusFilter(req, query), q.search);
+  query = searchFilter(statusFilter(req, visibleToStaff(req, query)), q.search);
   const result = await query;
   const rows = unwrap(result, 'Could not load article types').map(({ articles, ...t }) => ({ ...t, articles_count: articles?.[0]?.count ?? 0 }));
   return sendPage(res, rows, q, result.count);
@@ -184,7 +210,8 @@ export const listArticleTypes = catchAsync(async (req, res) => {
 
 export const createArticleType = catchAsync(async (req, res) => {
   const name = cleanName(req.body?.name, 'Article type', 60);
-  if (await findByName('article_types', name)) throw new ConflictError(`Article type "${name}" already exists.`);
+  const owner = ownerOf(req);
+  if (await findByName('article_types', name, { partner_id: owner })) throw new ConflictError(`Article type "${name}" already exists.`);
   let sortOrder = cleanSortOrder(req.body?.sort_order, null);
   if (sortOrder === null) {
     // new types go to the end by default
@@ -192,18 +219,19 @@ export const createArticleType = catchAsync(async (req, res) => {
     sortOrder = (data?.[0]?.sort_order ?? 0) + 10;
   }
   const created = unwrap(
-    await supabaseAdmin.from('article_types').insert({ name, status: cleanStatus(req.body?.status, 'active'), sort_order: sortOrder }).select(TYPE_COLUMNS).single(),
+    await supabaseAdmin.from('article_types').insert({ name, status: cleanStatus(req.body?.status, 'active'), sort_order: sortOrder, partner_id: owner }).select(TYPE_COLUMNS).single(),
     'Could not create the article type'
   );
   return ApiResponse.created(res, { ...created, articles_count: 0 }, `${name} added. Now add its articles.`);
 });
 
 export const updateArticleType = catchAsync(async (req, res) => {
-  const current = unwrapOne(await supabaseAdmin.from('article_types').select('id, name').eq('id', req.params.id).maybeSingle(), 'Article type not found');
+  const current = unwrapOne(await supabaseAdmin.from('article_types').select('id, name, partner_id').eq('id', req.params.id).maybeSingle(), 'Article type not found');
+  assertCanEdit(req, current, 'article type');
   const patch = {};
   if (req.body?.name !== undefined) {
     patch.name = cleanName(req.body.name, 'Article type', 60);
-    const dupe = await findByName('article_types', patch.name);
+    const dupe = await findByName('article_types', patch.name, { partner_id: current.partner_id });
     if (dupe && dupe.id !== current.id) throw new ConflictError(`Article type "${patch.name}" already exists.`);
   }
   if (req.body?.status !== undefined) patch.status = cleanStatus(req.body.status);
@@ -214,7 +242,8 @@ export const updateArticleType = catchAsync(async (req, res) => {
 });
 
 export const deleteArticleType = catchAsync(async (req, res) => {
-  const current = unwrapOne(await supabaseAdmin.from('article_types').select('id, name').eq('id', req.params.id).maybeSingle(), 'Article type not found');
+  const current = unwrapOne(await supabaseAdmin.from('article_types').select('id, name, partner_id').eq('id', req.params.id).maybeSingle(), 'Article type not found');
+  assertCanEdit(req, current, 'article type');
   const { count } = await supabaseAdmin.from('articles').select('id', { count: 'exact', head: true }).eq('article_type_id', current.id);
   if (count) {
     throw new ConflictError(`"${current.name}" still has ${count} article${count === 1 ? '' : 's'}. Delete them first, or deactivate the type to hide it from customers.`);
@@ -229,6 +258,7 @@ export const deleteArticleType = catchAsync(async (req, res) => {
  */
 export const lookupArticleTypes = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 20, maxLimit: 50, sortable: ['name', 'sort_order'], defaultSort: 'sort_order', defaultDir: 'asc' });
+  const partnerId = partnerOfQuery(req);
   let query = supabaseAdmin
     .from('article_types')
     .select('id, name, sort_order, articles!inner(id)', { count: 'exact' })
@@ -238,6 +268,9 @@ export const lookupArticleTypes = catchAsync(async (req, res) => {
     .order('sort_order', { ascending: true })
     .order('name', { ascending: true })
     .range(q.from, q.to);
+  if (partnerId) {
+    query = query.or(`partner_id.is.null,partner_id.eq.${partnerId}`).or(`partner_id.is.null,partner_id.eq.${partnerId}`, { referencedTable: 'articles' });
+  }
   query = searchFilter(query, q.search);
   const result = await query;
   const rows = unwrap(result, 'Could not load article types').map(({ articles, ...t }) => t);
@@ -249,7 +282,7 @@ export const lookupArticleTypes = catchAsync(async (req, res) => {
 /** margin = customer price - partner cost (null until both are set) */
 const withMargin = (a) => ({ ...a, margin: a.customer_price === null || a.customer_price === undefined || a.partner_cost === null || a.partner_cost === undefined ? null : round2(Number(a.customer_price) - Number(a.partner_cost)) });
 
-const ARTICLE_COLUMNS = 'id, article_type_id, name, image_url, customer_price, partner_cost, status, sort_order, created_at, updated_at';
+const ARTICLE_COLUMNS = 'id, article_type_id, name, image_url, customer_price, partner_cost, status, sort_order, partner_id, created_at, updated_at';
 
 /** GET /api/partner/articles?type_id&search&status&page&limit */
 export const listArticles = catchAsync(async (req, res) => {
@@ -261,7 +294,7 @@ export const listArticles = catchAsync(async (req, res) => {
     .order('name', { ascending: true })
     .range(q.from, q.to);
   if (req.query.type_id) query = query.eq('article_type_id', req.query.type_id);
-  query = searchFilter(statusFilter(req, query), q.search);
+  query = searchFilter(statusFilter(req, visibleToStaff(req, query)), q.search);
   const result = await query;
   return sendPage(res, unwrap(result, 'Could not load articles').map(withMargin), q, result.count);
 });
@@ -282,11 +315,13 @@ const saveImage = async (req, current = null) => {
 
 export const createArticle = catchAsync(async (req, res) => {
   const type = unwrapOne(
-    await supabaseAdmin.from('article_types').select('id, name').eq('id', req.body?.article_type_id || '00000000-0000-0000-0000-000000000000').maybeSingle(),
+    await supabaseAdmin.from('article_types').select('id, name, partner_id').eq('id', req.body?.article_type_id || '00000000-0000-0000-0000-000000000000').maybeSingle(),
     'Choose which article type this belongs to'
   );
+  const owner = ownerOf(req);
+  if (type.partner_id && type.partner_id !== owner && owner !== null) throw new ForbiddenError('That article type belongs to another partner.');
   const name = cleanName(req.body?.name, 'Article', 100);
-  if (await findByName('articles', name, { article_type_id: type.id })) throw new ConflictError(`"${name}" already exists under ${type.name}.`);
+  if (await findByName('articles', name, { article_type_id: type.id, partner_id: owner })) throw new ConflictError(`"${name}" already exists under ${type.name}.`);
 
   let sortOrder = cleanSortOrder(req.body?.sort_order, null);
   if (sortOrder === null) {
@@ -297,7 +332,7 @@ export const createArticle = catchAsync(async (req, res) => {
   const created = unwrap(
     await supabaseAdmin
       .from('articles')
-      .insert({ article_type_id: type.id, name, customer_price: cleanPrice(req.body?.customer_price) ?? null, partner_cost: cleanPrice(req.body?.partner_cost) ?? null, status: cleanStatus(req.body?.status, 'active'), sort_order: sortOrder, ...image })
+      .insert({ article_type_id: type.id, name, customer_price: cleanPrice(req.body?.customer_price) ?? null, partner_cost: cleanPrice(req.body?.partner_cost) ?? null, status: cleanStatus(req.body?.status, 'active'), sort_order: sortOrder, partner_id: owner, ...image })
       .select(ARTICLE_COLUMNS)
       .single(),
     'Could not create the article'
@@ -306,11 +341,12 @@ export const createArticle = catchAsync(async (req, res) => {
 });
 
 export const updateArticle = catchAsync(async (req, res) => {
-  const current = unwrapOne(await supabaseAdmin.from('articles').select('id, name, article_type_id, image_path').eq('id', req.params.id).maybeSingle(), 'Article not found');
+  const current = unwrapOne(await supabaseAdmin.from('articles').select('id, name, article_type_id, image_path, partner_id').eq('id', req.params.id).maybeSingle(), 'Article not found');
+  assertCanEdit(req, current, 'article');
   const patch = {};
   if (req.body?.name !== undefined) {
     patch.name = cleanName(req.body.name, 'Article', 100);
-    const dupe = await findByName('articles', patch.name, { article_type_id: current.article_type_id });
+    const dupe = await findByName('articles', patch.name, { article_type_id: current.article_type_id, partner_id: current.partner_id });
     if (dupe && dupe.id !== current.id) throw new ConflictError(`"${patch.name}" already exists in this article type.`);
   }
   if (req.body?.customer_price !== undefined) patch.customer_price = cleanPrice(req.body.customer_price);
@@ -324,7 +360,8 @@ export const updateArticle = catchAsync(async (req, res) => {
 });
 
 export const deleteArticle = catchAsync(async (req, res) => {
-  const current = unwrapOne(await supabaseAdmin.from('articles').select('id, name, image_path').eq('id', req.params.id).maybeSingle(), 'Article not found');
+  const current = unwrapOne(await supabaseAdmin.from('articles').select('id, name, image_path, partner_id').eq('id', req.params.id).maybeSingle(), 'Article not found');
+  assertCanEdit(req, current, 'article');
   const { count } = await supabaseAdmin.from('order_unit_articles').select('id', { count: 'exact', head: true }).eq('article_id', current.id);
   if (count) {
     unwrap(await supabaseAdmin.from('articles').update({ status: 'inactive' }).eq('id', current.id));
@@ -343,19 +380,27 @@ export const lookupArticles = catchAsync(async (req, res) => {
   const typeId = String(req.query.type_id || '');
   if (!typeId) throw new BadRequestError('type_id is required.');
   const q = parseListQuery(req, { defaultLimit: 20, maxLimit: 50, sortable: ['name'], defaultSort: 'name', defaultDir: 'asc' });
+  const partnerId = partnerOfQuery(req);
   const type = await supabaseAdmin.from('article_types').select('id').eq('id', typeId).eq('status', 'active').maybeSingle();
   if (!type.data) throw new NotFoundError('Article type not found');
 
   let query = supabaseAdmin
     .from('articles')
-    .select('id, article_type_id, name, image_url', { count: 'exact' })
+    .select('id, article_type_id, name, image_url, partner_id', { count: 'exact' })
     .eq('article_type_id', typeId)
     .eq('status', 'active')
     .order('sort_order', { ascending: true })
     .order('name', { ascending: true })
     .range(q.from, q.to);
+  if (partnerId) query = query.or(`partner_id.is.null,partner_id.eq.${partnerId}`);
   query = searchFilter(query, q.search);
   const result = await query;
-  return sendPage(res, unwrap(result, 'Could not load articles'), q, result.count);
+  let rows = unwrap(result, 'Could not load articles');
+  if (partnerId) {
+    // the partner's own article replaces a shared one with the same name
+    const own = new Set(rows.filter((a) => a.partner_id === partnerId).map((a) => a.name.trim().toLowerCase()));
+    rows = rows.filter((a) => a.partner_id === partnerId || !own.has(a.name.trim().toLowerCase()));
+  }
+  return sendPage(res, rows.map(({ partner_id, ...a }) => a), q, result.count);
 });
 
