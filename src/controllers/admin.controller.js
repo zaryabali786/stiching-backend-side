@@ -15,6 +15,7 @@ import { activePartnerOf, inActivePartner } from '../services/access.service.js'
 import { loadShipTo, saveShipTo } from '../services/ship-to.service.js';
 import { postexSettingsView, savePostexSettings, getOperationalCities, listMerchantAddresses } from '../services/postex.service.js';
 import { loadExpressStitching, saveExpressStitching } from '../services/express-stitching.service.js';
+import { loadExpressShipping, saveExpressShipping } from '../services/express-shipping.service.js';
 import { resolveCourier } from '../services/courier.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
@@ -543,6 +544,21 @@ export const setExpressStitching = catchAsync(async (req, res) => {
   if (!Number.isInteger(days) || days < 1 || days > 90) throw new BadRequestError('Days must be a whole number from 1 to 90.');
   const saved = await saveExpressStitching(b, req.userId);
   return ApiResponse.success(res, saved, 'Express stitching saved. Customers now see it when they create an order.');
+});
+
+
+// ─────────────────────────────── Express shipping ───────────────────────────────
+
+/** GET /api/admin/settings/express-shipping -> { enabled, days } */
+export const getExpressShipping = catchAsync(async (req, res) => ApiResponse.success(res, await loadExpressShipping()));
+
+/** PUT /api/admin/settings/express-shipping  body: { enabled, days } */
+export const setExpressShipping = catchAsync(async (req, res) => {
+  const b = req.body || {};
+  const days = Number(b.days);
+  if (!Number.isInteger(days) || days < 1 || days > 90) throw new BadRequestError('Days must be a whole number from 1 to 90.');
+  const saved = await saveExpressShipping(b, req.userId);
+  return ApiResponse.success(res, saved, 'Express shipping saved. Customers now see it when they create an order.');
 });
 
 

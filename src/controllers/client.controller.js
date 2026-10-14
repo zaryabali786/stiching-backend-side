@@ -7,7 +7,8 @@ import { unwrap, unwrapOne, round2 } from '../utils/db.js';
 import { STATUS_GROUPS, STATUS_LABELS, setOrderStatus, addEvent, notifyPartnerAboutOrder, syncOrderFromCards, logUnitEvent, buildUnitTimeline } from '../services/order.service.js';
 import { notifyStaff, notifyAdmins, notifyPartner, notifyUser } from '../services/notification.service.js';
 import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
-import { resolveOrderRefs, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
+import { fallbackPrices, priceKey } from '../services/article-price.service.js';
+import { resolveOrderRefs, internationalFromCountry, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
 import { createMessage } from '../services/chat.service.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
 import { linkImportToOrder } from '../services/order-import.service.js';
@@ -17,6 +18,7 @@ import { cleanMeasurements as cleanMeasurementsRaw, cleanNearestSize as cleanNea
 import { readAssignmentMode } from './admin-partners.controller.js';
 import { decideArticle, approveAllArticles, rejectParcel, requestReturn, releaseArticles, assertOwnUnit, describeArticle } from '../services/unit-review.service.js';
 import { loadExpressStitching, dueAfter } from '../services/express-stitching.service.js';
+import { loadExpressShipping } from '../services/express-shipping.service.js';
 import { shipmentsForUnits } from '../services/return-shipment.service.js';
 import { canCustomerSubmit, returnSummary, returnBadge, groupSummary, articleGroup, groupReference, needsDetails, RETURN_LABELS } from '../services/unit-flow.service.js';
 
@@ -44,7 +46,7 @@ const ORDER_DETAIL_SELECT = `
   units:order_units!order_units_order_id_fkey(
     *,
     size_chart:size_charts(id, name, person_name, variation, nearest_size, measurements, notes, notes_audio),
-    picks:order_unit_articles(article_type_id, article_id, type:article_types(id, name, sort_order), article:articles(id, name, image_url)),
+    picks:order_unit_articles(article_type_id, article_id, type:article_types(id, name, sort_order), article:articles(id, name, image_url, customer_price)),
     card:job_cards(id, stage, qc_passed, cutting_at, stitching_at, qc_at, packed_at, approval_status, approval_photos, approval_requested_at, approval_decided_at, change_request, change_request_audio),
     unit_events:order_unit_events(status, note, created_at)
   ),
@@ -62,7 +64,6 @@ const loadOwnOrder = async (req, select = '*') => {
   return order;
 };
 
-/** The articles picked for a piece, flat and in the partner's type order. Never carries a price. */
 /** What the customer sees about one piece's approval (its own photos and decision). */
 const shapeApproval = (card) => ({
   status: card?.approval_status || 'none',
@@ -87,6 +88,8 @@ const shapeUnit = ({ picks, unit_price, currency, card, unit_events, ...unit }, 
       article_id: p.article_id,
       name: one(p.article)?.name ?? null,
       image_url: one(p.article)?.image_url ?? null,
+      // the article's current customer price (null = on request); the same price the order form lists
+      customer_price: one(p.article)?.customer_price ?? null,
     }))
     .sort((a, b) => a.type_sort - b.type_sort)
     .map(({ type_sort, ...rest }) => rest),
@@ -126,7 +129,12 @@ const orderDetailResponse = async (order) => {
   const returned = (order.units || []).filter((u) => u.return_status && u.return_status !== 'none').map((u) => u.id);
   const shipments = returned.length ? await shipmentsForUnits(returned).catch(() => new Map()) : new Map();
   const withShipments = { ...order, units: (order.units || []).map((u) => ({ ...u, return_shipment: shipments.get(u.id) ?? null })) };
-  return signNoteAudio({ ...shapeOrderDetail(withShipments), return_unit: returnUnit, brand_invoice: await withSignedUrl(order.brand_invoice) });
+  const shaped = shapeOrderDetail(withShipments);
+  // a shared article with no price of its own shows the partners' price, exactly as in the order form
+  const picked = (shaped.units || []).flatMap((u) => u.selected_articles || []);
+  const filled = await fallbackPrices(picked.map((p) => ({ name: p.name, type_name: p.type_name, customer_price: p.customer_price }))).catch(() => new Map());
+  for (const p of picked) if (p.customer_price == null && filled.has(priceKey(p.type_name, p.name))) p.customer_price = filled.get(priceKey(p.type_name, p.name));
+  return signNoteAudio({ ...shaped, return_unit: returnUnit, brand_invoice: await withSignedUrl(order.brand_invoice) });
 };
 
 // ─────────────────────────────── Overview ───────────────────────────────
@@ -314,7 +322,7 @@ export const createClientOrder = catchAsync(async (req, res) => {
   const explicitBrand = !!body.brand_id;
   // "Direct from customer": the brand is chosen per article; the order takes the first article's brand
   if (!body.brand_id) body.brand_id = body.units.find((u) => u.brand_id)?.brand_id;
-  const refs = await resolveOrderRefs(body);
+  const refs = await resolveOrderRefs({ ...body, destination_country: body.destination_country || req.profile?.country });
 
   const units = body.units.map(cleanUnit);
   const unitBrandIds = [...new Set(units.map((u) => u.brand_id).filter(Boolean))];
@@ -341,14 +349,13 @@ export const createClientOrder = catchAsync(async (req, res) => {
   const note = String(body.note ?? body.customer_notes ?? '').trim().slice(0, 2000) || null;
   const expressSetting = await loadExpressStitching();
   const express = body.express_stitching === true && expressSetting.enabled;
+  const shippingSetting = await loadExpressShipping();
+  const expressShip = body.express_shipping === true && shippingSetting.enabled;
   const due = new Date();
   due.setUTCDate(due.getUTCDate() + 12);
   const p = req.profile;
 
-  const order = unwrap(
-    await supabaseAdmin
-      .from('orders')
-      .insert({
+  const orderRow = {
         customer_id: req.userId,
         customer_name: p.full_name || p.email,
         customer_code: p.customer_code,
@@ -362,16 +369,23 @@ export const createClientOrder = catchAsync(async (req, res) => {
         priority: express ? 'rush' : 'normal',
         express_stitching: express,
         express_days: express ? expressSetting.days : null,
+        // only written when asked for, so ordering keeps working until database update 0036 is applied
+        ...(expressShip ? { express_shipping: true, express_shipping_days: shippingSetting.days, express_shipping_price: shippingSetting.price_pkr } : {}),
+        ...(express ? { express_stitching_price: expressSetting.price_pkr } : {}),
         due_date: express ? dueAfter(new Date(), expressSetting.days) : due.toISOString().slice(0, 10),
         destination_country: (body.destination_country || p.country || '').trim() || (refs.international_shipping === false ? 'Pakistan' : null),
         destination_city: (body.destination_city || p.city || '').trim() || null,
         destination_address: (body.destination_address || p.address || '').trim() || null,
         destination_phone: (body.destination_phone || p.phone || '').trim().slice(0, 40) || null,
-      })
-      .select('*')
-      .single(),
-    'Could not create order'
-  );
+  };
+  // the express prices are saved with database update 0039: until it is applied the order is made without them
+  const insertOrder = async (row) => supabaseAdmin.from('orders').insert(row).select('*').single();
+  let created = await insertOrder(orderRow);
+  if (created.error && /express_(stitching|shipping)_price/.test(created.error.message || '')) {
+    const { express_stitching_price, express_shipping_price, ...rest } = orderRow;
+    created = await insertOrder(rest);
+  }
+  const order = unwrap(created, 'Could not create order');
 
   const undo = async () => supabaseAdmin.from('orders').delete().eq('id', order.id); // cascades to the pieces
   Object.assign(order, await assignPartnerByRule(order));
@@ -451,10 +465,12 @@ export const updateClientOrder = catchAsync(async (req, res) => {
   const fixedArticles = emailOrder || websiteCompletion;
   if (isDraft && emailOrder && order.parcel_review === 'none') throw new ForbiddenError('You can complete this order after we receive your parcel.');
   const body = req.body || {};
+  // a customer's own parcel names its brand per article: the order takes the first article's brand (as when it was created)
+  if (order.order_source === 'customer' && !body.brand_id && Array.isArray(body.units)) body.brand_id = body.units.find((u) => u?.brand_id)?.brand_id;
 
   const patch = {};
   // customers never choose or change the partner: the admin assigns it (an order without one is at the central location)
-  if (isDraft || body.brand_id !== undefined || body.courier_id !== undefined || body.international_shipping !== undefined || body.tracking_number !== undefined) {
+  if (isDraft || body.brand_id !== undefined || body.courier_id !== undefined || body.international_shipping !== undefined || body.destination_country !== undefined || body.tracking_number !== undefined) {
     // validate the shipping block as a whole, filling gaps from the current order
     Object.assign(
       patch,
@@ -463,7 +479,8 @@ export const updateClientOrder = catchAsync(async (req, res) => {
           brand_id: body.brand_id ?? order.brand_id,
           courier_id: body.courier_id === undefined ? order.courier_id : body.courier_id,
           tracking_number: body.tracking_number === undefined ? order.tracking_number : body.tracking_number,
-          international_shipping: body.international_shipping ?? order.international_shipping,
+          // the delivery country decides; when it is not known the saved value stays
+          international_shipping: body.international_shipping ?? internationalFromCountry(body.destination_country ?? order.destination_country) ?? order.international_shipping,
         },
         { order }
       )
@@ -478,13 +495,31 @@ export const updateClientOrder = catchAsync(async (req, res) => {
     patch.priority = patch.express_stitching ? 'rush' : 'normal';
     // the days come from the admin's setting; turning it off puts the normal lead time back
     patch.express_days = patch.express_stitching ? setting.days : null;
+    // the order keeps the price it was made with: it changes only when express is switched on or off
+    patch.express_stitching_price = patch.express_stitching ? setting.price_pkr : null;
     const base = new Date(order.created_at);
     patch.due_date = patch.express_stitching ? dueAfter(base, setting.days) : dueAfter(base, 12);
   }
+  if (body.express_shipping !== undefined && (body.express_shipping === true) !== !!order.express_shipping) {
+    const setting = await loadExpressShipping();
+    patch.express_shipping = body.express_shipping === true && setting.enabled;
+    patch.express_shipping_days = patch.express_shipping ? setting.days : null;
+    patch.express_shipping_price = patch.express_shipping ? setting.price_pkr : null;
+  }
+  // an order made before express had a price: saving it now fixes the price it is charged (so the form, invoice and payment agree)
+  if ((patch.express_stitching ?? order.express_stitching) && order.express_stitching_price == null && patch.express_stitching_price === undefined) patch.express_stitching_price = (await loadExpressStitching()).price_pkr;
+  if ((patch.express_shipping ?? order.express_shipping) && order.express_shipping_price == null && patch.express_shipping_price === undefined) patch.express_shipping_price = (await loadExpressShipping()).price_pkr;
   for (const key of ['destination_country', 'destination_city', 'destination_address', 'destination_phone']) {
     if (body[key] !== undefined) patch[key] = String(body[key] || '').trim() || null;
   }
-  if (Object.keys(patch).length) unwrap(await supabaseAdmin.from('orders').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', order.id));
+  if (Object.keys(patch).length) {
+    let saved = await supabaseAdmin.from('orders').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', order.id);
+    if (saved.error && /express_(stitching|shipping)_price/.test(saved.error.message || '')) {
+      const { express_stitching_price, express_shipping_price, ...rest } = patch; // database update 0039 is not applied yet
+      saved = Object.keys(rest).length ? await supabaseAdmin.from('orders').update({ ...rest, updated_at: new Date().toISOString() }).eq('id', order.id) : { error: null };
+    }
+    unwrap(saved);
+  }
 
   if (Array.isArray(body.units)) {
     if (!body.units.length) throw new BadRequestError('Add at least one article.');

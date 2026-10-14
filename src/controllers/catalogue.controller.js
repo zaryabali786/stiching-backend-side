@@ -1,3 +1,4 @@
+import { fallbackPrices, priceKey } from '../services/article-price.service.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { scopeOf } from '../services/access.service.js';
@@ -89,13 +90,23 @@ const searchFilter = (query, search, column = 'name') => (search ? query.ilike(c
 // ═════════════════════════════ Brands & couriers (same shape) ═════════════════════════════
 
 const namedCatalogue = ({ table, label, orderColumn, nameMax = 80, extra }) => {
-  const columns = `id, name, status, created_at, updated_at${extra ? `, ${extra.column}` : ''}`;
+  const logo = table === 'brands';
+  const baseColumns = `id, name, status, created_at, updated_at${extra ? `, ${extra.column}` : ''}`;
+  // a logo is kept for brands; until database update 0037 is applied the lists work without it
+  const columns = logo ? `${baseColumns}, logo_url` : baseColumns;
+  const withoutLogo = (run) => async (cols) => {
+    const first = await run(cols);
+    return first.error && /logo_url|logo_path/.test(first.error.message || '') ? run(cols.replace(', logo_url', '')) : first;
+  };
 
   const list = catchAsync(async (req, res) => {
     const q = parseListQuery(req, { defaultLimit: 20, sortable: ['name', 'created_at', 'status'], defaultSort: 'name', defaultDir: 'asc' });
-    let query = supabaseAdmin.from(table).select(columns, { count: 'exact' }).order(q.sort, { ascending: q.ascending }).range(q.from, q.to);
-    query = searchFilter(statusFilter(req, query), q.search);
-    const result = await query;
+    const run = withoutLogo((cols) => {
+      let query = supabaseAdmin.from(table).select(cols, { count: 'exact' }).order(q.sort, { ascending: q.ascending }).range(q.from, q.to);
+      query = searchFilter(statusFilter(req, query), q.search);
+      return query;
+    });
+    const result = await run(columns);
     return sendPage(res, unwrap(result, `Could not load ${label}s`), q, result.count);
   });
 
@@ -108,13 +119,15 @@ const namedCatalogue = ({ table, label, orderColumn, nameMax = 80, extra }) => {
       created_by: req.userId,
       ...(extra ? { [extra.column]: asBool(req.body?.[extra.column], extra.default) } : {}),
     };
+    if (logo) Object.assign(row, await saveLogo(req));
     const created = unwrap(await supabaseAdmin.from(table).insert(row).select(columns).single(), `Could not create ${label.toLowerCase()}`);
     return ApiResponse.created(res, created, `${label} added.`);
   });
 
   const update = catchAsync(async (req, res) => {
-    const current = unwrapOne(await supabaseAdmin.from(table).select('id, name').eq('id', req.params.id).maybeSingle(), `${label} not found`);
+    const current = unwrapOne(await supabaseAdmin.from(table).select(logo ? 'id, name, logo_path' : 'id, name').eq('id', req.params.id).maybeSingle(), `${label} not found`);
     const patch = {};
+    if (logo) Object.assign(patch, await saveLogo(req, current));
     if (req.body?.name !== undefined) {
       patch.name = cleanName(req.body.name, label, nameMax);
       const dupe = await findByName(table, patch.name);
@@ -159,6 +172,21 @@ const namedCatalogue = ({ table, label, orderColumn, nameMax = 80, extra }) => {
   });
 
   return { list, create, update, remove, lookup };
+};
+
+/** Brand logo: a new picture replaces the old one; remove_logo clears it. */
+const saveLogo = async (req, current = null) => {
+  const upload = req.body?.logo_upload;
+  if (upload?.dataUrl) {
+    const stored = await uploadCatalogueImage('brands', upload);
+    if (current?.logo_path) await removeStoredFile('evidence', current.logo_path);
+    return { logo_url: stored.url, logo_path: stored.path };
+  }
+  if (req.body?.remove_logo === true && current?.logo_path) {
+    await removeStoredFile('evidence', current.logo_path);
+    return { logo_url: null, logo_path: null };
+  }
+  return {};
 };
 
 const brands = namedCatalogue({ table: 'brands', label: 'Brand', orderColumn: 'brand_id' });
@@ -259,20 +287,24 @@ export const deleteArticleType = catchAsync(async (req, res) => {
  */
 export const lookupArticleTypes = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 20, maxLimit: 50, sortable: ['name', 'sort_order'], defaultSort: 'sort_order', defaultDir: 'asc' });
-  const partnerId = partnerOfQuery(req);
-  let query = supabaseAdmin
-    .from('article_types')
-    .select('id, name, sort_order, articles!inner(id)', { count: 'exact' })
-    .eq('status', 'active')
-    .eq('articles.status', 'active')
-    .limit(1, { referencedTable: 'articles' })
-    .order('sort_order', { ascending: true })
-    .order('name', { ascending: true })
-    .range(q.from, q.to);
-  // an order with a partner offers that partner's articles; an order still at the central location offers the shared standard set
-  query = partnerId ? query.eq('partner_id', partnerId).eq('articles.partner_id', partnerId) : query.is('partner_id', null).is('articles.partner_id', null);
-  query = searchFilter(query, q.search);
-  const result = await query;
+  const requestedPartner = partnerOfQuery(req);
+  const build = (partnerId) => {
+    let query = supabaseAdmin
+      .from('article_types')
+      .select('id, name, sort_order, articles!inner(id)', { count: 'exact' })
+      .eq('status', 'active')
+      .eq('articles.status', 'active')
+      .limit(1, { referencedTable: 'articles' })
+      .order('sort_order', { ascending: true })
+      .order('name', { ascending: true })
+      .range(q.from, q.to);
+    // an order with a partner offers that partner's articles; an order still at the central location offers the shared standard set
+    query = partnerId ? query.eq('partner_id', partnerId).eq('articles.partner_id', partnerId) : query.is('partner_id', null).is('articles.partner_id', null);
+    return searchFilter(query, q.search);
+  };
+  let result = await build(requestedPartner);
+  // a partner that has not built its own catalogue yet offers the shared standard set (same as an order without a partner)
+  if (requestedPartner && !result.error && !result.count && !q.search) result = await build(null);
   const rows = unwrap(result, 'Could not load article types').map(({ articles, ...t }) => t);
   return sendPage(res, rows, q, result.count);
 });
@@ -392,7 +424,8 @@ export const lookupArticles = catchAsync(async (req, res) => {
     .order('sort_order', { ascending: true })
     .order('name', { ascending: true })
     .range(q.from, q.to);
-  query = partnerId ? query.eq('partner_id', partnerId) : query.is('partner_id', null);
+  // the partner's own articles, plus the shared standard ones (a type without partner articles falls back to the shared set)
+  query = partnerId ? query.or(`partner_id.eq.${partnerId},partner_id.is.null`) : query.is('partner_id', null);
   query = searchFilter(query, q.search);
   const result = await query;
   let rows = unwrap(result, 'Could not load articles');
@@ -403,22 +436,11 @@ export const lookupArticles = catchAsync(async (req, res) => {
   }
   // An order with no partner yet shows the shared set. A price the partners set on their own copy still tells the customer
   // what to expect: use the default partner's price for the same article, else the lowest one.
-  if (!partnerId && rows.some((a) => a.customer_price == null)) {
+  if (rows.some((a) => a.customer_price == null)) {
     const typeRow = await supabaseAdmin.from('article_types').select('name').eq('id', typeId).maybeSingle();
-    const names = [...new Set(rows.filter((a) => a.customer_price == null).map((a) => a.name))];
-    const [theirs, defaults] = await Promise.all([
-      supabaseAdmin.from('articles').select('name, customer_price, partner_id, type:article_types!inner(name)').in('name', names).not('partner_id', 'is', null).not('customer_price', 'is', null).eq('article_types.name', typeRow.data?.name ?? ''),
-      supabaseAdmin.from('partners').select('id').eq('is_default', true),
-    ]);
-    const defaultIds = new Set((defaults.data || []).map((p) => p.id));
-    const priceFor = new Map();
-    for (const t of theirs.data || []) {
-      const key = t.name.trim().toLowerCase();
-      const cur = priceFor.get(key);
-      const better = !cur || (defaultIds.has(t.partner_id) && !cur.isDefault) || (defaultIds.has(t.partner_id) === cur.isDefault && Number(t.customer_price) < cur.price);
-      if (better) priceFor.set(key, { price: Number(t.customer_price), isDefault: defaultIds.has(t.partner_id) });
-    }
-    rows = rows.map((a) => (a.customer_price == null && priceFor.has(a.name.trim().toLowerCase()) ? { ...a, customer_price: priceFor.get(a.name.trim().toLowerCase()).price } : a));
+    const typeName = typeRow.data?.name ?? '';
+    const prices = await fallbackPrices(rows.map((a) => ({ name: a.name, type_name: typeName, customer_price: a.customer_price })));
+    rows = rows.map((a) => (a.customer_price == null && prices.has(priceKey(typeName, a.name)) ? { ...a, customer_price: prices.get(priceKey(typeName, a.name)) } : a));
   }
   return sendPage(res, rows.map(({ partner_id, ...a }) => a), q, result.count);
 });

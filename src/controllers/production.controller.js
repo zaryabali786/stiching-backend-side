@@ -5,7 +5,7 @@ import { parseListQuery, sanitizeSearch, ilikeAny, sendPage } from '../utils/pag
 import { unwrap, unwrapOne, todayISO } from '../utils/db.js';
 import { syncOrderFromCards, setOrderStatus, getOrderOr404, addEvent, articleDisplayStatus, STATUS_LABELS } from '../services/order.service.js';
 import { scoped, scopeOf, assertMemberOfPartner, can } from '../services/access.service.js';
-import { STAGES, STAGE_LABELS, PREVIOUS_STAGE, NEXT_STAGE, SCAN_ROLES, resolveScanRole, permissionForStage, checkReceive, progressFor, articleState, ARTICLE_STATE_LABELS } from '../services/unit-flow.service.js';
+import { STAGES, STAGE_RANK, STAGE_LABELS, PREVIOUS_STAGE, NEXT_STAGE, SCAN_ROLES, resolveScanRole, permissionForStage, checkReceive, progressFor, articleState, ARTICLE_STATE_LABELS } from '../services/unit-flow.service.js';
 import { emitUnitUpdate } from '../services/unit-review.service.js';
 import { buildMasterTracking } from '../services/master-tracking.service.js';
 import { suggestAssignees } from '../services/team.service.js';
@@ -247,6 +247,15 @@ export const moveCard = catchAsync(async (req, res) => {
   const order = await getOrderOr404(card.order_id, 'id, status, reference');
   if (['paid', 'at_admin_warehouse', 'partner_dispatch', 'shipped', 'delivered', 'cancelled'].includes(order.status) && stage !== 'packed') {
     throw new BadRequestError(`Order ${order.reference} is already ${order.status.replace(/_/g, ' ')} and cannot go back into production.`);
+  }
+
+  // forward moves go one stage at a time (a board drop cannot skip Pressing); going back stays possible for corrections
+  if (STAGE_RANK[stage] > STAGE_RANK[card.stage]) {
+    if (NEXT_STAGE[card.stage] !== stage) {
+      throw new BadRequestError(`"${card.unit_title}" is in ${STAGE_LABELS[card.stage]}. It goes to ${STAGE_LABELS[NEXT_STAGE[card.stage]]} next, not straight to ${STAGE_LABELS[stage]}.`);
+    }
+    if (card.approval_status === 'pending') throw new BadRequestError(`"${card.unit_title}" is waiting for the customer to approve its photos.`);
+    if (stage === 'pressing' && !card.qc_passed) throw new BadRequestError(`"${card.unit_title}" has not passed quality check yet.`);
   }
 
   const position = await computePosition(stage, prevId, nextId, card.id, card.partner_id);
@@ -769,23 +778,44 @@ export const requestCustomerApproval = catchAsync(async (req, res) => {
 });
 
 /**
- * POST /api/partner/qc/orders/:orderId/pack  body: { weight_kg }
+ * POST /api/partner/qc/orders/:orderId/pressing
+ * Every article that passed quality check (and is not waiting for the customer) moves on to Pressing. Packing comes after it.
+ */
+export const sendOrderToPressing = catchAsync(async (req, res) => {
+  const order = await getOrderOr404(req.params.orderId);
+  const cards = unwrap(await supabaseAdmin.from('job_cards').select('id, unit_id, stage, qc_passed, approval_status, unit_title').eq('order_id', order.id));
+  const waiting = cards.filter((c) => c.approval_status === 'pending');
+  if (waiting.length) throw new BadRequestError(`Waiting for the customer to approve: ${waiting.map((c) => c.unit_title).join(', ')}.`);
+  const ready = cards.filter((c) => c.stage === 'qc' && c.qc_passed);
+  if (!ready.length) throw new BadRequestError('No article of this order has passed quality check and is waiting for Pressing.');
+  let position = await computePosition('pressing', null, null, null, order.partner_id);
+  for (const c of ready) {
+    unwrap(await supabaseAdmin.from('job_cards').update({
+      stage: 'pressing', qc_passed: true, pressing_at: new Date().toISOString(), position, updated_at: new Date().toISOString(),
+    }).eq('id', c.id));
+    position += GAP;
+    await logActivity(c.id, req, 'Moved from Quality check to Pressing');
+    await logUnitEvent(c.unit_id, order.id, 'pressing', { actorId: req.userId });
+  }
+  const updated = await syncOrderFromCards(order.id, req.userId);
+  return ApiResponse.success(res, { orderStatus: updated.status, moved: ready.length }, `${ready.length} article${ready.length === 1 ? '' : 's'} of ${order.reference} moved to Pressing.`);
+});
+
+/**
+ * POST /api/partner/qc/orders/:orderId/pack
+ * Packs the order. Every article must have finished Pressing first. The parcel weight is not asked here: it is the total of the
+ * article weights entered in Receiving, and the invoice reads it from there.
  */
 export const packOrder = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.orderId);
   const cards = unwrap(await supabaseAdmin.from('job_cards').select('id, unit_id, stage, qc_passed, approval_status, unit_title').eq('order_id', order.id));
   const waiting = cards.filter((c) => c.approval_status === 'pending');
   if (waiting.length) throw new BadRequestError(`Waiting for the customer to approve: ${waiting.map((c) => c.unit_title).join(', ')}.`);
-  if (!cards.length || !cards.every((c) => c.stage === 'packed' || c.stage === 'pressing' || (c.stage === 'qc' && c.qc_passed))) {
-    throw new BadRequestError('Every article must pass QC before packing.');
+  if (!cards.length) throw new BadRequestError('This order has no articles in production.');
+  const notPressed = cards.filter((c) => c.stage !== 'pressing' && c.stage !== 'packed');
+  if (notPressed.length) {
+    throw new BadRequestError(`Every article must finish Pressing before packing. Still to do: ${notPressed.map((c) => `${c.unit_title} (${STAGE_LABELS[c.stage]})`).join(', ')}.`);
   }
-  // the parcel weighs what its articles weigh (Receiving); only an older order with no article weights is weighed here
-  const known = await orderWeightInfo(order);
-  if (known.missing.length && known.source !== 'order') {
-    throw new BadRequestError(`Add the weight in Receiving first for: ${known.missing.map((m) => m.title).join(', ')}.`);
-  }
-  const weight = known.total_kg ?? Number(req.body?.weight_kg);
-  if (!(weight > 0 && weight < 50)) throw new BadRequestError('Enter the parcel weight in kg.');
 
   let position = await computePosition('packed', null, null, null, order.partner_id);
   for (const c of cards.filter((x) => x.stage !== 'packed')) {
@@ -796,8 +826,8 @@ export const packOrder = catchAsync(async (req, res) => {
     await logActivity(c.id, req, 'Packed');
     await logUnitEvent(c.unit_id, order.id, 'packed', { actorId: req.userId });
   }
-  unwrap(await supabaseAdmin.from('orders').update({ weight_kg: weight }).eq('id', order.id));
-  await addEvent(order.id, order.status, `Parcel weighed: ${weight} kg${known.source === 'articles' ? ' (total of the articles)' : ''}`, req.userId);
+  // keep the order's weight equal to the total of its articles (Receiving); nothing is typed here
+  await syncOrderWeight(order);
   const updated = await syncOrderFromCards(order.id, req.userId);
   return ApiResponse.success(res, { orderStatus: updated.status }, `Order ${order.reference} packed.`);
 });

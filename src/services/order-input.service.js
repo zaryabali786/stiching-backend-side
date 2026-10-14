@@ -11,6 +11,15 @@ import { unwrap } from '../utils/db.js';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v) => UUID.test(String(v || ''));
 
+/**
+ * Whether a destination country is outside Pakistan (null when the country is not known). The customer is never asked: the shipping
+ * type follows the delivery address.
+ */
+export const internationalFromCountry = (country) => {
+  const c = String(country ?? '').trim().toLowerCase();
+  return c ? c !== 'pakistan' : null;
+};
+
 /** International => Express, otherwise Standard. The customer never picks the shipping type directly. */
 export const shippingServiceFor = (international) => (international ? 'express' : 'standard');
 
@@ -23,8 +32,8 @@ const toBool = (v) => (v === true || v === 'true' ? true : v === false || v === 
  */
 export const resolveOrderRefs = async (body, { order = null } = {}) => {
   if (!isUuid(body.brand_id)) throw new BadRequestError('Choose the brand you ordered from.');
-  const international = toBool(body.international_shipping);
-  if (international === null) throw new BadRequestError('Tell us whether this order ships internationally (Yes or No).');
+  // no question is asked any more: an explicit value (older clients) wins, otherwise the delivery country decides, otherwise domestic
+  const international = toBool(body.international_shipping) ?? internationalFromCountry(body.destination_country) ?? false;
 
   const hasCourier = body.courier_id !== undefined && body.courier_id !== null && body.courier_id !== '';
   if (hasCourier && !isUuid(body.courier_id)) throw new BadRequestError('That courier is not valid. Choose another.');

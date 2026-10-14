@@ -7,6 +7,9 @@ import { notifyUser, notifyPartner, notifyAdmins } from '../services/notificatio
 import { resolveCourier } from '../services/courier.service.js';
 import { inActivePartner } from '../services/access.service.js';
 import { orderWeightInfo, requireOrderWeight, syncOrderWeight } from '../services/weight.service.js';
+import { listExtraCosts, extraCostLine } from '../services/extra-cost.service.js';
+import { loadExpressStitching } from '../services/express-stitching.service.js';
+import { loadExpressShipping } from '../services/express-shipping.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
 
@@ -296,11 +299,16 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
   // the shipment weight is the sum of the article weights entered in Receiving (never typed here, never assumed 0)
   const weight = await orderWeightInfo(order);
   order.weight_kg = weight.total_kg;
+  await ensureExpressPrices(order);
   const [priceItems, shippingOptions] = await Promise.all([
     supabaseAdmin.from('price_items').select('*').eq('is_active', true).order('category').order('name'),
     weight.total_kg == null ? [] : ratesFor(shipCountry(order), weight.total_kg, order.shipping_service),
   ]);
   const items = unwrap(priceItems);
+  // the partner's extra materials with their bills (empty until database update 0038 is applied)
+  const extraCosts = await listExtraCosts(order.id).catch(() => []);
+  const onInvoice = new Set((invoice?.lines || []).map((l) => l.extra_cost_id).filter(Boolean));
+  const extras = extraCosts.map((c) => ({ ...c, in_invoice: onInvoice.has(c.id) }));
   const currency = invoice?.currency || currencyFor(shipCountry(order));
 
   // Suggest the FX rate last used for this currency (admin confirms it; it is locked at issue)
@@ -309,7 +317,9 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
   return ApiResponse.success(res, {
     order: { ...order, destination_country: order.destination_country || shipCountry(order) || null, invoice: undefined, status_label: STATUS_LABELS[order.status] },
     invoice: invoice ? { ...invoice, lines: (invoice.lines || []).sort((a, b) => a.sort_order - b.sort_order) } : null,
-    suggestedLines: invoice ? null : await suggestLines(order, items, shippingOptions),
+    // a new invoice starts with the approved extra items already on it (the admin never retypes them)
+    suggestedLines: invoice ? null : [...(await suggestLines(order, items, shippingOptions)), ...expressLines(order), ...extras.filter((c) => c.status === 'approved').map(extraCostLine)].map((l, i) => ({ ...l, sort_order: i })),
+    extraCosts: extras,
     weight: { total_kg: weight.total_kg, source: weight.source, missing: weight.missing, articles: weight.units.map((u) => ({ id: u.id, title: u.unit_title, code: u.code, weight_kg: u.weight_kg == null ? null : Number(u.weight_kg) })) },
     priceItems: items,
     shippingOptions,
@@ -318,7 +328,33 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
   });
 });
 
-const LINE_KINDS = ['stitching', 'accessory', 'accessory_stitching', 'shipping', 'duties', 'discount', 'other'];
+const LINE_KINDS = ['stitching', 'accessory', 'accessory_stitching', 'shipping', 'duties', 'discount', 'other', 'express_stitching', 'express_shipping'];
+
+/**
+ * The express charges of an order, from the prices saved on the order when express was chosen. The server decides these lines: the
+ * invoice always has exactly one of each when express is on (and none when it is off), whatever the browser sends.
+ */
+/** An order made before the prices existed (express on, no price saved) takes the admin's current price now, once, and keeps it. */
+export const ensureExpressPrices = async (order) => {
+  const patch = {};
+  if (order.express_stitching && order.express_stitching_price == null) patch.express_stitching_price = (await loadExpressStitching()).price_pkr;
+  if (order.express_shipping && order.express_shipping_price == null) patch.express_shipping_price = (await loadExpressShipping()).price_pkr;
+  if (!Object.keys(patch).length) return order;
+  const { error } = await supabaseAdmin.from('orders').update(patch).eq('id', order.id);
+  if (error && !/express_(stitching|shipping)_price/.test(error.message || '')) throw error;
+  return error ? order : Object.assign(order, patch);
+};
+
+export const expressLines = (order) => {
+  const out = [];
+  if (order.express_stitching && Number(order.express_stitching_price) > 0) {
+    out.push({ kind: 'express_stitching', label: 'Express stitching', description: order.express_days ? `Ready in ${order.express_days} days` : null, quantity: 1, customer_amount: round2(order.express_stitching_price), partner_amount: 0 });
+  }
+  if (order.express_shipping && Number(order.express_shipping_price) > 0) {
+    out.push({ kind: 'express_shipping', label: 'Express shipping', description: order.express_shipping_days ? `Delivered in ${order.express_shipping_days} days` : null, quantity: 1, customer_amount: round2(order.express_shipping_price), partner_amount: 0 });
+  }
+  return out;
+};
 
 const computeTotals = (lines, fxRate) => {
   const charges = lines.filter((l) => l.kind !== 'discount');
@@ -343,6 +379,7 @@ export const saveInvoiceDraft = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.orderId);
   if (order.status !== 'packed') throw new BadRequestError(`Invoices can only be built for packed orders (this order is ${STATUS_LABELS[order.status]}).`);
   // every article of the shipment must have its weight (Receiving) before an invoice is made
+  await ensureExpressPrices(order);
   const weightInfo = await requireOrderWeight(order);
   await syncOrderWeight(order);
   order.weight_kg = weightInfo.total_kg;
@@ -364,6 +401,7 @@ export const saveInvoiceDraft = catchAsync(async (req, res) => {
       label: String(l.label).trim().slice(0, 160),
       description: l.description ? String(l.description).slice(0, 300) : null,
       unit_id: l.unit_id || null,
+      extra_cost_id: l.extra_cost_id || null,
       price_item_id: l.price_item_id || null,
       quantity: Number(l.quantity) > 0 ? Number(l.quantity) : 1,
       customer_amount: round2(customer),
@@ -371,6 +409,23 @@ export const saveInvoiceDraft = catchAsync(async (req, res) => {
       sort_order: i,
     };
   });
+  // express charges: the server replaces whatever the browser sent with the order's own (one of each, none when express is off)
+  for (let i = lines.length - 1; i >= 0; i--) if (lines[i].kind === 'express_stitching' || lines[i].kind === 'express_shipping') lines.splice(i, 1);
+  lines.push(...expressLines(order).map((l) => ({ ...l, unit_id: null, price_item_id: null })));
+
+  // lines that come from the partner's extra items: each must belong to this order, be approved, and appear only once
+  const extraIds = lines.map((l) => l.extra_cost_id).filter(Boolean);
+  if (extraIds.length) {
+    if (new Set(extraIds).size !== extraIds.length) throw new BadRequestError('The same extra item is on the invoice twice.');
+    const found = unwrap(await supabaseAdmin.from('order_extra_costs').select('id, status, order_id, total_pkr').in('id', extraIds));
+    for (const id of extraIds) {
+      const c = found.find((x) => x.id === id);
+      if (!c || c.order_id !== order.id) throw new BadRequestError('An extra item on this invoice does not belong to this order.');
+      if (c.status !== 'approved') throw new BadRequestError('Only approved extra items can be on the invoice. Approve it first.');
+    }
+  }
+  for (const l of lines) if (!l.extra_cost_id) delete l.extra_cost_id;
+
   // A shipping item picked from the shipping price list: the SERVER prices it (never the browser), so the invoice carries
   // exactly what the list says today. The amount is copied onto the line, so later list changes leave this invoice alone.
   let shippingRateId = null;

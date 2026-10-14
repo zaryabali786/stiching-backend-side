@@ -121,12 +121,13 @@ export const getPartnerOverview = catchAsync(async (req, res) => {
 const RECEIVING_SELECT = `
   partner:partners!orders_partner_id_fkey(name, short_code, receiving_name, receiving_address, receiving_city),
   id, reference, partner_id, brand, brand_order_number, tracking_number, status, has_issue, customer_name, customer_code,
-  destination_city, destination_country, destination_address, destination_phone, priority, express_stitching, express_days, due_date, customer_notes, created_at, received_at,
+  destination_city, destination_country, destination_address, destination_phone, priority, express_stitching, express_days, express_shipping, express_shipping_days, due_date, customer_notes, created_at, received_at,
   import_source, order_source, details_completed_at, parcel_media, parcel_received_at, parcel_review,
-  units:order_units!order_units_order_id_fkey(id, code, unit_title, stitching_type, notes, quantity, status, issue_type, issue_note, issue_media, receive_media, received_at, line_no, design, weight_kg, created_at, review_status, review_note, review_media, return_status, return_to, return_note, return_courier, return_tracking, resubmit_count, held_at, hold_received_at, hold_resolved_at, return_shipping)
+  units:order_units!order_units_order_id_fkey(id, code, unit_title, stitching_type, notes, quantity, status, issue_type, issue_note, issue_media, receive_media, received_at, line_no, design, weight_kg, product_image_url, created_at, review_status, review_note, review_media, return_status, return_to, return_note, return_courier, return_tracking, resubmit_count, held_at, hold_received_at, hold_resolved_at, return_shipping)
 `;
 
-const RECEIVING_SELECT_BEFORE_0027 = RECEIVING_SELECT.replace(', return_shipping', '').replace(', held_at, hold_received_at, hold_resolved_at', '');
+const RECEIVING_SELECT_BEFORE_0036 = RECEIVING_SELECT.replace(', express_shipping, express_shipping_days', '');
+const RECEIVING_SELECT_BEFORE_0027 = RECEIVING_SELECT_BEFORE_0036.replace(', return_shipping', '').replace(', held_at, hold_received_at, hold_resolved_at', '');
 const RECEIVING_SELECT_BEFORE_0021 = RECEIVING_SELECT_BEFORE_0027.replace(/, review_status, review_note[^)]*\)/, ')').replace(', order_source, details_completed_at', '');
 
 /**
@@ -169,7 +170,12 @@ export const getReceiving = catchAsync(async (req, res) => {
     }
     return map;
   };
-  const [returnTabs, holdOnlyIds, resolvedOrderIds] = await Promise.all([returnTabOfUnits(), idsWithReturn(['held']), resolvedIds()]);
+  // orders that really have an article with an open problem (the order's own has_issue flag can be out of date)
+  const issueOrderIds = async () => {
+    const rows = (await supabaseAdmin.from('order_units').select('order_id, return_status').eq('status', 'issue').limit(2000)).data || [];
+    return [...new Set(rows.filter((x) => !x.return_status || x.return_status === 'none').map((x) => x.order_id))];
+  };
+  const [returnTabs, holdOnlyIds, resolvedOrderIds, issueIds] = await Promise.all([returnTabOfUnits(), idsWithReturn(['held']), resolvedIds(), issueOrderIds()]);
   const returnOrderIds = Object.fromEntries(RETURN_TABS.map((t) => [t, [...new Set([...returnTabs.values()].filter((x) => x.tab === t).map((x) => x.order_id))]]));
   const holdIds = [...new Set([...holdOnlyIds, ...resolvedOrderIds])];
   const NONE = ['00000000-0000-0000-0000-000000000000'];
@@ -177,7 +183,7 @@ export const getReceiving = catchAsync(async (req, res) => {
     if (RETURN_TABS.includes(tab)) return query.in('id', returnOrderIds[tab].length ? returnOrderIds[tab] : NONE);
     if (tab === 'hold') return query.in('id', holdIds.length ? holdIds : NONE);
     if (tab === 'expected') return query.or(EXPECTED);
-    if (tab === 'issues') return query.eq('has_issue', true).not('status', 'in', '(cancelled,delivered)');
+    if (tab === 'issues') return query.in('id', issueIds.length ? issueIds : NONE).not('status', 'in', '(cancelled,delivered)');
     return query.or(RECENT);
   };
 
@@ -193,12 +199,13 @@ export const getReceiving = catchAsync(async (req, res) => {
   let [result, expected, issues, recent, hold, ...returnCounts] = await Promise.all([
     listQuery(RECEIVING_SELECT),
     scoped(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).or(EXPECTED)),
-    scoped(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).eq('has_issue', true).not('status', 'in', '(cancelled,delivered)')),
+    countIn(issueIds).not('status', 'in', '(cancelled,delivered)'),
     scoped(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).or(RECENT)),
     countIn(holdIds),
     ...RETURN_TABS.map((t) => countIn(returnOrderIds[t])),
   ]);
   // the article-review columns come with database update 0021: until it is applied, keep the screen working without them
+  if (result.error && /express_shipping/.test(result.error.message || '')) result = await listQuery(RECEIVING_SELECT_BEFORE_0036);
   if (result.error && /held_|hold_|return_shipping/.test(result.error.message || '')) result = await listQuery(RECEIVING_SELECT_BEFORE_0027);
   if (result.error && /review_|return_|resubmit_|order_source|details_completed/.test(result.error.message || '')) result = await listQuery(RECEIVING_SELECT_BEFORE_0021);
   // One order is shown per group: <ref> (approved / normal), <ref>-HOLD, <ref>-RETURN, <ref>-RESOLVED. Each tab shows only the
@@ -704,14 +711,9 @@ export const getPartnerWarehouse = catchAsync(async (req, res) => {
   return sendPage(res, rows, q, result.count, { counts: countMap });
 });
 
-export const setOrderWeight = catchAsync(async (req, res) => {
-  const weight = Number(req.body?.weight_kg);
-  if (!(weight > 0 && weight < 50)) throw new BadRequestError('Enter a weight between 0 and 50 kg.');
-  // the weight comes from the articles (Receiving): only an older order with no article weights can be set by hand
-  const order = unwrapOne(await supabaseAdmin.from('orders').select('*').eq('id', req.params.id).maybeSingle(), 'Order not found');
-  if ((await orderWeightInfo(order)).source === 'articles') throw new BadRequestError('This order’s weight is the total of its articles. Change an article’s weight in Receiving.');
-  unwrap(await supabaseAdmin.from('orders').update({ weight_kg: weight, updated_at: new Date().toISOString() }).eq('id', req.params.id));
-  return ApiResponse.success(res, { weight_kg: weight }, 'Weight saved.');
+/** The weight can no longer be typed here: it is the total of the article weights entered in Receiving. */
+export const setOrderWeight = catchAsync(async () => {
+  throw new BadRequestError('The weight is the total of the article weights. Add or change an article weight in Receiving.');
 });
 
 /**
@@ -949,13 +951,19 @@ export const getEarnings = catchAsync(async (req, res) => {
  */
 export const getPartnerOrders = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 10, sortable: ['created_at', 'due_date', 'reference', 'customer_name'], defaultSort: 'created_at' });
-  let query = scoped(req.access, supabaseAdmin
+  const buildList = (logoSelect) => scoped(req.access, supabaseAdmin
     .from('orders')
-    .select('id, reference, brand, created_at, due_date, customer_name, customer_code, status, order_kind, units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
+        .select(`id, reference, brand, created_at, due_date, customer_name, customer_code, status, order_kind${logoSelect}, units:order_units!order_units_order_id_fkey(count)`, { count: 'exact' })
     .order(q.sort, { ascending: q.ascending, nullsFirst: false })
     .range(q.from, q.to));
-  if (q.search) query = query.or(ilikeAny(['reference', 'customer_name', 'customer_code', 'brand', 'brand_order_number'], q.search));
-  const result = await query;
+  const listQuery = (logoSelect) => {
+    let query = buildList(logoSelect);
+    if (q.search) query = query.or(ilikeAny(['reference', 'customer_name', 'customer_code', 'brand', 'brand_order_number'], q.search));
+    return query;
+  };
+  // the brand's logo comes with database update 0037: until then the list works without it
+  let result = await listQuery(', brand_ref:brands!orders_brand_id_fkey(id, name, logo_url)');
+  if (result.error && /logo_url|brand_ref|brands/.test(result.error.message || '')) result = await listQuery('');
   const rows = unwrap(result);
   const cards = rows.length ? unwrap(await supabaseAdmin.from('job_cards').select('order_id, stage').in('order_id', rows.map((o) => o.id))) : [];
   const stagesOf = new Map();
@@ -964,10 +972,12 @@ export const getPartnerOrders = catchAsync(async (req, res) => {
     m.set(c.stage, (m.get(c.stage) || 0) + 1);
     stagesOf.set(c.order_id, m);
   }
-  const items = rows.map(({ units, ...o }) => {
+  const items = rows.map(({ units, brand_ref, ...o }) => {
     const stages = stagesOf.get(o.id);
+    const brandRow = Array.isArray(brand_ref) ? brand_ref[0] : brand_ref;
     return {
       ...o,
+      brand_logo_url: brandRow?.logo_url ?? null,
       articles: units?.[0]?.count ?? 0,
       parent_status: o.status,
       parent_status_label: STATUS_LABELS[o.status] || o.status,
@@ -977,6 +987,82 @@ export const getPartnerOrders = catchAsync(async (req, res) => {
     };
   });
   return sendPage(res, items, q, result.count);
+});
+
+/** Money and contact details never reach the partner through an event's note. */
+const SENSITIVE_NOTE = /(pkr|usd|gbp|eur|aed|invoice|payment|paid|refund|stripe|@|\+?\d[\d\s-]{8,})/i;
+const PARTNER_TIMELINE_LABELS = { ...STATUS_LABELS };
+
+/**
+ * GET /api/partner/orders/:id — one order for the partner's side panel. Only what the workshop needs: the customer's NAME and
+ * delivery ADDRESS (never their phone or email), the articles, the order's status history, and what this partner earns on it.
+ * Admin notes, invoice and payment amounts are not part of this response.
+ */
+export const getPartnerOrder = catchAsync(async (req, res) => {
+  const order = unwrapOne(
+    await scoped(req.access, supabaseAdmin
+      .from('orders')
+      .select('id, reference, brand, brand_order_number, status, order_kind, created_at, due_date, received_at, packed_at, shipped_at, delivered_at, customer_name, customer_code, destination_address, destination_city, destination_country, customer_notes, express_stitching, express_days, priority, express_shipping, express_shipping_days, return_unit_id')
+      .eq('id', req.params.id)).maybeSingle(),
+    'Order not found'
+  );
+  const brandRow = order.brand ? (await supabaseAdmin.from('brands').select('name, logo_url').ilike('name', order.brand).maybeSingle().then((x) => (x.error ? { data: null } : x))).data : null;
+  const [unitsRes, eventsRes, invoiceRes] = await Promise.all([
+    supabaseAdmin
+      .from('order_units')
+      .select('id, code, line_no, unit_title, quantity, status, notes, product_image_url, stitching_type, design, size_snapshot, picks:order_unit_articles(article_type_id, type:article_types(name, sort_order), article:articles(name, image_url))')
+      .eq('order_id', order.id)
+      .order('line_no'),
+    supabaseAdmin.from('order_events').select('id, status, note, created_at').eq('order_id', order.id).order('created_at', { ascending: true }),
+    supabaseAdmin.from('invoices').select('status, partner_total_pkr').eq('order_id', order.id).maybeSingle(),
+  ]);
+  const one = (v) => (Array.isArray(v) ? v[0] : v);
+  const units = unwrap(unitsRes).map((u) => {
+    const chart = u.size_snapshot || null;
+    return {
+      id: u.id,
+      code: u.code,
+      line_no: u.line_no,
+      title: u.unit_title,
+      quantity: u.quantity,
+      image_url: u.product_image_url,
+      stitching_type: u.stitching_type,
+      notes: u.notes,
+      size: chart ? { name: chart.name || null, person: chart.person_name || null, nearest: chart.nearest_size || null, measurements: chart.measurements || {} } : null,
+      customizations: (u.picks || [])
+        .map((p) => ({ type: one(p.type)?.name ?? null, sort: one(p.type)?.sort_order ?? 0, name: one(p.article)?.name ?? null, image_url: one(p.article)?.image_url ?? null }))
+        .sort((a, b) => a.sort - b.sort)
+        .map(({ sort, ...x }) => x),
+    };
+  });
+  const timeline = unwrap(eventsRes)
+    .map((e) => ({ id: e.id, status: e.status, label: PARTNER_TIMELINE_LABELS[e.status] || e.status, note: e.note && !SENSITIVE_NOTE.test(e.note) ? e.note : null, at: e.created_at }));
+
+  // the partner's own share, from the invoice's partner total (the same figure as Earnings): earned once paid, pending until then
+  const inv = unwrap(invoiceRes);
+  const earnings = !inv || inv.status === 'draft' || inv.status === 'void'
+    ? { state: 'unavailable', amount_pkr: null }
+    : inv.status === 'paid'
+      ? { state: 'earned', amount_pkr: Number(inv.partner_total_pkr) }
+      : { state: 'pending', amount_pkr: Number(inv.partner_total_pkr) };
+
+  return ApiResponse.success(res, {
+    id: order.id,
+    reference: order.reference,
+    order_kind: order.order_kind,
+    status: order.status,
+    status_label: STATUS_LABELS[order.status] || order.status,
+    created_at: order.created_at,
+    due_date: order.due_date,
+    brand: { name: order.brand, logo_url: brandRow?.logo_url ?? null, order_number: order.brand_order_number },
+    customer: { name: order.customer_name, code: order.customer_code },
+    delivery: { address: order.destination_address, city: order.destination_city, country: order.destination_country },
+    notes: order.customer_notes,
+    express: { stitching: order.express_stitching ? order.express_days : null, shipping: order.express_shipping ? order.express_shipping_days : null, rush: order.priority === 'rush' },
+    units,
+    timeline,
+    earnings,
+  });
 });
 
 /**

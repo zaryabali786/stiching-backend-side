@@ -3,6 +3,7 @@ import { supabase, supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { loadShipTo } from '../services/ship-to.service.js';
 import { loadExpressStitching } from '../services/express-stitching.service.js';
+import { loadExpressShipping } from '../services/express-shipping.service.js';
 import { loadClientTheme } from './theme.controller.js';
 import { loadPortalTheme } from './portal-theme.controller.js';
 import { catchAsync, BadRequestError, UnauthorizedError, ForbiddenError, ApiResponse } from '../utils/error.helper.js';
@@ -237,6 +238,7 @@ export const getPublicConfig = catchAsync(async (req, res) =>
       ...config.platform,
       ...(await loadShipTo().catch(() => ({}))), // the admin's own address wins over the .env defaults
       expressStitching: await loadExpressStitching().catch(() => ({ enabled: true, days: 5 })),
+      expressShipping: await loadExpressShipping().catch(() => ({ enabled: true, days: 3 })),
       // the publishable key is safe to expose; the secret key never leaves the server
       google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null },
       payments: { stripe: { enabled: !!config.stripe.secretKey && !!config.stripe.publishableKey, publishableKey: config.stripe.publishableKey || null } },

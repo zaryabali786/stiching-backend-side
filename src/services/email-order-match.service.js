@@ -89,7 +89,7 @@ export const resolveEmailTarget = async (userId, extracted) => {
   const rows = unwrap(
     await supabaseAdmin
       .from('orders')
-      .select('id, reference, status, brand, brand_order_number, courier_id, courier_name, tracking_number, shipping_updated_at')
+      .select('id, reference, status, brand, brand_order_number, courier_id, courier_name, tracking_number, shipping_updated_at, brand_payment_method, brand_payment_status')
       .eq('customer_id', userId)
       .not('brand_order_number', 'is', null)
       .neq('status', 'cancelled')
@@ -158,13 +158,32 @@ export const applyShippingUpdate = async (order, extracted, { receivedAt }) => {
   const { data: updated, error } = await query.select('id, status').maybeSingle();
   if (error) throw error;
   if (!updated) {
-    const fresh = unwrap(await supabaseAdmin.from('orders').select('id, reference, status, brand, brand_order_number, courier_id, courier_name, tracking_number, shipping_updated_at').eq('id', order.id).maybeSingle());
+    const fresh = unwrap(await supabaseAdmin.from('orders').select('id, reference, status, brand, brand_order_number, courier_id, courier_name, tracking_number, shipping_updated_at, brand_payment_method, brand_payment_status').eq('id', order.id).maybeSingle());
     return fresh ? applyShippingUpdate(fresh, extracted, { receivedAt }) : { changed: false, summary: 'The order is no longer available.' };
   }
 
   const summary = [courierLabel, tracking || order.tracking_number].filter(Boolean).join(' · ') || 'shipping details';
   await addEvent(order.id, updated.status, `Shipping details updated from an email: ${summary}`, null);
   return { changed: true, summary };
+};
+
+/** "Cash on delivery" in any wording. */
+export const isCod = (method) => /\b(cod|cash\s*(on|upon)\s*delivery)\b/i.test(String(method || ''));
+
+/**
+ * Save how the brand order was paid, as the email states it. A method already saved is kept (the first confirmation wins);
+ * a "paid" status is never taken back by a later "pending", and nothing is saved when the email does not say.
+ */
+export const applyPaymentUpdate = async (order, extracted) => {
+  const method = String(extracted?.payment_method ?? '').trim().slice(0, 80);
+  const status = ['paid', 'pending'].includes(extracted?.payment_status) ? extracted.payment_status : null;
+  const patch = {};
+  if (method && !order.brand_payment_method) patch.brand_payment_method = method;
+  if (status && order.brand_payment_status !== status && !(order.brand_payment_status === 'paid' && status === 'pending')) patch.brand_payment_status = status;
+  if (!Object.keys(patch).length) return { changed: false };
+  unwrap(await supabaseAdmin.from('orders').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', order.id));
+  await addEvent(order.id, order.status, `Payment details read from an email: ${[patch.brand_payment_method, patch.brand_payment_status].filter(Boolean).join(' · ')}`, null);
+  return { changed: true, patch };
 };
 
 /** Remember on the inbox email what happened to it. */
@@ -190,6 +209,7 @@ export const matchEmailToOrder = async ({ userId, inboxId, extracted, receivedAt
   }
 
   const result = await applyShippingUpdate(found.order, extracted, { receivedAt });
+  await applyPaymentUpdate(found.order, extracted).catch((e) => console.warn('[Mail] payment details not saved:', e.message));
   await markEmail(inboxId, { order_id: found.order.id, match_status: 'matched', match_note: result.changed ? `Updated ${found.order.reference}: ${result.summary}` : `${found.order.reference}: ${result.summary}` });
   if (result.changed) {
     await notifyUser(userId, {

@@ -1,4 +1,4 @@
--- V360: complete database setup (0001 + 0002 + 0003 + 0004 + 0005 + 0006 + 0007 + 0008 + 0009 + 0010 + 0011 + 0012 + 0013 + 0014 + 0015 + 0016 + 0017 + 0018 + 0019 + 0020 + 0021 + 0022 + 0023 + 0024 + 0025 + 0026 + 0027 + 0028 + 0029 + 0030 + 0031 + 0032 + 0033 + 0034). Safe to run more than once.
+-- V360: complete database setup (0001 + 0002 + 0003 + 0004 + 0005 + 0006 + 0007 + 0008 + 0009 + 0010 + 0011 + 0012 + 0013 + 0014 + 0015 + 0016 + 0017 + 0018 + 0019 + 0020 + 0021 + 0022 + 0023 + 0024 + 0025 + 0026 + 0027 + 0028 + 0029 + 0030 + 0031 + 0032 + 0033 + 0034 + 0035 + 0036 + 0037 + 0038 + 0039). Safe to run more than once.
 -- Paste this whole file into the Supabase SQL Editor of your project and press Run.
 
 
@@ -2605,3 +2605,76 @@ UPDATE public.orders
  WHERE status = 'draft'
    AND partner_id IS NULL
    AND EXISTS (SELECT 1 FROM public.partners WHERE is_default AND status = 'active');
+
+
+-- How the customer paid the brand (read from the order confirmation email). Never guessed: empty when the email does not say.
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS brand_payment_method TEXT;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS brand_payment_status TEXT;
+DO $$ BEGIN
+  ALTER TABLE public.orders ADD CONSTRAINT orders_brand_payment_status_check CHECK (brand_payment_status IS NULL OR brand_payment_status IN ('paid', 'pending'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+
+-- Express shipping: the customer can ask for the finished order to be delivered faster. The admin decides how many days it takes
+-- (Settings > Express). Safe to run more than once.
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS express_shipping BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS express_shipping_days INTEGER;
+DO $$ BEGIN
+  ALTER TABLE public.orders ADD CONSTRAINT orders_express_shipping_days_check CHECK (express_shipping_days IS NULL OR express_shipping_days BETWEEN 1 AND 90);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+NOTIFY pgrst, 'reload schema';
+
+
+-- A logo for each brand (uploaded in Catalogue > Brands), shown next to the brand's orders. Safe to run more than once.
+ALTER TABLE public.brands ADD COLUMN IF NOT EXISTS logo_url TEXT;
+ALTER TABLE public.brands ADD COLUMN IF NOT EXISTS logo_path TEXT;
+NOTIFY pgrst, 'reload schema';
+
+
+-- Extra materials a partner buys while an article is being cut or stitched, with the supplier bill. Separate from the customer's own
+-- prices; the admin approves each item and approved ones are added to the invoice once. Safe to run more than once.
+CREATE TABLE IF NOT EXISTS public.order_extra_costs (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  order_id UUID NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
+  unit_id UUID REFERENCES public.order_units(id) ON DELETE SET NULL,
+  partner_id UUID REFERENCES public.partners(id) ON DELETE SET NULL,
+  stage TEXT NOT NULL CHECK (stage IN ('cutting', 'stitching')),
+  name TEXT NOT NULL CHECK (char_length(btrim(name)) BETWEEN 1 AND 160),
+  quantity NUMERIC(10, 2) NOT NULL CHECK (quantity > 0),
+  unit_price NUMERIC(12, 2) NOT NULL CHECK (unit_price >= 0),
+  total_pkr NUMERIC(12, 2) NOT NULL CHECK (total_pkr >= 0),
+  notes TEXT,
+  -- the supplier bill: { path, name, type, size } in the private "documents" bucket
+  bill JSONB,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  decision_note TEXT,
+  decided_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  decided_at TIMESTAMPTZ,
+  -- lets the browser repeat a submit without making a second entry
+  client_key TEXT,
+  added_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  added_by_name TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS order_extra_costs_order_idx ON public.order_extra_costs (order_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS order_extra_costs_client_key_idx ON public.order_extra_costs (order_id, client_key) WHERE client_key IS NOT NULL;
+
+-- an invoice line that comes from an extra item: one item is on at most one invoice line, so a regenerated invoice never counts it twice
+ALTER TABLE public.invoice_lines ADD COLUMN IF NOT EXISTS extra_cost_id UUID REFERENCES public.order_extra_costs(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS invoice_lines_extra_cost_idx ON public.invoice_lines (extra_cost_id) WHERE extra_cost_id IS NOT NULL;
+
+ALTER TABLE public.order_extra_costs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "order_extra_costs_staff" ON public.order_extra_costs;
+CREATE POLICY "order_extra_costs_staff" ON public.order_extra_costs FOR ALL USING (public.staff_can_see_order(order_id)) WITH CHECK (public.staff_can_see_order(order_id));
+NOTIFY pgrst, 'reload schema';
+
+
+-- Express stitching / express shipping prices. The admin sets them (Settings > Express); an order keeps the price it was made with,
+-- and the invoice charges them once as their own lines. Safe to run more than once.
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS express_stitching_price NUMERIC(12, 2);
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS express_shipping_price NUMERIC(12, 2);
+ALTER TABLE public.invoice_lines DROP CONSTRAINT IF EXISTS invoice_lines_kind_check;
+ALTER TABLE public.invoice_lines ADD CONSTRAINT invoice_lines_kind_check
+  CHECK (kind IN ('stitching', 'accessory', 'accessory_stitching', 'shipping', 'duties', 'discount', 'other', 'express_stitching', 'express_shipping'));
+NOTIFY pgrst, 'reload schema';

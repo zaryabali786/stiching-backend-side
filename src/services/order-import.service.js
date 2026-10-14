@@ -15,7 +15,7 @@ import { loadCourierNames, matchEmailToOrder, readShippingFromText, resolveEmail
  * order_imports row whose `extracted` draft prefills the customer's order form.
  */
 
-const emptyDraft = () => ({ is_order: true, brand: null, order_number: null, order_date: null, currency: null, total: null, tracking_number: null, courier_name: null, items: [] });
+const emptyDraft = () => ({ is_order: true, brand: null, order_number: null, order_date: null, currency: null, total: null, payment_method: null, payment_status: null, tracking_number: null, courier_name: null, items: [] });
 
 const updateImport = async (id, patch) =>
   unwrap(await supabaseAdmin.from('order_imports').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', id).select('*').single(), 'Could not save the import');
@@ -478,6 +478,8 @@ export const createDraftOrder = async (userId, importId, extracted, { receivedAt
           import_id: importId,
           brand_order_total: Number.isFinite(total) && total > 0 ? total : null,
           brand_order_currency: extracted.currency || null,
+          brand_payment_method: extracted.payment_method || null,
+          brand_payment_status: extracted.payment_status || null,
           priority: 'normal',
           due_date: due.toISOString().slice(0, 10),
           destination_country: profile.country || null,
@@ -565,7 +567,7 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
     try {
       extracted = await extractOrderWithAi(
         [{ type: 'text', text: bodyText }, ...readable],
-        'This is an email the customer forwarded after ordering from a clothing brand (it may contain the original message below a "Forwarded message" line, and may have an invoice attached). It is either an order confirmation or a later shipping / tracking update. Extract the original brand, its order number exactly as printed, currency, total, the courier name and tracking number if shown, and every product line (none for a pure shipping update).'
+        'This is an email the customer forwarded after ordering from a clothing brand (it may contain the original message below a "Forwarded message" line, and may have an invoice attached). It is either an order confirmation or a later shipping / tracking update. Extract the original brand, its order number exactly as printed, currency, total, how it was paid (payment method and whether it is paid or pending, only if the email says so), the courier name and tracking number if shown, and every product line (none for a pure shipping update).'
       );
       extractedBy = 'ai';
       if (!extracted.is_order) {

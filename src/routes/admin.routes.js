@@ -1,3 +1,4 @@
+import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
 import {
   getAdminOverview,
@@ -16,11 +17,13 @@ import {
   getShipTo,
   setShipTo,
   getExpressStitching,
+  getExpressShipping,
   getPostexSettings,
   setPostexSettings,
   testPostexSettings,
   getPostexAddresses,
   setExpressStitching,
+  setExpressShipping,
 } from '../controllers/admin.controller.js';
 import {
   getPermissionCatalogue,
@@ -108,6 +111,8 @@ router.put('/settings/postex', setPostexSettings);
 router.post('/settings/postex/test', testPostexSettings);
 router.get('/settings/postex/addresses', getPostexAddresses);
 router.put('/settings/express-stitching', setExpressStitching);
+router.get('/settings/express-shipping', getExpressShipping);
+router.put('/settings/express-shipping', setExpressShipping);
 router.get('/partners', listPartners);
 router.post('/partners', createPartner);
 router.get('/partners/:id', getPartner);
@@ -161,6 +166,7 @@ router.delete('/banners/:id', deleteBanner);
 
 // Invoices
 router.get('/invoices', getAdminInvoices);
+router.post('/extra-costs/:id/decision', decideOrderExtra);
 router.get('/invoices/builder/:orderId', inActivePartnerOrder('orderId'), getInvoiceBuilder);
 router.put('/invoices/builder/:orderId', inActivePartnerOrder('orderId'), saveInvoiceDraft);
 router.post('/invoices/:id/issue', issueInvoice);

@@ -35,6 +35,8 @@ const ORDER_TOOL = {
       order_date: { type: ['string', 'null'], description: 'YYYY-MM-DD' },
       currency: { type: ['string', 'null'], description: 'ISO 4217 code of the prices, e.g. PKR, GBP, USD, AED.' },
       total: { type: ['number', 'null'], description: 'Order grand total as a number.' },
+      payment_method: { type: ['string', 'null'], description: 'How the customer paid the shop, exactly as the email says: e.g. "Visa ending 4242", "Bank transfer", "PayPal", "Cash on Delivery". null when the email does not say.' },
+      payment_status: { type: ['string', 'null'], enum: ['paid', 'pending', null], description: '"paid" ONLY if the email says payment was received / paid / charged; "pending" if it is awaiting payment or cash on delivery; null when not stated. Never guess.' },
       tracking_number: { type: ['string', 'null'], description: 'Courier tracking number if shown.' },
       courier_name: { type: ['string', 'null'], description: 'Name of the courier / carrier delivering the parcel if shown, e.g. "DHL", "TCS", "Leopards". Not the shop.' },
       items: {
@@ -219,6 +221,8 @@ export const normaliseExtracted = (raw = {}) => {
     order_date: date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null,
     currency: currencyCode(raw.currency),
     total: money(raw.total),
+    payment_method: str(raw.payment_method, 80),
+    payment_status: ['paid', 'pending'].includes(raw.payment_status) ? raw.payment_status : null,
     tracking_number: str(raw.tracking_number, 60),
     courier_name: str(raw.courier_name, 80),
     items,

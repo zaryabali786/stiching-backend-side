@@ -45,6 +45,7 @@ import {
   getEarningsSummary,
   getEarnings,
   getPartnerOrders,
+  getPartnerOrder,
   getPartnerBadges,
 } from '../controllers/partner.controller.js';
 import {
@@ -65,6 +66,7 @@ import {
   requestCustomerApproval,
   requestCardApproval,
   packOrder,
+  sendOrderToPressing,
   scanReceive,
   getProductionReceiving,
   getMasterTracking,
@@ -82,6 +84,7 @@ import {
 } from '../controllers/chat.controller.js';
 
 import { requirePermission as need, requireAnyPermission as needAny } from '../middlewares/auth.middleware.js';
+import { getOrderExtras, addOrderExtra, editOrderExtra, removeOrderExtra } from '../controllers/extra-costs.controller.js';
 import { ownsOrder, ownsUnit, ownsCard, ownsMember, ownsTransfer, ownsParcel } from '../middlewares/ownership.middleware.js';
 import { listPartnerUsers, createPartnerUser, updatePartnerUser, resetPartnerUserPassword, deactivatePartnerUser, getPartnerAccess } from '../controllers/partner-users.controller.js';
 
@@ -136,6 +139,10 @@ router.post('/production/scan-receive', needAny('production.update', 'quality.up
 router.get('/production/receiving', needAny('production.view', 'quality.view'), getProductionReceiving);
 router.get('/production/master-tracking', needAny('production.view', 'teams.view'), getMasterTracking);
 router.get('/production/orders', need('production.view'), getProductionOrders);
+router.get('/production/orders/:orderId/extras', need('production.view'), ownsOrder('orderId'), getOrderExtras);
+router.post('/production/orders/:orderId/extras', need('production.update'), ownsOrder('orderId'), addOrderExtra);
+router.patch('/production/extras/:id', need('production.update'), editOrderExtra);
+router.delete('/production/extras/:id', need('production.update'), removeOrderExtra);
 router.get('/production/cards/:id', need('production.view'), ownsCard(), getCardDetail);
 router.patch('/production/cards/:id', need('production.update'), ownsCard(), updateCard);
 router.put('/production/cards/:id/move', need('production.update'), ownsCard(), moveCard);
@@ -150,6 +157,7 @@ router.post('/qc/cards/:id/pass', need('quality.update'), ownsCard(), passQc);
 router.post('/qc/cards/:id/fail', need('quality.update'), ownsCard(), failQc);
 router.post('/qc/cards/:id/request-approval', need('quality.update'), ownsCard(), requestCardApproval);
 router.post('/qc/orders/:orderId/request-approval', need('quality.update'), ownsOrder('orderId'), requestCustomerApproval);
+router.post('/qc/orders/:orderId/pressing', need('quality.update'), ownsOrder('orderId'), sendOrderToPressing);
 router.post('/qc/orders/:orderId/pack', need('quality.update'), ownsOrder('orderId'), packOrder);
 
 // Warehouse
@@ -173,6 +181,7 @@ router.post('/warehouse/transfers/:id/dispatch', need('warehouse.update'), ownsT
 // Earnings
 router.get('/earnings/summary', need('earnings.view'), getEarningsSummary);
 router.get('/orders', need('overview.view'), getPartnerOrders);
+router.get('/orders/:id', need('overview.view'), getPartnerOrder);
 router.get('/earnings', need('earnings.view'), getEarnings);
 
 // Catalogues the customer order form is built from (partner staff and admins manage them)
