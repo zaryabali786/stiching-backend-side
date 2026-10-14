@@ -34,7 +34,7 @@ const cleanText = (value, label, max, required = false) => {
   return text || null;
 };
 
-export const STAFF_TYPES = ['master', 'tailor', 'staff'];
+export const STAFF_TYPES = ['master', 'tailor', 'qa', 'pressing', 'packing', 'staff'];
 
 const cleanStaffType = (value) => {
   const type = String(value ?? 'staff').trim().toLowerCase();

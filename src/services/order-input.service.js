@@ -23,27 +23,31 @@ const toBool = (v) => (v === true || v === 'true' ? true : v === false || v === 
  */
 export const resolveOrderRefs = async (body, { order = null } = {}) => {
   if (!isUuid(body.brand_id)) throw new BadRequestError('Choose the brand you ordered from.');
-  if (!isUuid(body.courier_id)) throw new BadRequestError('Choose the courier that is delivering your parcel to us.');
   const international = toBool(body.international_shipping);
   if (international === null) throw new BadRequestError('Tell us whether this order ships internationally (Yes or No).');
 
+  const hasCourier = body.courier_id !== undefined && body.courier_id !== null && body.courier_id !== '';
+  if (hasCourier && !isUuid(body.courier_id)) throw new BadRequestError('That courier is not valid. Choose another.');
+
   const [brandRes, courierRes] = await Promise.all([
     supabaseAdmin.from('brands').select('id, name, status').eq('id', body.brand_id).maybeSingle(),
-    supabaseAdmin.from('couriers').select('id, name, status, requires_tracking').eq('id', body.courier_id).maybeSingle(),
+    hasCourier ? supabaseAdmin.from('couriers').select('id, name, status, requires_tracking').eq('id', body.courier_id).maybeSingle() : Promise.resolve({ data: null, error: null }),
   ]);
   const brand = unwrap(brandRes, 'Could not check the brand');
   const courier = unwrap(courierRes, 'Could not check the courier');
   if (!brand || (brand.status !== 'active' && order?.brand_id !== brand.id)) throw new BadRequestError('That brand is not available. Choose another.');
-  if (!courier || (courier.status !== 'active' && order?.courier_id !== courier.id)) throw new BadRequestError('That courier is not available. Choose another.');
+  if (hasCourier && (!courier || (courier.status !== 'active' && order?.courier_id !== courier.id))) throw new BadRequestError('That courier is not available. Choose another.');
 
+  // Courier and tracking are optional: they can be added later by the customer, the admin, or a follow-up shipping email.
   const tracking = String(body.tracking_number ?? '').trim();
-  if (courier.requires_tracking && !tracking) throw new BadRequestError(`Enter the ${courier.name} tracking number.`);
   if (tracking.length > 60) throw new BadRequestError('The tracking number is too long.');
 
   return {
     brand_id: brand.id,
     brand: brand.name, // the name is kept on the order for lists and search; renames follow the brand
-    courier_id: courier.id,
+    courier_id: courier?.id ?? null,
+    // a courier picked from the list replaces any name that was only read from an email
+    ...(courier ? { courier_name: null } : {}),
     tracking_number: tracking || null,
     international_shipping: international,
     shipping_service: shippingServiceFor(international),
@@ -87,9 +91,14 @@ export const resolveUnitArticles = async (rawUnits, alreadyPicked = [], partnerI
       if (!keptFromBefore && (article.status !== 'active' || type?.status !== 'active')) {
         throw new BadRequestError(`"${article.name}" is not available any more. Please choose again.`);
       }
-      // a partner only offers its own articles and the shared ones
-      if (partnerId && ((article.partner_id && article.partner_id !== partnerId) || (type?.partner_id && type.partner_id !== partnerId))) {
-        throw new BadRequestError(`"${article.name}" is not offered by the partner you chose. Please choose again.`);
+      // a partner only offers its own articles; an order with no partner yet (at the central location) uses the shared set,
+      // so whichever partner the admin picks later can make it (a piece an order already had stays valid)
+      if (!keptFromBefore) {
+        const owner = partnerId ?? null;
+        const typeOwner = type?.partner_id ?? null;
+        if (article.partner_id !== owner || (typeOwner !== null && typeOwner !== owner)) {
+          throw new BadRequestError(owner ? `"${article.name}" is not offered by this order's partner. Please choose again.` : `"${article.name}" is not in the standard set. Please choose again.`);
+        }
       }
       if (seenTypes.has(article.article_type_id)) throw new BadRequestError(`Choose only one ${type?.name || 'option'} per piece.`);
       seenTypes.add(article.article_type_id);
@@ -106,18 +115,4 @@ export const saveUnitArticles = async (unitId, rows) => {
   unwrap(await supabaseAdmin.from('order_unit_articles').delete().eq('unit_id', unitId), 'Could not update the article choices');
   if (!rows.length) return;
   unwrap(await supabaseAdmin.from('order_unit_articles').insert(rows.map((r) => ({ ...r, unit_id: unitId }))), 'Could not save the article choices');
-};
-
-/**
- * The stitching partner the customer chose. Returns its id, or null when the customer left it to the platform
- * ("auto" / nothing): the assignment rule set by the admin then picks one when the order is submitted.
- */
-export const resolveOrderPartner = async (value) => {
-  if (value === undefined || value === null || value === '' || value === 'auto') return null;
-  if (!isUuid(value)) throw new BadRequestError('Choose a valid stitching partner.');
-  const partner = unwrap(await supabaseAdmin.from('partners').select('id, status, is_listed, permissions').eq('id', value).maybeSingle(), 'Could not check the partner');
-  if (!partner || partner.status !== 'active' || !partner.is_listed || !(partner.permissions || []).includes('receiving.view')) {
-    throw new BadRequestError('That partner is not taking orders right now. Please choose another.');
-  }
-  return partner.id;
 };

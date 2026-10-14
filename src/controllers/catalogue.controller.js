@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { scopeOf } from '../services/access.service.js';
+import { copyStandardCatalogue } from '../services/catalogue-copy.service.js';
 import { parseListQuery, sendPage } from '../utils/pagination.js';
 import { unwrap, unwrapOne, round2 } from '../utils/db.js';
 import { uploadCatalogueImage, removeStoredFile } from '../services/storage.service.js';
@@ -17,13 +18,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Who owns what: article types and articles belong to one partner, or to nobody (partner_id NULL = shared by every partner).
- * A partner (or an admin working as a partner) sees the shared rows plus its own, and can only change its own.
+ * A partner (or an admin working as a partner) sees and changes only its own rows; the shared rows are a template it can copy.
  * An admin without a selected partner sees and manages everything; what that admin creates is shared.
  */
 const ownerOf = (req) => scopeOf(req.access) ?? null;
 const visibleToStaff = (req, query) => {
   const scope = scopeOf(req.access);
-  return scope === undefined ? query : query.or(`partner_id.is.null,partner_id.eq.${scope}`);
+  return scope === undefined ? query : query.eq('partner_id', scope);
 };
 const assertCanEdit = (req, row, what) => {
   const scope = scopeOf(req.access);
@@ -31,7 +32,7 @@ const assertCanEdit = (req, row, what) => {
     throw new ForbiddenError(row.partner_id ? `This ${what} belongs to another partner.` : `This ${what} is shared by every partner, so only the admin can change it. Add your own instead.`);
   }
 };
-/** The customer's chosen partner (?partner_id=): shared rows plus that partner's. Without it every row is offered. */
+/** The order's partner (?partner_id=, only once the admin assigned one). Without it a customer is offered the shared standard set. */
 const partnerOfQuery = (req) => {
   const id = String(req.query.partner_id || '');
   if (!id) return null;
@@ -268,9 +269,8 @@ export const lookupArticleTypes = catchAsync(async (req, res) => {
     .order('sort_order', { ascending: true })
     .order('name', { ascending: true })
     .range(q.from, q.to);
-  if (partnerId) {
-    query = query.or(`partner_id.is.null,partner_id.eq.${partnerId}`).or(`partner_id.is.null,partner_id.eq.${partnerId}`, { referencedTable: 'articles' });
-  }
+  // an order with a partner offers that partner's articles; an order still at the central location offers the shared standard set
+  query = partnerId ? query.eq('partner_id', partnerId).eq('articles.partner_id', partnerId) : query.is('partner_id', null).is('articles.partner_id', null);
   query = searchFilter(query, q.search);
   const result = await query;
   const rows = unwrap(result, 'Could not load article types').map(({ articles, ...t }) => t);
@@ -374,7 +374,7 @@ export const deleteArticle = catchAsync(async (req, res) => {
 
 /**
  * GET /api/client/articles?type_id=<required>&search&page&limit
- * Active articles of an active type. Never includes the internal price.
+ * Active articles of an active type. Includes the customer price (never the partner cost).
  */
 export const lookupArticles = catchAsync(async (req, res) => {
   const typeId = String(req.query.type_id || '');
@@ -386,13 +386,13 @@ export const lookupArticles = catchAsync(async (req, res) => {
 
   let query = supabaseAdmin
     .from('articles')
-    .select('id, article_type_id, name, image_url, partner_id', { count: 'exact' })
+    .select('id, article_type_id, name, image_url, customer_price, partner_id', { count: 'exact' })
     .eq('article_type_id', typeId)
     .eq('status', 'active')
     .order('sort_order', { ascending: true })
     .order('name', { ascending: true })
     .range(q.from, q.to);
-  if (partnerId) query = query.or(`partner_id.is.null,partner_id.eq.${partnerId}`);
+  query = partnerId ? query.eq('partner_id', partnerId) : query.is('partner_id', null);
   query = searchFilter(query, q.search);
   const result = await query;
   let rows = unwrap(result, 'Could not load articles');
@@ -401,6 +401,37 @@ export const lookupArticles = catchAsync(async (req, res) => {
     const own = new Set(rows.filter((a) => a.partner_id === partnerId).map((a) => a.name.trim().toLowerCase()));
     rows = rows.filter((a) => a.partner_id === partnerId || !own.has(a.name.trim().toLowerCase()));
   }
+  // An order with no partner yet shows the shared set. A price the partners set on their own copy still tells the customer
+  // what to expect: use the default partner's price for the same article, else the lowest one.
+  if (!partnerId && rows.some((a) => a.customer_price == null)) {
+    const typeRow = await supabaseAdmin.from('article_types').select('name').eq('id', typeId).maybeSingle();
+    const names = [...new Set(rows.filter((a) => a.customer_price == null).map((a) => a.name))];
+    const [theirs, defaults] = await Promise.all([
+      supabaseAdmin.from('articles').select('name, customer_price, partner_id, type:article_types!inner(name)').in('name', names).not('partner_id', 'is', null).not('customer_price', 'is', null).eq('article_types.name', typeRow.data?.name ?? ''),
+      supabaseAdmin.from('partners').select('id').eq('is_default', true),
+    ]);
+    const defaultIds = new Set((defaults.data || []).map((p) => p.id));
+    const priceFor = new Map();
+    for (const t of theirs.data || []) {
+      const key = t.name.trim().toLowerCase();
+      const cur = priceFor.get(key);
+      const better = !cur || (defaultIds.has(t.partner_id) && !cur.isDefault) || (defaultIds.has(t.partner_id) === cur.isDefault && Number(t.customer_price) < cur.price);
+      if (better) priceFor.set(key, { price: Number(t.customer_price), isDefault: defaultIds.has(t.partner_id) });
+    }
+    rows = rows.map((a) => (a.customer_price == null && priceFor.has(a.name.trim().toLowerCase()) ? { ...a, customer_price: priceFor.get(a.name.trim().toLowerCase()).price } : a));
+  }
   return sendPage(res, rows.map(({ partner_id, ...a }) => a), q, result.count);
 });
 
+/**
+ * POST /api/partner/catalogue/standard-set — copy the standard types and articles into this partner's own catalogue.
+ */
+export const copyStandardSet = catchAsync(async (req, res) => {
+  const owner = ownerOf(req);
+  if (!owner) throw new BadRequestError('Choose a partner first (top bar), then copy the standard set into its catalogue.');
+  const done = await copyStandardCatalogue(owner);
+  const message = done.typesAdded || done.articlesAdded
+    ? `Added ${done.typesAdded} type${done.typesAdded === 1 ? '' : 's'} and ${done.articlesAdded} article${done.articlesAdded === 1 ? '' : 's'} to your catalogue.`
+    : 'Your catalogue already has everything from the standard set.';
+  return ApiResponse.success(res, done, message);
+});

@@ -1,19 +1,16 @@
 import { supabaseAdmin } from '../config/supabase.js';
-import { config } from '../config/env.js';
+import { loadShipTo } from '../services/ship-to.service.js';
 import { catchAsync, ApiResponse } from '../utils/error.helper.js';
 import { unwrap } from '../utils/db.js';
 
-/** Platform defaults from the environment; an unset one is a [placeholder] and counts as empty. */
-const fallback = (key) => {
-  const v = config.platform?.[key] || '';
-  return v.startsWith('[') ? '' : v;
-};
 
 /**
  * GET /api/client/partners — the stitching partners a customer can choose from when starting an order, each with the
  * address the parcel has to be sent to. `recommendedId` is the partner the platform would pick right now (lowest load).
  */
 export const listClientPartners = catchAsync(async (req, res) => {
+  const shipTo = await loadShipTo().catch(() => ({}));
+  const fallback = (key) => shipTo[key] || '';
   const [rows, pick] = await Promise.all([
     supabaseAdmin
       .from('partners')

@@ -8,7 +8,12 @@ import {
   updateClientOrder,
   cancelClientOrder,
   deleteClientDraft,
+  approveParcel,
+  reviewArticle,
+  returnArticle,
+  rejectWholeParcel,
   approveClientOrder,
+  listPendingApprovals,
   requestChanges,
   payClientOrder,
   getClientSizes,
@@ -33,7 +38,8 @@ import {
   addBrandAsCustomer,
 } from '../controllers/catalogue.controller.js';
 import { listClientPartners } from '../controllers/partner-directory.controller.js';
-import { getInbox, getMailbox, getUnreadCount, getEmail, readAll, removeEmail } from '../controllers/inbox.controller.js';
+import { getInbox, getMailbox, getUnreadCount, getEmail, readAll, removeEmail, send as sendInboxEmail } from '../controllers/inbox.controller.js';
+import { getMySupport, sendMySupport, readMySupport, getMySupportUnread } from '../controllers/support.controller.js';
 import { previewProduct } from '../controllers/client.controller.js';
 import { getMessages, postMessage, uploadVoice, readMessages, uploadVoiceNote, getConversationScopes, getMyConversations } from '../controllers/chat.controller.js';
 import { createPaymentIntent, confirmPayment } from '../controllers/payment.controller.js';
@@ -47,13 +53,24 @@ router.get('/overview', getClientOverview);
 router.get('/banners', getActiveBanners);
 router.get('/home-layout', getClientHomeLayout);
 
+// General chat with the admin team (not about an order)
+router.get('/support/messages', getMySupport);
+router.post('/support/messages', sendMySupport);
+router.post('/support/read', readMySupport);
+router.get('/support/unread', getMySupportUnread);
+
 router.get('/orders', getClientOrders);
 router.get('/orders/counts', getClientOrderCounts);
 router.post('/orders', createClientOrder);
 router.get('/orders/:id', getClientOrder);
 router.patch('/orders/:id', updateClientOrder);
+router.post('/orders/:id/approve-parcel', approveParcel);
+router.post('/orders/:id/units/:unitId/review', reviewArticle);
+router.post('/orders/:id/reject-parcel', rejectWholeParcel);
+router.post('/orders/:id/units/:unitId/return', returnArticle);
 router.post('/orders/:id/cancel', cancelClientOrder);
 router.delete('/orders/:id', deleteClientDraft);
+router.get('/approvals', listPendingApprovals);
 router.post('/orders/:id/approve', approveClientOrder);
 router.post('/orders/:id/request-changes', requestChanges);
 router.post('/orders/:id/payment-intent', createPaymentIntent);
@@ -75,6 +92,7 @@ router.get('/inbox', getInbox);
 router.get('/inbox/address', getMailbox);
 router.get('/inbox/unread-count', getUnreadCount);
 router.post('/inbox/read-all', readAll);
+router.post('/inbox/send', sendInboxEmail);
 router.get('/inbox/:id', getEmail);
 router.delete('/inbox/:id', removeEmail);
 

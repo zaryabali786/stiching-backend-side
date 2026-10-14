@@ -59,7 +59,12 @@ CREATE TABLE IF NOT EXISTS public.article_types (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS article_types_name_lower_idx ON public.article_types (lower(btrim(name)));
+-- 0013 replaces this index with a per-partner one: do not bring the old one back once partner_id exists
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'article_types' AND column_name = 'partner_id') THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS article_types_name_lower_idx ON public.article_types (lower(btrim(name)));
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS article_types_order_idx ON public.article_types (status, sort_order, lower(name));
 
 CREATE TABLE IF NOT EXISTS public.articles (
@@ -75,7 +80,12 @@ CREATE TABLE IF NOT EXISTS public.articles (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS articles_type_name_lower_idx ON public.articles (article_type_id, lower(btrim(name)));
+-- 0013 replaces this index with a per-partner one: do not bring the old one back once partner_id exists
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'articles' AND column_name = 'partner_id') THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS articles_type_name_lower_idx ON public.articles (article_type_id, lower(btrim(name)));
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS articles_type_status_idx ON public.articles (article_type_id, status, sort_order, lower(name));
 
 DROP TRIGGER IF EXISTS trg_article_types_updated ON public.article_types;

@@ -261,13 +261,13 @@ export const deactivateAdminPartnerUser = catchAsync(async (req, res) => {
 
 // ───────────────────────── orders <-> partners ─────────────────────────
 
-const ASSIGNMENT_MODES = ['auto', 'manual'];
+const ASSIGNMENT_MODES = ['default', 'auto', 'manual'];
 
 /** The current rule for new orders. Without the settings table (migration 0008 not run yet) it is 'auto'. */
 export const readAssignmentMode = async () => {
   const { data, error } = await supabaseAdmin.from('platform_settings').select('value').eq('key', 'order_assignment').maybeSingle();
-  if (error) return 'auto';
-  return ASSIGNMENT_MODES.includes(data?.value?.mode) ? data.value.mode : 'auto';
+  if (error) return 'default';
+  return ASSIGNMENT_MODES.includes(data?.value?.mode) ? data.value.mode : 'default';
 };
 
 const assignmentPayload = async () => {
@@ -281,13 +281,13 @@ const assignmentPayload = async () => {
 /** GET /api/admin/settings/order-assignment */
 export const getOrderAssignment = catchAsync(async (req, res) => ApiResponse.success(res, await assignmentPayload()));
 
-/** PUT /api/admin/settings/order-assignment  body: { mode: 'auto' | 'manual' }: applies to orders created from now on */
+/** PUT /api/admin/settings/order-assignment  body: { mode: 'default' | 'auto' | 'manual' }: applies to orders created from now on */
 export const setOrderAssignment = catchAsync(async (req, res) => {
   const mode = req.body?.mode;
-  if (!ASSIGNMENT_MODES.includes(mode)) throw new BadRequestError("Mode must be 'auto' or 'manual'.");
+  if (!ASSIGNMENT_MODES.includes(mode)) throw new BadRequestError("Mode must be 'default', 'auto' or 'manual'.");
   const { error } = await supabaseAdmin.from('platform_settings').upsert({ key: 'order_assignment', value: { mode }, updated_by: req.userId, updated_at: new Date().toISOString() });
   if (error) throw new BadRequestError('Could not save. Run the latest database update (0008) first.');
-  return ApiResponse.success(res, await assignmentPayload(), mode === 'auto' ? 'New orders now go to the least busy partner.' : 'New orders now wait for you to choose a partner.');
+  return ApiResponse.success(res, await assignmentPayload(), mode === 'default' ? 'New orders now go to the default partner.' : mode === 'auto' ? 'New orders now go to the least busy partner.' : 'New orders now wait for you to choose a partner.');
 });
 
 /**

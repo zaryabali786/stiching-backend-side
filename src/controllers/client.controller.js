@@ -7,12 +7,32 @@ import { unwrap, unwrapOne, round2 } from '../utils/db.js';
 import { STATUS_GROUPS, STATUS_LABELS, setOrderStatus, addEvent, notifyPartnerAboutOrder, syncOrderFromCards, logUnitEvent, buildUnitTimeline } from '../services/order.service.js';
 import { notifyStaff, notifyAdmins, notifyPartner, notifyUser } from '../services/notification.service.js';
 import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
-import { resolveOrderRefs, resolveOrderPartner, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
+import { resolveOrderRefs, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
 import { createMessage } from '../services/chat.service.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
 import { linkImportToOrder } from '../services/order-import.service.js';
 import { readProductLink } from '../services/product-page.service.js';
 import { cleanMeasurements as cleanMeasurementsRaw, cleanNearestSize as cleanNearestRaw, sizeSnapshotOf, withSizeSnapshot } from '../utils/measurements.js';
+
+import { readAssignmentMode } from './admin-partners.controller.js';
+import { decideArticle, approveAllArticles, rejectParcel, requestReturn, releaseArticles, assertOwnUnit, describeArticle } from '../services/unit-review.service.js';
+import { loadExpressStitching, dueAfter } from '../services/express-stitching.service.js';
+import { shipmentsForUnits } from '../services/return-shipment.service.js';
+import { canCustomerSubmit, returnSummary, returnBadge, groupSummary, articleGroup, groupReference, needsDetails, RETURN_LABELS } from '../services/unit-flow.service.js';
+
+/**
+ * Apply the admin's assignment rule to an order that has no partner yet: in 'default' mode it goes to the partner the admin
+ * marked as default. (The database trigger does the same once migration 0020 is applied; this keeps it working either way.)
+ * @returns the order, with `partner_id` filled in when a partner was chosen
+ */
+const assignPartnerByRule = async (order) => {
+  if (order.partner_id || order.status === 'draft') return order;
+  if ((await readAssignmentMode()) !== 'default') return order;
+  const { data: partner } = await supabaseAdmin.from('partners').select('id').eq('is_default', true).eq('status', 'active').maybeSingle();
+  if (!partner) return order;
+  const { data } = await supabaseAdmin.from('orders').update({ partner_id: partner.id }).eq('id', order.id).is('partner_id', null).select('*').maybeSingle();
+  return data || order;
+};
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
 
@@ -53,7 +73,8 @@ const shapeApproval = (card) => ({
   change_request_audio: card?.change_request_audio || null,
 });
 
-const shapeUnit = ({ picks, unit_price, currency, card, unit_events, ...unit }) => ({
+const shapeUnit = ({ picks, unit_price, currency, card, unit_events, ...unit }, order = null) => ({
+  ...describeArticle({ unit, card: one(card), order }),
   approval: shapeApproval(one(card)),
   timeline: buildUnitTimeline(unit, one(card), unit_events),
   // the order keeps its own copy of the sizes (later edits to the chart don't change it)
@@ -73,10 +94,19 @@ const shapeUnit = ({ picks, unit_price, currency, card, unit_events, ...unit }) 
 
 const shapeOrderDetail = (order) => {
   const invoice = one(order.invoice);
+  const returns = returnSummary(order.units || []);
+  // a parcel the customer rejected is "being returned", not "received"
+  const returnLabel = returns?.whole_parcel
+    ? returns.status === 'sent_back' ? `Parcel returned${returns.to ? ` to ${RETURN_LABELS[returns.to] === 'the customer' ? 'you' : RETURN_LABELS[returns.to]}` : ''}` : `Parcel rejected · return to ${returns.to ? (returns.to === 'customer' ? 'you' : 'the brand') : 'be arranged'}`
+    : null;
   return {
     ...order,
-    status_label: STATUS_LABELS[order.status],
-    units: (order.units || []).sort((a, b) => a.line_no - b.line_no).map(shapeUnit),
+    return_summary: returns,
+    // website / email orders finish their articles, sizes and notes after the parcel is approved
+    details_pending: needsDetails(order) && !order.details_completed_at && order.parcel_review !== 'none',
+    status_label: returnLabel || STATUS_LABELS[order.status],
+    groups: groupSummary(order.reference, order.units || []),
+    units: (order.units || []).sort((a, b) => a.line_no - b.line_no).map((u) => ({ ...shapeUnit(u, order), group: articleGroup(u), group_reference: groupReference(order.reference, articleGroup(u)) })),
     events: (order.events || []).sort((a, b) => a.created_at.localeCompare(b.created_at)),
     // customers only ever see issued or paid invoices
     invoice: invoice && ['issued', 'paid'].includes(invoice.status)
@@ -87,7 +117,17 @@ const shapeOrderDetail = (order) => {
 };
 
 /** Order detail for the customer, with a short-lived link to the uploaded brand invoice. */
-const orderDetailResponse = async (order) => signNoteAudio({ ...shapeOrderDetail(order), brand_invoice: await withSignedUrl(order.brand_invoice) });
+const orderDetailResponse = async (order) => {
+  // a return order points at the article it returns: the customer sees which one
+  const returnUnit = order.order_kind === 'return' && order.return_unit_id
+    ? (await supabaseAdmin.from('order_units').select('id, unit_title, code, order_id').eq('id', order.return_unit_id).maybeSingle()).data
+    : null;
+  // the courier shipment of each returned article (courier, CN, tracking events) is shown on the order
+  const returned = (order.units || []).filter((u) => u.return_status && u.return_status !== 'none').map((u) => u.id);
+  const shipments = returned.length ? await shipmentsForUnits(returned).catch(() => new Map()) : new Map();
+  const withShipments = { ...order, units: (order.units || []).map((u) => ({ ...u, return_shipment: shipments.get(u.id) ?? null })) };
+  return signNoteAudio({ ...shapeOrderDetail(withShipments), return_unit: returnUnit, brand_invoice: await withSignedUrl(order.brand_invoice) });
+};
 
 // ─────────────────────────────── Overview ───────────────────────────────
 
@@ -160,6 +200,10 @@ export const getClientOverview = catchAsync(async (req, res) => {
 
 // ─────────────────────────────── Orders ───────────────────────────────
 
+const LIST_COLS = 'id, reference, brand, brand_order_number, tracking_number, status, has_issue, import_source, created_at, destination_city, destination_country';
+const LIST_SELECT = `${LIST_COLS}, order_kind, units:order_units!order_units_order_id_fkey(review_status, return_status, return_to, return_courier, return_tracking, held_at, hold_resolved_at)`;
+const LIST_SELECT_LEGACY = `${LIST_COLS}, units:order_units!order_units_order_id_fkey(id)`;
+
 /**
  * GET /api/client/orders?page&limit&search&status=active|completed|all|<status>
  */
@@ -167,7 +211,7 @@ export const getClientOrders = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 10, sortable: ['created_at', 'reference'] });
   let query = supabaseAdmin
     .from('orders')
-    .select('id, reference, brand, brand_order_number, tracking_number, status, has_issue, import_source, created_at, destination_city, destination_country, units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
+    .select(LIST_SELECT, { count: 'exact' })
     .eq('customer_id', req.userId)
     .order(q.sort, { ascending: q.ascending })
     .range(q.from, q.to);
@@ -176,11 +220,24 @@ export const getClientOrders = catchAsync(async (req, res) => {
   if (status && STATUS_GROUPS[status]) query = query.in('status', STATUS_GROUPS[status]);
   else if (status && STATUS_LABELS[status]) query = query.eq('status', status);
   if (q.search) query = query.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
+  const rebuild = (select) => {
+    let qq = supabaseAdmin.from('orders').select(select, { count: 'exact' }).eq('customer_id', req.userId).order(q.sort, { ascending: q.ascending }).range(q.from, q.to);
+    if (status && STATUS_GROUPS[status]) qq = qq.in('status', STATUS_GROUPS[status]);
+    else if (status && STATUS_LABELS[status]) qq = qq.eq('status', status);
+    if (q.search) qq = qq.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
+    return qq;
+  };
 
-  const result = await query;
+  let result = await query;
+  if (result.error) {
+    // the return columns are missing until the article-workflow migration has run: list without them
+    result = await rebuild(LIST_SELECT_LEGACY);
+  }
   const rows = unwrap(result, 'Could not load orders').map((o) => ({
     ...o,
-    units_count: o.units?.[0]?.count ?? 0,
+    units_count: o.units?.length ?? 0,
+    return_badge: returnBadge(o.units),
+    groups: groupSummary(o.reference, o.units),
     units: undefined,
     status_label: STATUS_LABELS[o.status],
   }));
@@ -228,6 +285,7 @@ const cleanUnit = (u, i) => {
     unit_title: title.slice(0, 160),
     product_link: link ? link.slice(0, 500) : null,
     product_image_url: cleanHttpUrl(u.product_image_url),
+    brand_id: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(u.brand_id || '')) ? u.brand_id : null,
     brand_sku: u.brand_sku ? String(u.brand_sku).slice(0, 80) : null,
     stitching_type: u.stitching_type ? String(u.stitching_type).slice(0, 120) : null,
     size_chart_id: u.size_chart_id || null,
@@ -239,23 +297,37 @@ const cleanUnit = (u, i) => {
 /**
  * POST /api/client/orders
  * body: {
- *   brand_id, courier_id, tracking_number, international_shipping (true|false), brand_order_number?, note?,
+ *   brand_id, international_shipping (true|false), courier_id?, tracking_number?, brand_order_number?, note?,
  *   destination_country?, destination_city?, destination_address?,
  *   units: [{ unit_title, product_link?, product_image_url?, stitching_type?, size_chart_id?, notes?, quantity,
  *             article_ids: [uuid], reference_uploads? }]
  * }
  * Shipping type is derived: international => express, otherwise standard. There is no rush option.
+ * The customer never picks a partner: every order starts at the admin's central location (partner_id NULL) and the admin
+ * assigns a partner afterwards (POST /api/admin/orders/:id/partner). Courier and tracking can be added any time later.
  */
 export const createClientOrder = catchAsync(async (req, res) => {
   const body = req.body || {};
-  const refs = await resolveOrderRefs(body);
-  const partnerId = await resolveOrderPartner(body.partner_id);
   if (!Array.isArray(body.units) || body.units.length === 0) throw new BadRequestError('Add at least one article.');
   if (body.units.length > 30) throw new BadRequestError('An order can have at most 30 articles.');
+  // A brand chosen for the whole order = a website purchase (or an import of one); brands per article = the customer's own parcel
+  const explicitBrand = !!body.brand_id;
+  // "Direct from customer": the brand is chosen per article; the order takes the first article's brand
+  if (!body.brand_id) body.brand_id = body.units.find((u) => u.brand_id)?.brand_id;
+  const refs = await resolveOrderRefs(body);
 
   const units = body.units.map(cleanUnit);
+  const unitBrandIds = [...new Set(units.map((u) => u.brand_id).filter(Boolean))];
+  if (unitBrandIds.length) {
+    const found = unwrap(await supabaseAdmin.from('brands').select('id, name, status').in('id', unitBrandIds), 'Could not check the brands');
+    const names = new Map(found.filter((b) => b.status === 'active').map((b) => [b.id, b.name]));
+    for (const u of units) {
+      if (u.brand_id && !names.has(u.brand_id)) throw new BadRequestError('One of the brands is not available. Choose another.');
+      u.brand = u.brand_id ? names.get(u.brand_id) : null;
+    }
+  }
   const uploads = body.units.map((u) => (Array.isArray(u.reference_uploads) ? u.reference_uploads.slice(0, 4) : []));
-  const picks = await resolveUnitArticles(body.units, [], partnerId);
+  const picks = await resolveUnitArticles(body.units, [], null);
   const noteAudios = await Promise.all(body.units.map((u) => cleanVoiceNote(u.notes_audio, req.userId)));
 
   // Size charts must belong to this customer
@@ -267,6 +339,8 @@ export const createClientOrder = catchAsync(async (req, res) => {
 
   const charts = await loadChartsFor(req.userId, chartIds);
   const note = String(body.note ?? body.customer_notes ?? '').trim().slice(0, 2000) || null;
+  const expressSetting = await loadExpressStitching();
+  const express = body.express_stitching === true && expressSetting.enabled;
   const due = new Date();
   due.setUTCDate(due.getUTCDate() + 12);
   const p = req.profile;
@@ -279,15 +353,20 @@ export const createClientOrder = catchAsync(async (req, res) => {
         customer_name: p.full_name || p.email,
         customer_code: p.customer_code,
         ...refs,
-        // the partner the customer chose; null lets the admin's assignment rule decide
-        partner_id: partnerId,
+        partner_id: null, // central location first; the admin chooses the partner later
         brand_order_number: body.brand_order_number?.trim() || null,
         customer_notes: note,
-        priority: 'normal',
-        due_date: due.toISOString().slice(0, 10),
+        order_source: body.import_id || explicitBrand ? 'website' : 'customer',
+        // a customer's own parcel has no details step: it goes to production once approved
+        details_completed_at: body.import_id || explicitBrand ? null : new Date().toISOString(),
+        priority: express ? 'rush' : 'normal',
+        express_stitching: express,
+        express_days: express ? expressSetting.days : null,
+        due_date: express ? dueAfter(new Date(), expressSetting.days) : due.toISOString().slice(0, 10),
         destination_country: (body.destination_country || p.country || '').trim() || (refs.international_shipping === false ? 'Pakistan' : null),
         destination_city: (body.destination_city || p.city || '').trim() || null,
         destination_address: (body.destination_address || p.address || '').trim() || null,
+        destination_phone: (body.destination_phone || p.phone || '').trim().slice(0, 40) || null,
       })
       .select('*')
       .single(),
@@ -295,6 +374,7 @@ export const createClientOrder = catchAsync(async (req, res) => {
   );
 
   const undo = async () => supabaseAdmin.from('orders').delete().eq('id', order.id); // cascades to the pieces
+  Object.assign(order, await assignPartnerByRule(order));
   const insertedUnits = await supabaseAdmin
     .from('order_units')
     .insert(units.map((u, i) => ({ ...u, design: picks[i].design, size_snapshot: sizeSnapshotOf(charts.get(u.size_chart_id)), notes_audio: noteAudios[i] ?? null, line_no: i + 1, order_id: order.id })))
@@ -362,15 +442,18 @@ export const updateClientOrder = catchAsync(async (req, res) => {
   const order = await loadOwnOrder(req);
   // a draft made from an email is completed here: saving it submits it, like a newly created order
   const isDraft = order.status === 'draft';
-  if (order.status !== 'submitted' && !isDraft) throw new ForbiddenError('This order can no longer be edited because the parcel has arrived.');
+  // a website order whose parcel was checked is completed here (its articles, sizes and notes), then it goes to production
+  const websiteCompletion = !isDraft && order.order_source === 'website' && order.status === 'received' && order.parcel_review !== 'none' && !order.details_completed_at;
+  if (order.status !== 'submitted' && !isDraft && !websiteCompletion) throw new ForbiddenError('This order can no longer be edited because the parcel has arrived.');
+  // an order made from an email: its articles are fixed. The customer completes them only after each one was received and approved.
+  const emailOrder = order.order_source === 'email' || order.import_source === 'email';
+  // for both, the articles are the ones that arrived: they cannot be added or removed, and only approved ones can be edited
+  const fixedArticles = emailOrder || websiteCompletion;
+  if (isDraft && emailOrder && order.parcel_review === 'none') throw new ForbiddenError('You can complete this order after we receive your parcel.');
   const body = req.body || {};
 
   const patch = {};
-  // the partner can only be chosen (or changed) while the order is still a draft: after that the customer has been told where to ship
-  if (isDraft && body.partner_id !== undefined) {
-    const chosen = await resolveOrderPartner(body.partner_id);
-    if (chosen) patch.partner_id = chosen;
-  }
+  // customers never choose or change the partner: the admin assigns it (an order without one is at the central location)
   if (isDraft || body.brand_id !== undefined || body.courier_id !== undefined || body.international_shipping !== undefined || body.tracking_number !== undefined) {
     // validate the shipping block as a whole, filling gaps from the current order
     Object.assign(
@@ -378,8 +461,8 @@ export const updateClientOrder = catchAsync(async (req, res) => {
       await resolveOrderRefs(
         {
           brand_id: body.brand_id ?? order.brand_id,
-          courier_id: body.courier_id ?? order.courier_id,
-          tracking_number: body.tracking_number ?? order.tracking_number,
+          courier_id: body.courier_id === undefined ? order.courier_id : body.courier_id,
+          tracking_number: body.tracking_number === undefined ? order.tracking_number : body.tracking_number,
           international_shipping: body.international_shipping ?? order.international_shipping,
         },
         { order }
@@ -389,7 +472,16 @@ export const updateClientOrder = catchAsync(async (req, res) => {
   if (body.brand_order_number !== undefined) patch.brand_order_number = String(body.brand_order_number || '').trim() || null;
   const noteChanged = body.note !== undefined || body.customer_notes !== undefined;
   if (noteChanged) patch.customer_notes = String(body.note ?? body.customer_notes ?? '').trim().slice(0, 2000) || null;
-  for (const key of ['destination_country', 'destination_city', 'destination_address']) {
+  if (body.express_stitching !== undefined && (body.express_stitching === true) !== !!order.express_stitching) {
+    const setting = await loadExpressStitching();
+    patch.express_stitching = body.express_stitching === true && setting.enabled;
+    patch.priority = patch.express_stitching ? 'rush' : 'normal';
+    // the days come from the admin's setting; turning it off puts the normal lead time back
+    patch.express_days = patch.express_stitching ? setting.days : null;
+    const base = new Date(order.created_at);
+    patch.due_date = patch.express_stitching ? dueAfter(base, setting.days) : dueAfter(base, 12);
+  }
+  for (const key of ['destination_country', 'destination_city', 'destination_address', 'destination_phone']) {
     if (body[key] !== undefined) patch[key] = String(body[key] || '').trim() || null;
   }
   if (Object.keys(patch).length) unwrap(await supabaseAdmin.from('orders').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', order.id));
@@ -397,13 +489,17 @@ export const updateClientOrder = catchAsync(async (req, res) => {
   if (Array.isArray(body.units)) {
     if (!body.units.length) throw new BadRequestError('Add at least one article.');
     if (body.units.length > 30) throw new BadRequestError('An order can have at most 30 articles.');
-    const existing = unwrap(await supabaseAdmin.from('order_units').select('id, reference_images, picks:order_unit_articles(article_id)').eq('order_id', order.id));
+    const existing = unwrap(await supabaseAdmin.from('order_units').select('id, reference_images, product_link, unit_title, quantity, status, review_status, picks:order_unit_articles(article_id)').eq('order_id', order.id));
+    if (fixedArticles) {
+      if (body.units.some((u) => !u.id || !existing.some((e) => e.id === u.id))) throw new BadRequestError('You cannot add articles to an order made from an email.');
+      if (existing.some((e) => !body.units.some((u) => u.id === e.id))) throw new BadRequestError('You cannot remove articles from an order made from an email.');
+    }
     const keepIds = new Set(body.units.map((u) => u.id).filter((id) => existing.some((e) => e.id === id)));
 
     // articles an existing piece already has stay valid even if the partner switched them off since
     const already = body.units.map((u) => new Set((existing.find((e) => e.id === u.id)?.picks || []).map((x) => x.article_id)));
     const cleaned = body.units.map(cleanUnit);
-    const picks = await resolveUnitArticles(body.units, already, patch.partner_id ?? order.partner_id ?? null);
+    const picks = await resolveUnitArticles(body.units, already, order.partner_id ?? null);
     const noteAudios = await Promise.all(body.units.map((u) => cleanVoiceNote(u.notes_audio, req.userId)));
     const editCharts = await loadChartsFor(req.userId, [...new Set(cleaned.map((u) => u.size_chart_id).filter(Boolean))]);
 
@@ -413,8 +509,10 @@ export const updateClientOrder = catchAsync(async (req, res) => {
 
     // Update kept articles in place (keeps their photos), insert new ones
     for (const [i, raw] of body.units.entries()) {
-      const unit = { ...cleaned[i], design: picks[i].design, size_snapshot: sizeSnapshotOf(editCharts.get(cleaned[i].size_chart_id)), line_no: i + 1, updated_at: new Date().toISOString(), ...(noteAudios[i] !== undefined ? { notes_audio: noteAudios[i] } : {}) };
       const prev = existing.find((e) => e.id === raw.id);
+      // an article that was not received and approved yet cannot be edited
+      if (fixedArticles && !(prev?.status === 'received' && prev?.review_status === 'approved')) continue;
+      const unit = { ...cleaned[i], ...(fixedArticles ? { product_link: prev?.product_link ?? null, unit_title: prev.unit_title, quantity: prev.quantity } : {}), design: picks[i].design, size_snapshot: sizeSnapshotOf(editCharts.get(cleaned[i].size_chart_id)), line_no: i + 1, updated_at: new Date().toISOString(), ...(noteAudios[i] !== undefined ? { notes_audio: noteAudios[i] } : {}) };
       const uploads = Array.isArray(raw.reference_uploads) ? raw.reference_uploads.slice(0, 4) : [];
       const refsUploaded = uploads.length ? await uploadDataUrls(`references/${order.id}`, uploads) : [];
       let unitId;
@@ -429,22 +527,39 @@ export const updateClientOrder = catchAsync(async (req, res) => {
       await saveUnitArticles(unitId, picks[i].rows);
     }
   }
-  if (isDraft) {
+  if (isDraft || websiteCompletion) {
     const { count } = await supabaseAdmin.from('order_units').select('id', { count: 'exact', head: true }).eq('order_id', order.id);
     if (!count) throw new BadRequestError('Add at least one article.');
-    // the partner is chosen by the database as the status leaves "draft" (Settings > Orders)
-    const submitted = unwrap(await supabaseAdmin.from('orders').update({ status: 'submitted', updated_at: new Date().toISOString() }).eq('id', order.id).eq('status', 'draft').select('*').single(), 'Could not submit the order');
-    await addEvent(order.id, 'submitted', `Draft submitted with ${count} article(s) from ${submitted.brand}`, req.userId);
+    // the order keeps no partner until the admin assigns one (or the database rule in Settings > Orders does)
+    // the parcel is in our hands: every article needs the customer's decision, then the order goes on as "received".
+    // Articles they rejected carry on separately (return, correction, approval again) without holding up the approved ones.
+    const parcelIn = order.parcel_review !== 'none';
+    if (parcelIn) {
+      const verdict = canCustomerSubmit(unwrap(await supabaseAdmin.from('order_units').select('id, review_status').eq('order_id', order.id)));
+      if (!verdict.ok) throw new BadRequestError(verdict.message);
+    }
+    const doneAt = new Date().toISOString();
+    const submitted = isDraft
+      ? unwrap(await supabaseAdmin.from('orders').update({
+          status: parcelIn ? 'received' : 'submitted', ...(parcelIn ? { received_at: order.parcel_received_at || doneAt, details_completed_at: doneAt } : {}), updated_at: doneAt,
+        }).eq('id', order.id).eq('status', 'draft').select('*').single(), 'Could not submit the order')
+      : unwrap(await supabaseAdmin.from('orders').update({ details_completed_at: doneAt, updated_at: doneAt }).eq('id', order.id).is('details_completed_at', null).select('*').single(), 'Could not complete the order');
+    Object.assign(submitted, await assignPartnerByRule(submitted));
+    if (parcelIn) await releaseArticles(order.id); // the approved articles enter production now, each on its own ticket
+    await addEvent(order.id, submitted.status, parcelIn ? `Details completed after the parcel was reviewed · ${count} article(s) from ${submitted.brand}` : `Draft submitted with ${count} article(s) from ${submitted.brand}`, req.userId);
     if (submitted.customer_notes) {
       await createMessage({ order: submitted, profile: req.profile, kind: 'text', body: submitted.customer_notes, clientMsgId: `order-note-${order.id}`, silent: true }).catch((err) => console.warn('[Order] note message failed:', err.message));
     }
-    await announceNewOrder(submitted, count, req.userId);
+    if (parcelIn) {
+      await notifyAdmins({ type: 'order', title: `Order ${submitted.reference} is ready to start`, body: `${submitted.customer_name} (${submitted.customer_code}) · ${count} article(s) from ${submitted.brand}. Parcel approved and details added${submitted.partner_id ? '' : ' · choose a partner'}.`, link: `/admin/orders?ref=${submitted.reference}`, orderId: submitted.id });
+      if (submitted.partner_id) await notifyPartner({ type: 'order', title: `Order ${submitted.reference} is ready to start`, body: `${submitted.customer_name} · ${count} article(s). Parcel approved and sizes added.`, link: `/partner/production`, orderId: submitted.id }).catch(() => {});
+    } else await announceNewOrder(submitted, count, req.userId);
   } else {
     await addEvent(order.id, 'submitted', 'Order details updated by customer', req.userId);
   }
 
   const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
-  return ApiResponse.success(res, await orderDetailResponse(full), isDraft ? `Order ${full.reference} submitted.` : 'Order updated.');
+  return ApiResponse.success(res, await orderDetailResponse(full), isDraft ? `Order ${full.reference} submitted.` : websiteCompletion ? 'Details saved. Your approved articles go to production.' : 'Order updated.');
 });
 
 // ─────────────────────────────── Product link preview ───────────────────────────────
@@ -466,6 +581,49 @@ export const previewProduct = catchAsync(async (req, res) => {
 
   const r = await readProductLink(url);
   return ApiResponse.success(res, { url: r.url, ok: r.ok, title: r.title, image_url: r.image_url, brand: r.brand, error: r.error });
+});
+
+/**
+ * POST /api/client/orders/:id/approve-parcel — the customer has seen the photos / videos of the parcel we received and
+ * accepts them. After this they add sizes and details and submit the order.
+ */
+export const approveParcel = catchAsync(async (req, res) => {
+  const order = await loadOwnOrder(req);
+  const result = await approveAllArticles({ order, profile: req.profile });
+  const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
+  return ApiResponse.success(res, await orderDetailResponse(full), result.approved === 1 ? 'Article approved.' : `${result.approved} articles approved.`);
+});
+
+/**
+ * POST /api/client/orders/:id/units/:unitId/review  body: { decision: 'approve' | 'reject', note?, media?: [{ name, dataUrl }] }
+ * The customer approves or rejects ONE received article. A rejection needs a reason (photos help).
+ */
+export const reviewArticle = catchAsync(async (req, res) => {
+  const order = await loadOwnOrder(req);
+  const unit = await assertOwnUnit(order, req.params.unitId);
+  const result = await decideArticle({ order, unit, decision: req.body?.decision, note: req.body?.note, media: req.body?.media, returnTo: req.body?.return_to, action: req.body?.action === 'hold' ? 'hold' : 'return', shipping: req.body?.shipping, profile: req.profile });
+  const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
+  return ApiResponse.success(res, await orderDetailResponse(full), result.state === 'approved' ? 'Article approved.' : result.state === 'held' ? 'Article put on hold. We will keep it until you decide.' : 'Article rejected. You can ask us to send it back.');
+});
+
+/**
+ * POST /api/client/orders/:id/reject-parcel  body: { note, return_to?: 'brand'|'customer', media? }
+ * Reject every article that is waiting, with one reason and one return destination.
+ */
+export const rejectWholeParcel = catchAsync(async (req, res) => {
+  const order = await loadOwnOrder(req);
+  const result = await rejectParcel({ order, note: req.body?.note, media: req.body?.media, returnTo: req.body?.return_to, action: req.body?.action === 'hold' ? 'hold' : 'return', shipping: req.body?.shipping, profile: req.profile });
+  const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
+  return ApiResponse.success(res, await orderDetailResponse(full), result.held ? 'Parcel put on hold. We will keep it until you decide.' : `Parcel rejected. It will be returned to ${RETURN_LABELS[result.returnTo] === 'the customer' ? 'you' : 'the brand'}.`);
+});
+
+/** POST /api/client/orders/:id/units/:unitId/return  body: { note? } — send a rejected article back for correction or replacement. */
+export const returnArticle = catchAsync(async (req, res) => {
+  const order = await loadOwnOrder(req);
+  const unit = await assertOwnUnit(order, req.params.unitId);
+  await requestReturn({ order, unit, note: req.body?.note, profile: req.profile });
+  const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
+  return ApiResponse.success(res, await orderDetailResponse(full), 'Return requested. We will send the article back and tell you here.');
 });
 
 /**
@@ -493,6 +651,62 @@ const pendingCards = async (order, unitId) => {
   if (unitId) q = q.eq('unit_id', unitId);
   return unwrap(await q);
 };
+
+/**
+ * GET /api/client/approvals
+ * The customer's orders that have had photos sent for approval, with every article of each order and where it stands:
+ *   pending (waiting for the customer) · approved · rejected (changes asked for) · in_progress (not sent yet).
+ * `pending` is the number of articles waiting, for the badge in the side menu.
+ */
+const APPROVAL_STATE = { pending: 'pending', approved: 'approved', changes_requested: 'rejected' };
+
+export const listPendingApprovals = catchAsync(async (req, res) => {
+  const cards = unwrap(
+    await supabaseAdmin
+      .from('job_cards')
+      .select('order_id, approval_requested_at, order:orders!inner(customer_id)')
+      .in('approval_status', ['pending', 'approved', 'changes_requested'])
+      .eq('order.customer_id', req.userId)
+      .order('approval_requested_at', { ascending: false, nullsFirst: false })
+      .limit(300),
+    'Could not load your approvals'
+  );
+  const orderIds = [...new Set(cards.map((c) => c.order_id))].slice(0, 30);
+  if (!orderIds.length) return ApiResponse.success(res, { pending: 0, orders: [] });
+
+  const rows = unwrap(
+    await supabaseAdmin
+      .from('orders')
+      .select('id, reference, brand, units:order_units!order_units_order_id_fkey(id, unit_title, line_no, card:job_cards(id, approval_status, approval_photos, approval_requested_at, approval_decided_at, change_request))')
+      .in('id', orderIds),
+    'Could not load your approvals'
+  );
+
+  const orders = orderIds
+    .map((id) => rows.find((o) => o.id === id))
+    .filter(Boolean)
+    .map((o) => {
+      const articles = [...(o.units || [])]
+        .sort((x, y) => (x.line_no ?? 0) - (y.line_no ?? 0))
+        .map((u) => {
+          const card = one(u.card);
+          return {
+            unit_id: u.id,
+            title: u.unit_title,
+            status: APPROVAL_STATE[card?.approval_status] || 'in_progress',
+            photos: card?.approval_photos || [],
+            requested_at: card?.approval_requested_at || null,
+            decided_at: card?.approval_decided_at || null,
+            change_request: card?.approval_status === 'changes_requested' ? card.change_request || null : null,
+          };
+        });
+      return { order_id: o.id, reference: o.reference, brand: o.brand, articles };
+    });
+  // orders with something waiting come first, the rest keep the order of the latest photos sent
+  orders.sort((x, y) => Number(y.articles.some((a) => a.status === 'pending')) - Number(x.articles.some((a) => a.status === 'pending')));
+  const pending = orders.reduce((n, o) => n + o.articles.filter((a) => a.status === 'pending').length, 0);
+  return ApiResponse.success(res, { pending, orders });
+});
 
 const cardActivity = (card, req, body) =>
   supabaseAdmin.from('job_card_comments').insert({

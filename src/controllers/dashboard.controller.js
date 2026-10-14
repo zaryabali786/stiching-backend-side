@@ -8,11 +8,30 @@ const isPakistan = (country) => /^(pk|pakistan)$/i.test(String(country || '').tr
 const PERIODS = [7, 30, 90, 180, 365];
 const DAY = 86_400_000;
 
-/** Split [since, now] into daily buckets (up to 90 days) or weekly buckets (longer). */
-const makeBuckets = (days) => {
+/**
+ * The period to report on: a preset (?days=7|30|90|180|365, ending now) or an exact range (?from=YYYY-MM-DD&to=YYYY-MM-DD,
+ * both days included, at most one year).
+ */
+const parseRange = (query) => {
+  const iso = /^\d{4}-\d{2}-\d{2}$/;
+  if (iso.test(String(query.from || '')) && iso.test(String(query.to || ''))) {
+    const start = new Date(`${query.from}T00:00:00.000Z`);
+    const end = new Date(`${query.to}T23:59:59.999Z`);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) throw new BadRequestError('Choose a valid date range.');
+    if (end < start) throw new BadRequestError('The end date must not be before the start date.');
+    const days = Math.ceil((end - start) / DAY);
+    if (days > 366) throw new BadRequestError('Choose a range of at most one year.');
+    return { custom: true, from: query.from, to: query.to, days, since: start.toISOString(), until: end.toISOString() };
+  }
+  const days = PERIODS.includes(Number(query.days)) ? Number(query.days) : 30;
+  return { custom: false, from: null, to: null, days, since: daysAgoISO(days), until: new Date().toISOString() };
+};
+
+/** Split [since, since + days] into daily buckets (up to 90 days) or weekly buckets (longer). */
+const makeBuckets = (sinceISO, days) => {
   const step = days <= 90 ? 1 : 7;
   const count = Math.ceil(days / step);
-  const start = new Date(daysAgoISO(days)).getTime();
+  const start = new Date(sinceISO).getTime();
   const buckets = Array.from({ length: count }, (_, i) => {
     const d = new Date(start + i * step * DAY);
     return { label: d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' }), value: 0, amount: 0 };
@@ -35,31 +54,30 @@ const tally = (rows, pick, limit = 8) =>
  * One call with every number the customizable dashboard can show; the page picks what its widgets need.
  */
 export const getDashboard = catchAsync(async (req, res) => {
-  const days = PERIODS.includes(Number(req.query.days)) ? Number(req.query.days) : 30;
-  const since = daysAgoISO(days);
-  const prevSince = daysAgoISO(days * 2);
+  const { days, since, until, custom, from, to } = parseRange(req.query);
+  const prevSince = new Date(new Date(since).getTime() - days * DAY).toISOString();
   const sixMonths = startOfMonthISO(5);
   const scoped = (q, col) => inActivePartner(req.access, q, col);
 
   const [orderRows, openRows, paidInvoices, issuedInvoices, delayedCards, transfers, recent, profiles, partners] = await Promise.all([
-    scoped(supabaseAdmin.from('orders').select('id, reference, brand, customer_id, customer_name, destination_country, status, has_issue, created_at, shipped_at, delivered_at, partner_id').gte('created_at', prevSince).neq('status', 'draft')),
+    scoped(supabaseAdmin.from('orders').select('id, reference, brand, customer_id, customer_name, destination_country, status, has_issue, created_at, shipped_at, delivered_at, partner_id').gte('created_at', prevSince).lte('created_at', until).neq('status', 'draft')),
     scoped(supabaseAdmin.from('orders').select('status, has_issue, partner_id').not('status', 'in', '(cancelled,draft,delivered)')),
-    scoped(supabaseAdmin.from('invoices').select('total_pkr, partner_total_pkr, discount_pkr, paid_at, order:orders!invoices_order_id_fkey!inner(partner_id), lines:invoice_lines(kind, customer_amount, partner_amount)').eq('status', 'paid').gte('paid_at', prevSince), 'order.partner_id'),
+    scoped(supabaseAdmin.from('invoices').select('total_pkr, partner_total_pkr, discount_pkr, paid_at, order:orders!invoices_order_id_fkey!inner(partner_id), lines:invoice_lines(kind, customer_amount, partner_amount)').eq('status', 'paid').gte('paid_at', prevSince).lte('paid_at', until), 'order.partner_id'),
     scoped(supabaseAdmin.from('invoices').select('total_pkr, order:orders!invoices_order_id_fkey!inner(partner_id)').eq('status', 'issued'), 'order.partner_id'),
     scoped(supabaseAdmin.from('job_cards').select('order_id').lt('due_date', todayISO()).neq('stage', 'packed')),
     scoped(supabaseAdmin.from('transfers').select('id, code, orders:orders!orders_transfer_id_fkey(id)').eq('status', 'in_transit')),
     scoped(supabaseAdmin.from('orders').select('id, reference, brand, customer_name, status, created_at, destination_country').neq('status', 'draft').order('created_at', { ascending: false }).limit(8)),
-    supabaseAdmin.from('profiles').select('created_at').eq('role', 'customer').gte('created_at', sixMonths),
+    supabaseAdmin.from('profiles').select('created_at').eq('role', 'customer').gte('created_at', since < sixMonths ? since : sixMonths),
     supabaseAdmin.from('partners').select('id, name').eq('status', 'active'),
   ]);
 
-  const inPeriod = unwrap(orderRows).filter((o) => o.created_at >= since);
+  const inPeriod = unwrap(orderRows).filter((o) => o.created_at >= since && o.created_at <= until);
   const previous = unwrap(orderRows).filter((o) => o.created_at < since);
   const live = inPeriod.filter((o) => o.status !== 'cancelled');
   const open = unwrap(openRows);
   const countIn = (group) => open.filter((o) => group.includes(o.status)).length;
   const paid = unwrap(paidInvoices);
-  const paidNow = paid.filter((i) => i.paid_at >= since);
+  const paidNow = paid.filter((i) => i.paid_at >= since && i.paid_at <= until);
   const paidPrev = paid.filter((i) => i.paid_at < since);
   const awaiting = unwrap(issuedInvoices);
   const delayedOrderIds = [...new Set(unwrap(delayedCards).map((c) => c.order_id))];
@@ -72,12 +90,12 @@ export const getDashboard = catchAsync(async (req, res) => {
   const pct = (now, before) => (before ? Math.round(((now - before) / before) * 100) : null);
 
   // Trends over the chosen period
-  const ordersTrend = makeBuckets(days);
+  const ordersTrend = makeBuckets(since, days);
   for (const o of live) {
     const i = ordersTrend.indexOf(o.created_at);
     if (i >= 0) ordersTrend.buckets[i].value += 1;
   }
-  const revenueTrend = makeBuckets(days);
+  const revenueTrend = makeBuckets(since, days);
   for (const inv of paidNow) {
     const i = revenueTrend.indexOf(inv.paid_at);
     if (i >= 0) revenueTrend.buckets[i].value += Number(inv.total_pkr || 0);
@@ -130,6 +148,9 @@ export const getDashboard = catchAsync(async (req, res) => {
 
   return ApiResponse.success(res, {
     days,
+    custom,
+    from,
+    to,
     kpis: {
       orders: live.length,
       ordersChangePct: pct(live.length, previous.filter((o) => o.status !== 'cancelled').length),
@@ -140,7 +161,7 @@ export const getDashboard = catchAsync(async (req, res) => {
       marginPct: revenue ? Math.round(((revenue - payout) / revenue) * 100) : 0,
       avgOrderValue: paidNow.length ? round2(revenue / paidNow.length) : 0,
       paidInvoices: paidNow.length,
-      newCustomers: customersSince.filter((c) => c.created_at >= since).length,
+      newCustomers: customersSince.filter((c) => c.created_at >= since && c.created_at <= until).length,
       activeCustomers: uniqueCustomers,
       delivered: live.filter((o) => o.status === 'delivered').length,
       cancelled: inPeriod.filter((o) => o.status === 'cancelled').length,

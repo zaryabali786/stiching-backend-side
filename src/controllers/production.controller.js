@@ -1,9 +1,13 @@
+import { orderWeightInfo, syncOrderWeight } from '../services/weight.service.js';
 import { supabaseAdmin } from '../config/supabase.js';
-import { catchAsync, ApiResponse, BadRequestError } from '../utils/error.helper.js';
+import { catchAsync, ApiResponse, BadRequestError, ForbiddenError, ConflictError } from '../utils/error.helper.js';
 import { parseListQuery, sanitizeSearch, ilikeAny, sendPage } from '../utils/pagination.js';
 import { unwrap, unwrapOne, todayISO } from '../utils/db.js';
-import { syncOrderFromCards, setOrderStatus, getOrderOr404, addEvent, articleDisplayStatus } from '../services/order.service.js';
-import { scoped, scopeOf, assertMemberOfPartner } from '../services/access.service.js';
+import { syncOrderFromCards, setOrderStatus, getOrderOr404, addEvent, articleDisplayStatus, STATUS_LABELS } from '../services/order.service.js';
+import { scoped, scopeOf, assertMemberOfPartner, can } from '../services/access.service.js';
+import { STAGES, STAGE_LABELS, PREVIOUS_STAGE, NEXT_STAGE, SCAN_ROLES, resolveScanRole, permissionForStage, checkReceive, progressFor, articleState, ARTICLE_STATE_LABELS } from '../services/unit-flow.service.js';
+import { emitUnitUpdate } from '../services/unit-review.service.js';
+import { buildMasterTracking } from '../services/master-tracking.service.js';
 import { suggestAssignees } from '../services/team.service.js';
 import { uploadDataUrls } from '../services/storage.service.js';
 import { notifyUser } from '../services/notification.service.js';
@@ -11,8 +15,7 @@ import { withSizeSnapshot } from '../utils/measurements.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
 import { logUnitEvent } from '../services/order.service.js';
 
-export const STAGES = ['to_assign', 'cutting', 'stitching', 'qc', 'packed'];
-const STAGE_LABELS = { to_assign: 'To assign', cutting: 'Cutting', stitching: 'Stitching', qc: 'Quality check', packed: 'Packed' };
+export { STAGES };
 const GAP = 1024;
 
 const CARD_SELECT = `
@@ -20,7 +23,7 @@ const CARD_SELECT = `
   master:team_members!job_cards_master_id_fkey(id, name),
   tailor:team_members!job_cards_tailor_id_fkey(id, name),
   unit:order_units!job_cards_unit_id_fkey(id, line_no, unit_title, stitching_type, notes, product_link, quantity, design, reference_images, received_at, notes_audio, issue_audio, size_snapshot, size_chart:size_charts(id, name, person_name, variation, nearest_size, measurements, fit_feedback, notes, notes_audio)),
-  order:orders!job_cards_order_id_fkey(id, reference, brand, customer_id, customer_name, customer_code, destination_country, destination_city, status, priority, due_date, received_at, paid_at, change_request, change_request_audio, customer_notes, approval_photos, created_at),
+  order:orders!job_cards_order_id_fkey(id, reference, import_source, brand, customer_id, customer_name, customer_code, destination_country, destination_city, destination_address, destination_phone, status, priority, due_date, received_at, paid_at, change_request, change_request_audio, customer_notes, approval_photos, created_at),
   comments:job_card_comments(count)
 `;
 
@@ -63,15 +66,23 @@ const applyFilters = (query, src) => {
   return query;
 };
 
+/**
+ * An order whose articles are all packed goes to the Warehouse (Waiting for invoice and on). Its tickets leave the board's Packed column then:
+ * Packed only shows articles of orders that are still being finished.
+ */
+const WAREHOUSE_ORDER_STATUSES = ['packed', 'invoice_issued', 'awaiting_payment', 'paid', 'at_admin_warehouse', 'partner_dispatch', 'shipped', 'delivered'];
+
 const fetchColumn = async (stage, src, limit) => {
+  const inWarehouseHidden = stage === 'packed';
   let query = supabaseAdmin
     .from('job_cards')
-    .select(CARD_SELECT, { count: 'exact' })
+    .select(inWarehouseHidden ? CARD_SELECT.replace('order:orders!job_cards_order_id_fkey(', 'order:orders!job_cards_order_id_fkey!inner(') : CARD_SELECT, { count: 'exact' })
     .eq('stage', stage)
     .order('position', { ascending: true })
     .order('id', { ascending: true })
     .limit(limit);
   query = applyFilters(query, src);
+  if (inWarehouseHidden) query = query.not('order.status', 'in', `(${WAREHOUSE_ORDER_STATUSES.join(',')})`);
 
   const cursor = decodeCursor(src.cursor);
   if (cursor) query = query.or(`position.gt.${cursor.position},and(position.eq.${cursor.position},id.gt.${cursor.id})`);
@@ -219,6 +230,7 @@ const stagePatch = async (card, stage) => {
     }
   }
   if (stage === 'qc') Object.assign(patch, { qc_at: now, qc_passed: false, approval_status: 'none' });
+  if (stage === 'pressing') Object.assign(patch, { pressing_at: now, qc_passed: true });
   if (stage === 'packed') Object.assign(patch, { packed_at: now, qc_passed: true });
   return { patch, notes };
 };
@@ -353,7 +365,13 @@ export const getSuggestions = catchAsync(async (req, res) =>
  */
 export const scanCards = catchAsync(async (req, res) => {
   const code = sanitizeSearch(req.query.code);
-  if (!code) throw new BadRequestError('Enter an order reference or customer code.');
+  if (!code) throw new BadRequestError('Enter an article code, order reference or customer code.');
+  // an article's own QR code (SA-1001-1) finds that article's card
+  const article = (await supabaseAdmin.from('order_units').select('id').ilike('code', code).limit(1).maybeSingle()).data;
+  if (article) {
+    const one = unwrap(await scoped(req.access, supabaseAdmin.from('job_cards').select(CARD_SELECT).eq('unit_id', article.id).limit(1))).map(shapeCard);
+    return ApiResponse.success(res, one, one.length ? 'Job card found.' : 'That article has no job card yet (it is not released to production).');
+  }
   const rows = unwrap(
     await scoped(
       req.access,
@@ -366,6 +384,258 @@ export const scanCards = catchAsync(async (req, res) => {
     )
   ).map(shapeCard);
   return ApiResponse.success(res, rows, rows.length ? `${rows.length} card(s) found.` : 'No job cards found for that code.');
+});
+
+
+// ─────────────────────────────── Receiving an article by scanning its QR code ───────────────────────────────
+
+/** The person's team-member row (master / tailor on the board), when they have one. */
+const teamMemberOf = async (userId, partnerId) => {
+  if (!userId) return null;
+  let q = supabaseAdmin.from('team_members').select('id, name, role, partner_id, master_id').eq('user_id', userId).eq('is_active', true);
+  if (partnerId) q = q.eq('partner_id', partnerId);
+  const { data } = await q.limit(1).maybeSingle();
+  return data || null;
+};
+
+/**
+ * The stage this person receives for, from their own records: staff type, their team record on the board, or their
+ * permissions. Nobody chooses it. An owner or admin has no fixed stage: each scan goes into the stage after the article's.
+ */
+const scanRoleFor = async (req) => {
+  const supervisor = req.access.isAdmin || req.profile.partner_role === 'owner';
+  const member = await teamMemberOf(req.userId, req.access.partnerId || null);
+  const qualityOnly = can(req.access, 'quality.update') && !can(req.access, 'production.update') && !req.access.isAdmin;
+  const r = resolveScanRole({ staffType: req.profile.staff_type, memberRole: member?.role, qualityOnly, isSupervisor: supervisor });
+  if (!r.ok) throw new ForbiddenError(r.message);
+  if (r.permission && !can(req.access, r.permission)) throw new ForbiddenError('You do not have permission to receive articles for your stage.');
+  return { ...r, member };
+};
+
+/** Progress of one or more orders at one stage, for the receiving screen. */
+const receivingProgress = async ({ orderIds, stage, userId, member, role }) => {
+  if (!orderIds.length) return [];
+  const [orders, units, cards, receipts] = await Promise.all([
+    supabaseAdmin.from('orders').select('id, reference, customer_name, customer_code, brand').in('id', orderIds),
+    supabaseAdmin.from('order_units').select('id, order_id, code, line_no, unit_title, status, review_status').in('order_id', orderIds).order('line_no'),
+    supabaseAdmin.from('job_cards').select('id, unit_id, order_id, stage, qc_passed, approval_status, master_id, tailor_id').in('order_id', orderIds),
+    supabaseAdmin.from('unit_stage_receipts').select('unit_id, order_id, stage, role, user_id, user_name, received_at').in('order_id', orderIds).eq('stage', stage).order('received_at'),
+  ].map((p) => p.then((r) => unwrap(r))));
+  return orders.map((o) => progressFor({
+    order: o, stage, userId, member, role,
+    units: units.filter((u) => u.order_id === o.id), cards: cards.filter((c) => c.order_id === o.id), receipts: receipts.filter((r) => r.order_id === o.id),
+  }));
+};
+
+/**
+ * POST /api/partner/production/scan-receive  body: { code }
+ * `code` is what the article's QR code holds (its permanent code, e.g. SA-1061-1). The article is received for the stage of
+ * the person who scanned (their own records decide it): a master into Cutting, a tailor into Stitching, QA into Quality
+ * check, pressing into Pressing, packing into Packed. Every scan receives ONE article. The move is checked (role,
+ * permission, assignment, previous stage) and applied in one conditional update, so a second scan or two people scanning
+ * at once cannot receive it twice. Each receipt is saved with who and when, the confirmed result is broadcast with
+ * Socket.IO, and the reply carries the order's updated progress (received / remaining).
+ */
+export const scanReceive = catchAsync(async (req, res) => {
+  const code = String(req.body?.code || '').trim().slice(0, 80);
+  if (!code) throw new BadRequestError('Scan an article QR code or type its code.');
+  const role = await scanRoleFor(req);
+
+  const unit = (await supabaseAdmin.from('order_units').select('id, code, unit_title, order_id, status, review_status, line_no').ilike('code', code.replace(/[%_]/g, '\\$&')).limit(1).maybeSingle()).data;
+  if (!unit) {
+    // an order QR: show that order's progress instead of receiving blindly
+    const order = (await supabaseAdmin.from('orders').select('id, reference').ilike('reference', code.replace(/[%_]/g, '\\$&')).limit(1).maybeSingle()).data;
+    if (!order) throw new BadRequestError('No article or order has that code.');
+    const stage = role.stage || 'cutting';
+    const [progress] = await receivingProgress({ orderIds: [order.id], stage, userId: req.userId, member: role.member, role: role.role });
+    return ApiResponse.success(res, { kind: 'order', order: { id: order.id, reference: order.reference }, stage, progress }, progress?.awaiting ? `${progress.awaiting} article(s) of ${order.reference} can be received. Scan each article's QR code.` : `No article of ${order.reference} is waiting for ${STAGE_LABELS[stage]}.`);
+  }
+
+  const card = (await supabaseAdmin.from('job_cards').select('*').eq('unit_id', unit.id).maybeSingle()).data;
+  if (!card) {
+    const why = unit.status !== 'received' ? 'has not been received yet' : unit.review_status === 'pending' ? 'is waiting for the customer to approve it' : unit.review_status === 'rejected' ? 'was rejected by the customer' : 'is not in production yet';
+    throw new BadRequestError(`${unit.code || unit.unit_title} ${why}.`);
+  }
+  if (!req.access.isAdmin && card.partner_id !== req.access.partnerId) throw new ForbiddenError('This article belongs to another partner.');
+
+  // an owner / admin receives the article into the stage that follows the one it is in
+  const stage = role.stage || NEXT_STAGE[card.stage];
+  if (!stage) throw new ConflictError(`${unit.code || unit.unit_title} is already packed.`);
+  if (role.supervisor) {
+    const need = permissionForStage(stage);
+    if (need && !can(req.access, need)) throw new ForbiddenError('You do not have permission to receive articles for that stage.');
+  }
+
+  const member = role.supervisor ? null : role.member || (await teamMemberOf(req.userId, card.partner_id));
+  const verdict = checkReceive({ role: role.role, stage, card, member, title: unit.code || unit.unit_title });
+  if (!verdict.ok) {
+    if (verdict.code === 'duplicate' || verdict.code === 'invalid_transition') throw new ConflictError(verdict.message);
+    if (verdict.code === 'forbidden') throw new ForbiddenError(verdict.message);
+    throw new BadRequestError(verdict.message);
+  }
+
+  const order = await getOrderOr404(card.order_id);
+  if (['paid', 'at_admin_warehouse', 'partner_dispatch', 'shipped', 'delivered', 'cancelled'].includes(order.status) && stage !== 'packed') {
+    throw new BadRequestError(`Order ${order.reference} is already ${order.status.replace(/_/g, ' ')}.`);
+  }
+
+  const entering = await stagePatch(card, stage);
+  const position = await computePosition(stage, null, null, card.id, card.partner_id);
+  const patch = { ...entering.patch, ...verdict.assign, position, updated_at: new Date().toISOString() };
+  // the stage is part of the condition: only the first scan wins
+  const { data: moved, error } = await supabaseAdmin.from('job_cards').update(patch).eq('id', card.id).eq('stage', card.stage).select('id');
+  if (error) throw error;
+  if (!moved?.length) throw new ConflictError(`${unit.code || unit.unit_title} was just received by someone else.`);
+
+  const userName = req.profile.full_name || req.profile.email;
+  const receipt = unwrap(await supabaseAdmin.from('unit_stage_receipts').insert({
+    order_id: card.order_id, unit_id: unit.id, card_id: card.id, partner_id: card.partner_id, stage, role: role.role,
+    user_id: req.userId, user_name: userName, team_member_id: member?.id ?? null, received_at: new Date().toISOString(),
+  }).select('*').single());
+  await logActivity(card.id, req, `Received for ${STAGE_LABELS[stage]} by ${userName} (scan)`);
+  await logUnitEvent(unit.id, card.order_id, stage, { actorId: req.userId });
+  const updatedOrder = await syncOrderFromCards(card.order_id, req.userId);
+
+  emitUnitUpdate(
+    { ...order, status: updatedOrder.status, partner_id: card.partner_id },
+    unit,
+    { state: 'in_production', stage, stageLabel: STAGE_LABELS[stage], receivedBy: userName, role: role.role, receivedAt: receipt.received_at, cardId: card.id },
+  );
+  const [progress] = await receivingProgress({ orderIds: [card.order_id], stage, userId: req.userId, member, role: role.role });
+  return ApiResponse.success(
+    res,
+    { kind: 'article', card: await getCard(card.id), receipt, orderStatus: updatedOrder.status, stage, progress },
+    `${unit.code || unit.unit_title} received for ${STAGE_LABELS[stage]}.${progress ? ` ${progress.received} of ${progress.total} received.` : ''}`,
+  );
+});
+
+/**
+ * GET /api/partner/production/receiving
+ * The receiving screen: the person's stage (found automatically) and, for every order that has articles for them, how many
+ * are received, how many remain, and who received each one. Owners / admins see one entry per order and stage.
+ */
+export const getProductionReceiving = catchAsync(async (req, res) => {
+  const role = await scanRoleFor(req);
+  const stages = role.stage ? [role.stage] : Object.keys(PREVIOUS_STAGE);
+  const entries = [];
+  for (const stage of stages) {
+    const from = PREVIOUS_STAGE[stage];
+    const rows = unwrap(await scoped(req.access, supabaseAdmin.from('job_cards').select('order_id, stage').eq('stage', from).limit(300)));
+    const orderIds = [...new Set(rows.map((r) => r.order_id))].slice(0, 30);
+    // orders where the person already received some articles at this stage and has more to scan belong on the screen too
+    const recent = unwrap(await scoped(req.access, supabaseAdmin.from('unit_stage_receipts').select('order_id').eq('stage', stage).order('received_at', { ascending: false }).limit(60), 'partner_id'));
+    const ids = [...new Set([...orderIds, ...recent.map((r) => r.order_id)])].slice(0, 40);
+    const progress = await receivingProgress({ orderIds: ids, stage, userId: req.userId, member: role.member, role: role.role });
+    for (const p of progress) if (p.awaiting > 0 || (p.received > 0 && p.remaining > 0)) entries.push(p);
+  }
+  entries.sort((a, b) => (b.awaiting > 0) - (a.awaiting > 0) || a.reference.localeCompare(b.reference));
+  return ApiResponse.success(res, { role: role.role, supervisor: role.supervisor, stage: role.stage, stageLabel: role.stage ? STAGE_LABELS[role.stage] : null, orders: entries });
+});
+
+/**
+ * GET /api/partner/production/orders?search&page
+ * Each order as a parent with ALL its articles under it: where each one is, and who received it at which stage.
+ */
+export const getProductionOrders = catchAsync(async (req, res) => {
+  const q = parseListQuery(req, { defaultLimit: 10, defaultSort: 'updated_at', defaultDir: 'desc', sortable: ['updated_at', 'created_at'] });
+  let query = scoped(
+    req.access,
+    supabaseAdmin
+      .from('orders')
+      .select(`id, reference, brand, customer_name, customer_code, status, due_date, updated_at, partner_id,
+        units:order_units!order_units_order_id_fkey(id, code, line_no, unit_title, status, review_status, return_status, card:job_cards(id, stage, qc_passed, approval_status, master:team_members!job_cards_master_id_fkey(name), tailor:team_members!job_cards_tailor_id_fkey(name)))`, { count: 'exact' })
+      .not('status', 'in', '(draft,cancelled,submitted)')
+      .order(q.sort, { ascending: q.ascending })
+      .range(q.from, q.to),
+  );
+  if (q.search) query = query.or(ilikeAny(['reference', 'customer_code', 'customer_name', 'brand'], q.search));
+  const result = await query;
+  const orders = unwrap(result);
+  const ids = orders.map((o) => o.id);
+  const receipts = ids.length ? unwrap(await supabaseAdmin.from('unit_stage_receipts').select('unit_id, stage, role, user_name, received_at').in('order_id', ids).order('received_at')) : [];
+  const byUnit = new Map();
+  for (const r of receipts) byUnit.set(r.unit_id, [...(byUnit.get(r.unit_id) || []), r]);
+
+  const rows = orders.map((o) => {
+    const units = (o.units || []).sort((a, b) => a.line_no - b.line_no).map((u) => {
+      const card = Array.isArray(u.card) ? u.card[0] : u.card;
+      const state = articleState({ unit: u, card, order: o });
+      return {
+        id: u.id, code: u.code, line_no: u.line_no, title: u.unit_title, state, state_label: ARTICLE_STATE_LABELS[state],
+        stage: card?.stage ?? null, stage_label: card ? STAGE_LABELS[card.stage] : null, card_id: card?.id ?? null,
+        master: (Array.isArray(card?.master) ? card.master[0] : card?.master)?.name ?? null,
+        tailor: (Array.isArray(card?.tailor) ? card.tailor[0] : card?.tailor)?.name ?? null,
+        receipts: byUnit.get(u.id) || [],
+      };
+    });
+    const count = (state) => units.filter((u) => u.state === state).length;
+    return {
+      id: o.id, reference: o.reference, brand: o.brand, customer_name: o.customer_name, customer_code: o.customer_code,
+      status: o.status, status_label: STATUS_LABELS[o.status], due_date: o.due_date, updated_at: o.updated_at, units,
+      progress: { total: units.length, in_production: count('in_production'), completed: count('completed'), waiting: units.filter((u) => ['pending_approval', 'rejected', 'return_requested', 'returned', 'pending_receipt'].includes(u.state)).length },
+    };
+  });
+  return sendPage(res, rows, q, result.count);
+});
+
+// ─────────────────────────────── Master-wise tracking ───────────────────────────────
+
+/**
+ * GET /api/partner/production/master-tracking?master_id=
+ * One master and the tailors who work under them: every order with an article assigned to the team, how many of its
+ * articles were picked up (received) and which ones still wait to be picked up, plus each member's received / pending /
+ * completed numbers.
+ *   - a master sees their own team
+ *   - a tailor sees only what is assigned to them (never another master's data)
+ *   - the partner's owner / managers (and admins) choose any master of their partner
+ */
+export const getMasterTracking = catchAsync(async (req, res) => {
+  const viewer = await teamMemberOf(req.userId, req.access.partnerId || null);
+  const manager = req.access.isAdmin || req.profile.partner_role === 'owner' || (!viewer && can(req.access, 'teams.view'));
+  const memberColumns = 'id, name, role, master_id, daily_capacity, partner_id, is_active';
+  let master = null;
+  let onlyMemberId = null;
+  let masters = [];
+
+  if (manager) {
+    const scope = scopeOf(req.access);
+    let mq = supabaseAdmin.from('team_members').select(memberColumns).eq('role', 'master').eq('is_active', true).order('name');
+    if (scope !== undefined) mq = mq.eq('partner_id', scope);
+    masters = unwrap(await mq);
+    const wanted = String(req.query.master_id || '');
+    if (wanted && !masters.some((m) => m.id === wanted)) throw new ForbiddenError('That master is not in your partner.');
+    master = masters.find((m) => m.id === wanted) ?? masters[0] ?? null;
+  } else if (viewer?.role === 'master') {
+    master = unwrapOne(await supabaseAdmin.from('team_members').select(memberColumns).eq('id', viewer.id).maybeSingle(), 'Master not found');
+  } else if (viewer?.role === 'tailor' && viewer.master_id) {
+    master = unwrapOne(await supabaseAdmin.from('team_members').select(memberColumns).eq('id', viewer.master_id).maybeSingle(), 'Master not found');
+    onlyMemberId = viewer.id; // a tailor sees only their own work
+  } else {
+    throw new ForbiddenError("Only a master, a tailor on a master's team, or a manager can open master tracking.");
+  }
+  const viewerRole = manager ? 'manager' : viewer.role;
+  if (!master) {
+    return ApiResponse.success(res, { master: null, members: [], orders: [], totals: { orders: 0, articles: 0, received: 0, remaining: 0, completed: 0 }, masters, viewer: viewerRole });
+  }
+
+  const tailors = unwrap(await supabaseAdmin.from('team_members').select(memberColumns).eq('role', 'tailor').eq('master_id', master.id).eq('is_active', true).order('name'));
+  const tailorIds = tailors.map((t) => t.id);
+  // every ticket assigned to the master or to one of their tailors, then the whole of each of those orders
+  let mine = supabaseAdmin.from('job_cards').select('order_id, master_id, tailor_id').eq('partner_id', master.partner_id).limit(500);
+  mine = tailorIds.length ? mine.or(`master_id.eq.${master.id},tailor_id.in.(${tailorIds.join(',')})`) : mine.eq('master_id', master.id);
+  const orderIds = [...new Set(unwrap(await mine).filter((c) => c.master_id === master.id || tailorIds.includes(c.tailor_id)).map((c) => c.order_id))].slice(0, 60);
+  let result = { master, tailors, cards: [], units: [], orders: [], receipts: [] };
+  if (orderIds.length) {
+    const [orders, cards, units, receipts] = await Promise.all([
+      supabaseAdmin.from('orders').select('id, reference, customer_name, brand, due_date, status').in('id', orderIds).not('status', 'in', '(cancelled,delivered,draft)'),
+      supabaseAdmin.from('job_cards').select('id, order_id, unit_id, stage, master_id, tailor_id, unit_title').in('order_id', orderIds),
+      supabaseAdmin.from('order_units').select('id, order_id, code, line_no, unit_title').in('order_id', orderIds),
+      supabaseAdmin.from('unit_stage_receipts').select('unit_id, stage, role, user_id, user_name, received_at').in('order_id', orderIds).in('stage', ['cutting', 'stitching']).order('received_at'),
+    ].map((p) => p.then((r) => unwrap(r))));
+    result = { master, tailors, cards, units, orders, receipts };
+  }
+  const tracking = buildMasterTracking({ ...result, onlyMemberId });
+  return ApiResponse.success(res, { ...tracking, masters: manager ? masters.map((m) => ({ id: m.id, name: m.name })) : [], viewer: viewerRole });
 });
 
 // ─────────────────────────────── Quality check ───────────────────────────────
@@ -506,10 +776,15 @@ export const packOrder = catchAsync(async (req, res) => {
   const cards = unwrap(await supabaseAdmin.from('job_cards').select('id, unit_id, stage, qc_passed, approval_status, unit_title').eq('order_id', order.id));
   const waiting = cards.filter((c) => c.approval_status === 'pending');
   if (waiting.length) throw new BadRequestError(`Waiting for the customer to approve: ${waiting.map((c) => c.unit_title).join(', ')}.`);
-  if (!cards.length || !cards.every((c) => c.stage === 'packed' || (c.stage === 'qc' && c.qc_passed))) {
+  if (!cards.length || !cards.every((c) => c.stage === 'packed' || c.stage === 'pressing' || (c.stage === 'qc' && c.qc_passed))) {
     throw new BadRequestError('Every article must pass QC before packing.');
   }
-  const weight = Number(req.body?.weight_kg);
+  // the parcel weighs what its articles weigh (Receiving); only an older order with no article weights is weighed here
+  const known = await orderWeightInfo(order);
+  if (known.missing.length && known.source !== 'order') {
+    throw new BadRequestError(`Add the weight in Receiving first for: ${known.missing.map((m) => m.title).join(', ')}.`);
+  }
+  const weight = known.total_kg ?? Number(req.body?.weight_kg);
   if (!(weight > 0 && weight < 50)) throw new BadRequestError('Enter the parcel weight in kg.');
 
   let position = await computePosition('packed', null, null, null, order.partner_id);
@@ -522,7 +797,7 @@ export const packOrder = catchAsync(async (req, res) => {
     await logUnitEvent(c.unit_id, order.id, 'packed', { actorId: req.userId });
   }
   unwrap(await supabaseAdmin.from('orders').update({ weight_kg: weight }).eq('id', order.id));
-  await addEvent(order.id, order.status, `Parcel weighed: ${weight} kg`, req.userId);
+  await addEvent(order.id, order.status, `Parcel weighed: ${weight} kg${known.source === 'articles' ? ' (total of the articles)' : ''}`, req.userId);
   const updated = await syncOrderFromCards(order.id, req.userId);
   return ApiResponse.success(res, { orderStatus: updated.status }, `Order ${order.reference} packed.`);
 });

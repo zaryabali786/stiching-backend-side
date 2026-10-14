@@ -144,8 +144,8 @@ Search and paging happen on the server; never load a whole catalogue in the brow
 ```json
 {
   "brand_id": "uuid",                 // required, active brand
-  "courier_id": "uuid",               // required, active courier
-  "tracking_number": "TCS123",        // required when the courier has requires_tracking (default true)
+  "courier_id": "uuid|null",          // optional, active courier. Can be added later (customer PATCH, admin PATCH, or a follow-up email)
+  "tracking_number": "TCS123",        // optional
   "international_shipping": true,     // required boolean. true => shipping_service 'express', false => 'standard' (the server decides; any client value is ignored)
   "brand_order_number": "SP-1",       // optional
   "note": "text",                     // optional; stored as customer_notes AND as the first chat message
@@ -162,8 +162,18 @@ Search and paging happen on the server; never load a whole catalogue in the brow
 }
 ```
 There is no rush option any more: `priority` is always `normal` (due date +12 days). Prices are not accepted from customers.
-Errors are `400` with a readable `message` (missing/inactive brand or courier, missing tracking, international shipping not chosen,
+There is no `partner_id`: customers never choose a partner. Every order is created at the central location (`partner_id` NULL) and the admin assigns
+a partner afterwards with `POST /admin/orders/:id/partner`; until then customers see the shared (standard) article set, and the central ship-to address.
+Errors are `400` with a readable `message` (missing/inactive brand, inactive courier, international shipping not chosen,
 two articles of one type on a piece, an article that was switched off, ...).
+
+**Follow-up emails.** An email that reaches a customer's shopping address is read (order number, brand, courier, tracking). If the order number matches
+exactly one of that customer's orders (punctuation/case ignored, same brand), the courier and tracking are saved on that order (`courier_id` when the name is in
+the courier list, else `courier_name`), `inbox_emails` gets `order_id` + `match_status='matched'`, and no second order is made. Repeats are no-ops and an email older than
+the last update (`orders.shipping_updated_at`) never overwrites newer details. A missing, unknown, ambiguous or other-brand order number sets `match_status='review'` (+ `match_note`)
+and changes nothing. `GET /client/inbox` rows and `GET /client/inbox/:id` carry `match: { status, note, order_id, order_reference } | null`.
+An order made from an email has one `order_units` row (quantity 1) **per unit** of each product, `import_source = 'email'` and no product link field in the UI.
+`PATCH /admin/orders/:id` also accepts `courier_id` (or null) and `tracking_number`.
 
 `OrderDetail` now also has: `brand_id`, `brand_ref: { id, name }`, `courier_id`, `courier: { id, name, requires_tracking }`, `tracking_number`,
 `international_shipping`, `shipping_service`, and per piece `units[].selected_articles: [{ article_type_id, type_name, article_id, name, image_url }]`
@@ -599,3 +609,86 @@ It is a label and a starting point for permissions; access is still `permissions
 - Sockets are checked per person on every event (`message:new`, `message:read`, `inbox:update`), so a permission taken
   away or an order moved to another partner stops delivery immediately, without reconnecting.
 - `notification:new` now carries the saved notification: `{ notification: { id, title, body, link, ... } }`.
+
+## Article workflow (migration 0021)
+
+Orders are parents; every article (`order_units`, code like `SA-1061-1`, also its QR code) has its own state.
+
+**Customer** (`/api/client`)
+- `POST /orders/:id/units/:unitId/review` `{ decision: 'approve'|'reject', note?, media? }` — decide one received article (a rejection needs `note`).
+- `POST /orders/:id/approve-parcel` — approve every article that is waiting.
+- `POST /orders/:id/units/:unitId/return` `{ note? }` — ask to send a rejected article back.
+- Each unit in an order detail has `review_status`, `return_status`, `state`, `state_label`.
+- Orders made from an email (`import_source = 'email'`): articles cannot be added, removed or renamed; an article is editable only once it is received and approved. Submitting needs every article decided and at least one approved.
+
+**Partner / admin** (`/api/partner`)
+- `POST /receiving/units/:unitId/sent-back` `{ courier?, tracking? }` — a rejected article was sent back. Receive the corrected one again (receive endpoints) and the customer reviews it again.
+- `POST /production/scan-receive` `{ code }` — receive an article by its QR code for the scanner's stage (master → cutting, tailor → stitching, qa → qc, pressing → pressing, packing → packed). Checks role, permission, assignment and the previous stage; saves a row in `unit_stage_receipts`; broadcasts `unit:update`. Errors: 409 duplicate / wrong order of stages, 403 not allowed, 400 not released yet.
+- `GET /production/receiving` — the receiving screen: the signed-in person's stage (found from their staff type, team record or permissions; never chosen) and, per order, `received` / `remaining` / `awaiting` counts with every article's state and who received it. `scan-receive` returns the same `progress` for the order after each scan. Owners / admins have no fixed stage: each scan receives the article into the stage after its current one. `GET /production/orders` — orders with all their articles, states and receipts.
+
+**Socket.IO** `unit:update { orderId, unitId, code, state, stage, receivedBy, ... }` goes to the customer, the admins and the partner's production team (`production:<partnerId>` room).
+
+## Order sources, parcel review and returns (migration 0022)
+
+`orders.order_source`: `website` (bought on a brand's site / product links / invoice), `customer` (the customer's own parcel) or `email` (made from an order email).
+
+After a parcel is fully received every article waits for the customer (`review_status = 'pending'`):
+- **customer**: approved articles go straight to production. **website / email**: the customer first finishes the articles, sizes and notes (`PATCH /client/orders/:id`, sets `details_completed_at`), then the approved articles enter production.
+- `POST /client/orders/:id/units/:unitId/review` `{ decision: 'reject', note, return_to?: 'brand'|'customer' }` rejects one article and requests its return in one step. A customer's own parcel always returns to the customer; website and email orders must choose `brand` or `customer`.
+- `POST /client/orders/:id/reject-parcel` `{ note, return_to?, media? }` rejects every waiting article with one reason and one destination.
+- Staff: `POST /partner/receiving/units/:unitId/sent-back` records the courier / tracking; the history is in the article timeline and the order events. A rejected article never gets a production ticket.
+- Order detail adds `order_source`, `details_pending`, `return_summary` (and `status_label` reads "Parcel rejected · return to …" when the whole parcel was rejected).
+
+## Master tracking
+
+`GET /api/partner/production/master-tracking?master_id=` — one master and the tailors under them: `members` (received / pending / completed each), `orders` (each with `total`, `received`, `remaining`, `remaining_text` such as "3 articles remaining to pick up", and every article with its state, who received it and when) and `totals`. A master gets their own team (the `master_id` is ignored), a tailor gets only the articles assigned to them, the partner's owner / managers (and admins) choose any master of their partner (another partner's master is refused). An article counts as picked up once it left `to_assign`; unassigned articles of a team's order count as still to pick up; articles assigned to another master are not part of the order for this team. Receiving uses `POST /production/scan-receive`; the page refreshes on `unit:update` (Socket.IO).
+
+## Return parcels: courier workflow
+
+Return Requested → CN booked (Ready for return) → loadsheet downloaded (Handed over to courier) → In transit → Delivered → Returned.
+One `return_shipments` row per returned article; its tracking events are in `return_shipment_events`. **This project has no courier API
+connection**: the partner books with the courier and enters the CN. Delivery is only recorded from a tracking event, never inferred.
+
+Partner (permission `receiving.update`):
+- `POST /api/partner/receiving/units/:unitId/return/book` `{ courier_id, cn_number }`
+- `POST /api/partner/receiving/units/:unitId/return/cancel` (only while booked)
+- `POST /api/partner/receiving/returns/loadsheet` `{ shipment_ids: [] }` → `{ id, number }` (nothing handed over yet)
+- `GET  /api/partner/receiving/returns/loadsheets/:id/download` → CSV
+- `POST /api/partner/receiving/returns/loadsheets/:id/handed-over` (after the download; idempotent)
+- `POST /api/partner/receiving/returns/:shipmentId/tracking` `{ status: 'in_transit'|'delivered', note? }` (entered by staff, source `manual`)
+- `GET  /api/partner/receiving?tab=return_requested|ready_return|handed_over|returns`
+
+Courier webhook (header `x-webhook-secret: COURIER_WEBHOOK_SECRET`; 503 until the secret is set):
+- `POST /api/webhooks/courier` `{ cn, courier?, status, event_id?, occurred_at?, note? }` — `delivered` / `in transit` events only; the same `event_id`
+  or a second delivery changes nothing.
+
+## Warehouse dispatch (direct from the partner)
+
+Paid → book the courier CN (Ready for dispatch) → loadsheet downloaded → handover confirmed (Dispatched) → In transit → Delivered,
+or a failed delivery that the courier confirms is returning to the partner (Failed delivery tab) → partner confirms it is back.
+Uses the `shipments` table (one per order), `shipment_events` and the shared `return_loadsheets` (`kind = 'dispatch'`).
+**No courier API is connected**: the partner books with the courier and types the CN (`courier-provider.service.js` is where an API
+provider would plug in; none is registered). The order is Shipped only when the handover is confirmed, Delivered only from a tracking event.
+
+- `GET  /api/partner/warehouse?tab=to_invoice|awaiting_payment|paid|ready_dispatch|dispatched|delivered|failed_delivery`
+- `POST /api/partner/warehouse/orders/:id/book` `{ courier_id, cn_number }` (needs a paid invoice) · `POST .../book/cancel`
+- `POST /api/partner/warehouse/dispatch/loadsheet` `{ shipment_ids }` · `GET /api/partner/warehouse/loadsheets/:id/download` (CSV)
+- `POST /api/partner/warehouse/dispatch/loadsheets/:id/downloaded` · `POST .../handed-over`
+- `POST /api/partner/warehouse/shipments/:shipmentId/tracking` `{ status: in_transit|delivered|failed_delivery|returning_to_partner, note?, reason? }`
+- `POST /api/partner/warehouse/shipments/:shipmentId/received-back`
+- The courier webhook `POST /api/webhooks/courier` also accepts `delivery failed` and `return to origin` for dispatched parcels, and an optional `proof`.
+
+## PostEx (courier API)
+
+Set `POSTEX_API_TOKEN` (see `.env.example`) and make sure the courier "PostEx" exists under Catalogue > Couriers (migration 0031 adds it).
+Without a token PostEx is a manual courier like the others (the CN is typed in). With a token the Warehouse books the parcel through PostEx
+(`POST /services/integration/api/order/v3/create-order`), cancels it (`PUT .../v1/cancel-order`) and reads tracking
+(`GET .../v1/track-order/{cn}`, polled every `POSTEX_POLL_MINUTES`; a "Refresh PostEx tracking" button reads it on demand).
+
+**Verification status.** Checked against PostEx's official "Merchant API Integration Guide v4.1.9" (the PDF PostEx publishes). The endpoints, the
+`token` header, the create-order fields and the create / track response shapes match it, and a read-only call to `get-merchant-address` with a real token
+returned the account's addresses. Findings from the guide: `pickupAddressCode` / `storeAddressCode` are **optional** (a wrong value is refused with
+"INVALID MERCHANT STORE ADDRESS CODE"; use the codes from `get-merchant-address`, e.g. 001), `customerPhone` must be `03xxxxxxxxx`, tracking history carries
+only a message and a code per step (0001 At Merchant's Warehouse, 0002/0006/0007 Returned, 0003 At PostEx Warehouse, 0004 Package on Route, 0005 Delivered,
+0008 Delivery Under Review, 0013 Attempt Made), there are no webhooks, and PostEx offers its own loadsheet PDF (`POST v2/generate-load-sheet`) and airway bill
+PDF (`GET v1/get-invoice`), which this system does not use (the internal loadsheet is used). A first real booking has not been confirmed end to end yet.

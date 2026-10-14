@@ -32,7 +32,8 @@ export const getTeamWithLoad = async ({ includeInactive = false, partnerId } = {
   }
 
   const withLoad = members.map((m) => {
-    const assigned = m.role === 'master' ? cuttingByMaster[m.id] || 0 : stitchingByTailor[m.id] || 0;
+    // masters carry the cutting queue, tailors the stitching queue; quality, pressing and packing people are not assigned by the board
+    const assigned = m.role === 'master' ? cuttingByMaster[m.id] || 0 : m.role === 'tailor' ? stitchingByTailor[m.id] || 0 : 0;
     const capacity = Math.max(1, m.daily_capacity || 1);
     const loadPct = Math.round((assigned / capacity) * 100);
     return {

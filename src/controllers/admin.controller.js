@@ -12,6 +12,10 @@ import { signNoteAudio } from '../services/voice-note.service.js';
 import { logUnitEvent } from '../services/order.service.js';
 import { unreadConversationCount } from '../services/chat.service.js';
 import { activePartnerOf, inActivePartner } from '../services/access.service.js';
+import { loadShipTo, saveShipTo } from '../services/ship-to.service.js';
+import { postexSettingsView, savePostexSettings, getOperationalCities, listMerchantAddresses } from '../services/postex.service.js';
+import { loadExpressStitching, saveExpressStitching } from '../services/express-stitching.service.js';
+import { resolveCourier } from '../services/courier.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
 const isPakistan = (country) => /^(pk|pakistan)$/i.test(String(country || '').trim());
@@ -133,9 +137,9 @@ export const getAdminOrders = catchAsync(async (req, res) => {
 
   const scope = (query) => {
     if (group === 'issues') return query.eq('has_issue', true).not('status', 'in', '(cancelled,delivered,draft)');
-    if (group !== 'draft' && STATUS_GROUPS[group]) return query.in('status', STATUS_GROUPS[group]);
+    if (STATUS_GROUPS[group]) return query.in('status', STATUS_GROUPS[group]);
     if (group === 'cancelled') return query.eq('status', 'cancelled');
-    return query.neq('status', 'draft');
+    return query;
   };
 
   let query = scope(
@@ -153,23 +157,27 @@ export const getAdminOrders = catchAsync(async (req, res) => {
   if (q.search) query = query.or(ilikeAny(['reference', 'customer_name', 'customer_code', 'brand', 'brand_order_number', 'tracking_number'], q.search));
 
   const groups = ['awaiting_parcel', 'production', 'invoice', 'payment', 'warehouse', 'shipped'];
-  const countOrders = () => inActivePartner(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).neq('status', 'draft'));
+  const countOrders = (withDrafts = false) => {
+    const base = inActivePartner(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }));
+    return withDrafts ? base : base.neq('status', 'draft');
+  };
   const [result, ...counts] = await Promise.all([
     query,
-    countOrders(),
+    countOrders(true),
     ...groups.map((g) => countOrders().in('status', STATUS_GROUPS[g])),
+    countOrders(true).eq('status', 'draft'),
     countOrders().eq('has_issue', true).not('status', 'in', '(cancelled,delivered)'),
     countOrders().eq('status', 'cancelled'),
   ]);
 
   const rows = unwrap(result).map((o) => ({ ...o, units_count: o.units?.[0]?.count ?? 0, units: undefined, status_label: STATUS_LABELS[o.status] }));
-  const countMap = { all: counts[0].count || 0, issues: counts[counts.length - 2].count || 0, cancelled: counts[counts.length - 1].count || 0 };
+  const countMap = { all: counts[0].count || 0, draft: counts[counts.length - 3].count || 0, issues: counts[counts.length - 2].count || 0, cancelled: counts[counts.length - 1].count || 0 };
   groups.forEach((g, i) => (countMap[g] = counts[i + 1].count || 0));
   return sendPage(res, rows, q, result.count, { counts: countMap });
 });
 
 export const getAdminOrder = catchAsync(async (req, res) => {
-  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select(ADMIN_ORDER_DETAIL).eq('id', req.params.id).neq('status', 'draft')).maybeSingle(), 'Order not found');
+  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select(ADMIN_ORDER_DETAIL).eq('id', req.params.id)).maybeSingle(), 'Order not found');
   return ApiResponse.success(res, await signNoteAudio({
     ...order,
     status_label: STATUS_LABELS[order.status],
@@ -199,7 +207,7 @@ export const getAdminOrder = catchAsync(async (req, res) => {
  * GET /api/admin/orders/by-ref/:reference
  */
 export const getAdminOrderByRef = catchAsync(async (req, res) => {
-  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select('id').ilike('reference', req.params.reference).neq('status', 'draft')).maybeSingle(), 'Order not found');
+  const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select('id').ilike('reference', req.params.reference)).maybeSingle(), 'Order not found');
   req.params.id = order.id;
   return getAdminOrder(req, res);
 });
@@ -218,9 +226,38 @@ export const updateAdminOrder = catchAsync(async (req, res) => {
     if (!['normal', 'rush'].includes(b.priority)) throw new BadRequestError('Priority must be normal or rush.');
     patch.priority = b.priority;
   }
+  if (b.express_stitching !== undefined) {
+    patch.express_stitching = b.express_stitching === true;
+    if (!patch.express_stitching) patch.express_days = null;
+    else if (b.priority === undefined) patch.priority = 'rush';
+  }
+  if (b.express_days !== undefined && b.express_stitching !== false) {
+    const days = b.express_days === null || b.express_days === '' ? null : Number(b.express_days);
+    if (days !== null && (!Number.isInteger(days) || days < 1 || days > 90)) throw new BadRequestError('Express days must be a whole number from 1 to 90.');
+    patch.express_days = days;
+    // the due date follows from the days the admin decided, unless they set a date themselves
+    if (days !== null && b.due_date === undefined) {
+      const start = new Date(order.created_at);
+      start.setUTCDate(start.getUTCDate() + days);
+      patch.due_date = start.toISOString().slice(0, 10);
+    }
+  }
   if (b.has_issue !== undefined) patch.has_issue = !!b.has_issue;
   if (b.destination_country !== undefined) patch.destination_country = b.destination_country || null;
   if (b.destination_city !== undefined) patch.destination_city = b.destination_city || null;
+  // courier and tracking are optional on a new order; the admin can add or correct them any time
+  if (b.tracking_number !== undefined || b.courier_id !== undefined) {
+    if (b.tracking_number !== undefined) {
+      const tracking = String(b.tracking_number ?? '').trim();
+      if (tracking.length > 60) throw new BadRequestError('The tracking number is too long.');
+      patch.tracking_number = tracking || null;
+    }
+    if (b.courier_id !== undefined) {
+      patch.courier_id = b.courier_id ? (await resolveCourier({ courier_id: b.courier_id })).id : null;
+      patch.courier_name = null;
+    }
+    patch.shipping_updated_at = new Date().toISOString(); // an older email must not overwrite what the admin just set
+  }
 
   if (Object.keys(patch).length) {
     unwrap(await supabaseAdmin.from('orders').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', order.id));
@@ -472,4 +509,76 @@ export const getAdminBadges = catchAsync(async (req, res) => {
     orders: issues.count || 0,
     settings: 0,
   });
+});
+
+// ─────────────────────────────── Ship-to address ───────────────────────────────
+
+/** GET /api/admin/settings/ship-to — the address customers ship parcels to */
+export const getShipTo = catchAsync(async (req, res) => {
+  const a = await loadShipTo();
+  return ApiResponse.success(res, { name: a.shipToName, address: a.shipToAddress, city: a.shipToCity, phone: a.shipToPhone });
+});
+
+/** PUT /api/admin/settings/ship-to  body: { name, address, city, phone } */
+export const setShipTo = catchAsync(async (req, res) => {
+  const b = req.body || {};
+  if (!String(b.address ?? '').trim()) throw new BadRequestError('Enter the street address.');
+  if (!String(b.city ?? '').trim()) throw new BadRequestError('Enter the city.');
+  const a = await saveShipTo(b, req.userId).catch(() => {
+    throw new BadRequestError('Could not save. Run the latest database update (0008) first.');
+  });
+  return ApiResponse.success(res, { name: a.shipToName, address: a.shipToAddress, city: a.shipToCity, phone: a.shipToPhone }, 'Address saved. Customers now see it.');
+});
+
+
+// ─────────────────────────────── Express stitching ───────────────────────────────
+
+/** GET /api/admin/settings/express-stitching -> { enabled, days } */
+export const getExpressStitching = catchAsync(async (req, res) => ApiResponse.success(res, await loadExpressStitching()));
+
+/** PUT /api/admin/settings/express-stitching  body: { enabled, days } */
+export const setExpressStitching = catchAsync(async (req, res) => {
+  const b = req.body || {};
+  const days = Number(b.days);
+  if (!Number.isInteger(days) || days < 1 || days > 90) throw new BadRequestError('Days must be a whole number from 1 to 90.');
+  const saved = await saveExpressStitching(b, req.userId);
+  return ApiResponse.success(res, saved, 'Express stitching saved. Customers now see it when they create an order.');
+});
+
+
+// ─────────────────────────────── PostEx connection ───────────────────────────────
+
+/** GET /api/admin/settings/postex — the PostEx settings (the token is never returned, only its last 4 characters). */
+export const getPostexSettings = catchAsync(async (req, res) => ApiResponse.success(res, postexSettingsView()));
+
+/** PUT /api/admin/settings/postex  body: { token?, clearToken?, baseUrl?, pickupAddressCode?, storeAddressCode?, orderType?, pollMinutes? } */
+export const setPostexSettings = catchAsync(async (req, res) => {
+  try {
+    const view = await savePostexSettings(req.body || {}, req.userId);
+    return ApiResponse.success(res, view, view.configured ? 'PostEx saved. Warehouse bookings and tracking now use it.' : 'PostEx saved. It is not connected: no token is set.');
+  } catch (e) {
+    if (e?.name === 'PostexError') throw new BadRequestError(e.message);
+    throw e;
+  }
+});
+
+/** POST /api/admin/settings/postex/test — ask PostEx for its operational cities: proves the token and the address work. */
+export const testPostexSettings = catchAsync(async (req, res) => {
+  if (!postexSettingsView().configured) throw new BadRequestError('Save the PostEx token first.');
+  try {
+    await getOperationalCities();
+  } catch (e) {
+    throw new BadRequestError(`PostEx did not accept the connection: ${e?.message || 'no answer'}.`);
+  }
+  return ApiResponse.success(res, { ok: true }, 'PostEx answered. The token works.');
+});
+
+/** GET /api/admin/settings/postex/addresses — the pickup / return addresses of the PostEx account, with the codes PostEx accepts. */
+export const getPostexAddresses = catchAsync(async (req, res) => {
+  if (!postexSettingsView().configured) throw new BadRequestError('Save the PostEx token first.');
+  try {
+    return ApiResponse.success(res, await listMerchantAddresses());
+  } catch (e) {
+    throw new BadRequestError(`PostEx did not return your addresses: ${e?.message || 'no answer'}.`);
+  }
 });

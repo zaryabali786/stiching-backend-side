@@ -3,6 +3,8 @@ import { unwrap, unwrapOne } from '../utils/db.js';
 import { notifyUser, notifyAdmins, notifyPartner } from './notification.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
 import { ConflictError } from '../utils/error.helper.js';
+import { REVIEW_EVENT_LABELS, STAGE_RANK as FLOW_STAGE_RANK, sourceOf } from './unit-flow.service.js';
+import { startReview } from './unit-review.service.js';
 
 export const ORDER_STATUSES = [
   'submitted', 'received', 'assigned', 'cutting', 'stitching', 'qc_passed', 'customer_approval',
@@ -48,7 +50,7 @@ export const STATUS_GROUPS = {
 // Statuses the production board is allowed to drive (never regress a paid/shipped order)
 const BOARD_DRIVEN = ['received', 'assigned', 'cutting', 'stitching', 'qc_passed', 'customer_approval', 'packed'];
 
-export const STAGE_RANK = { to_assign: 0, cutting: 1, stitching: 2, qc: 3, packed: 4 };
+export const STAGE_RANK = FLOW_STAGE_RANK; // to_assign, cutting, stitching, qc, pressing, packed
 
 /**
  * Add a timeline entry without changing status.
@@ -109,6 +111,10 @@ export const articleDisplayStatus = (orderStatus, stage) => {
   if (afterProduction) return { key: orderStatus, label: ARTICLE_AFTER_PACK[orderStatus] };
   return { key: stage, label: null };
 };
+
+/** Other parts of the system (a return order and its article) follow an order's status: they register here, once, when their module loads. */
+const statusHooks = new Set();
+export const onOrderStatusChange = (fn) => { statusHooks.add(fn); };
 
 /** Article timeline entries that follow an order milestone (every article of the order moves together). */
 const UNIT_EVENT_FOR_STATUS = { shipped: 'shipped', delivered: 'delivered' };
@@ -173,6 +179,13 @@ export const setOrderStatus = async (orderId, status, { note, actorId, extra = {
 
   // open customer screens (order page, list) refresh by themselves
   emitTo(rooms.user(order.customer_id), 'order:update', { orderId: order.id, status: order.status, status_label: STATUS_LABELS[order.status] });
+  for (const hook of statusHooks) {
+    try {
+      await hook(order, status, { actorId });
+    } catch (e) {
+      console.warn('[order status hook]', e?.message || e);
+    }
+  }
   return order;
 };
 
@@ -189,7 +202,30 @@ export const syncReceiving = async (orderId, actorId) => {
   const issues = units.filter((u) => u.status === 'issue').length;
 
   const extra = { has_issue: issues > 0 };
-  if (pending === 0 && order.status === 'submitted') {
+  // Whatever the order's source (website, customer, email), a parcel that has just been fully received is first shown to the
+  // customer: they approve or reject each article before anything goes to production.
+  if (pending === 0 && ['draft', 'submitted'].includes(order.status) && order.parcel_review === 'none') {
+    const now = new Date().toISOString();
+    const summary = `Parcel received · ${units.length - issues} of ${units.length} units OK${issues ? `, ${issues} with an issue` : ''}`;
+    if (order.status === 'submitted') {
+      await setOrderStatus(orderId, 'received', { note: `${summary} · waiting for the customer to review`, actorId, extra: { ...extra, received_at: now } });
+    } else {
+      await addEvent(orderId, 'draft', `${summary} · waiting for the customer to review`, actorId);
+    }
+    unwrap(await supabaseAdmin.from('orders').update({ ...extra, parcel_received_at: now, parcel_review: 'pending', updated_at: now }).eq('id', orderId));
+    await startReview(orderId, actorId); // each received article now waits for the customer's own decision
+    await notifyUser(order.customer_id, {
+      type: 'alert',
+      title: `Your parcel arrived: ${order.reference}`,
+      body: sourceOf(order) === 'customer'
+        ? 'Check the photos and videos of your parcel and approve or reject each article. Approved articles go to production.'
+        : 'Check the photos and videos of your parcel and approve or reject each article, then add your sizes and details.',
+      link: `/app/orders/${order.id}`,
+      orderId: order.id,
+    });
+    emitTo(rooms.user(order.customer_id), 'order:update', { orderId: order.id, status: order.status === 'submitted' ? 'received' : order.status, status_label: STATUS_LABELS[order.status === 'submitted' ? 'received' : order.status] });
+  } else if (pending === 0 && order.status === 'submitted') {
+    // a parcel that was already reviewed (older orders): nothing to approve, the order simply moves on
     await setOrderStatus(orderId, 'received', {
       note: issues > 0
         ? `Parcel received · ${units.length - issues} of ${units.length} units OK, ${issues} with an issue`
@@ -221,14 +257,20 @@ export const syncOrderFromCards = async (orderId, actorId) => {
 
   const cards = unwrap(await supabaseAdmin.from('job_cards').select('stage, qc_passed, approval_status').eq('order_id', orderId));
   if (!cards.length) return order;
+  // an article the customer still has to approve (or has rejected / sent back) has no ticket yet: the order as a whole is
+  // not production-ready, so it stays at "received" while the other articles progress on their own tickets
+  const heldBack = unwrap(await supabaseAdmin.from('order_units').select('id, review_status, return_status').eq('order_id', orderId))
+    .some((u) => u.review_status === 'pending' || u.review_status === 'rejected' || (u.return_status && u.return_status !== 'none'));
 
   const minRank = Math.min(...cards.map((c) => STAGE_RANK[c.stage]));
   let target;
   if (minRank === 0) target = 'received';
   else if (minRank === 1) target = 'cutting';
   else if (minRank === 2) target = 'stitching';
-  else if (minRank === 3) target = cards.every((c) => c.qc_passed || c.stage === 'packed') ? 'qc_passed' : 'stitching';
+  else if (minRank === 3) target = cards.every((c) => c.qc_passed || c.stage === 'packed' || c.stage === 'pressing') ? 'qc_passed' : 'stitching';
+  else if (minRank === 4) target = 'qc_passed'; // pressing: quality check is done, packing is next
   else target = 'packed';
+  if (heldBack) target = 'received';
 
   // Approval is per piece: while any piece waits for the customer, the order shows "awaiting your approval"
   if (cards.some((c) => c.approval_status === 'pending')) target = 'customer_approval';
@@ -289,6 +331,7 @@ export const UNIT_EVENT_LABELS = {
   packed: 'Packed',
   shipped: 'Shipped',
   delivered: 'Delivered',
+  ...REVIEW_EVENT_LABELS,
 };
 
 /** Record one step in an article's own timeline. Never throws: a missed entry must not break the action. */

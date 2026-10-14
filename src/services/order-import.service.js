@@ -8,13 +8,14 @@ import { isDocumentType, uploadDocumentBuffer, withSignedUrl } from './storage.s
 import { notifyUser } from './notification.service.js';
 import { attachProductImages } from './email-images.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
+import { loadCourierNames, matchEmailToOrder, readShippingFromText, resolveEmailTarget, pickCourier } from './email-order-match.service.js';
 
 /**
  * Turns an uploaded brand invoice, a list of product links, or a forwarded brand email into an
  * order_imports row whose `extracted` draft prefills the customer's order form.
  */
 
-const emptyDraft = () => ({ is_order: true, brand: null, order_number: null, order_date: null, currency: null, total: null, tracking_number: null, items: [] });
+const emptyDraft = () => ({ is_order: true, brand: null, order_number: null, order_date: null, currency: null, total: null, tracking_number: null, courier_name: null, items: [] });
 
 const updateImport = async (id, patch) =>
   unwrap(await supabaseAdmin.from('order_imports').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', id).select('*').single(), 'Could not save the import');
@@ -59,6 +60,7 @@ export const linkImportToOrder = async (userId, orderId, importId) => {
       .from('orders')
       .update({
         import_source: claimed.source,
+        order_source: claimed.source === 'email' ? 'email' : 'website',
         import_id: claimed.id,
         brand_order_total: Number.isFinite(total) && total > 0 ? total : null,
         brand_order_currency: claimed.extracted?.currency || null,
@@ -82,14 +84,18 @@ const ownDomain = () => config.inboundEmail.domain.trim().toLowerCase().replace(
 
 export const inboundEmailEnabled = () => (!!ownDomain() || !!parseInboundAddress()) && !!config.inboundEmail.secret;
 
-const newToken = () => randomBytes(8).toString('hex'); // 16 hex chars, unguessable
+const newToken = () => randomBytes(8).toString('hex'); // fallback only, for a profile without a customer code
+
+/** The address token is the customer's own code (STX-10011 -> stx-10011), so the address is readable and unique. */
+export const tokenForCode = (code) => (code ? String(code).trim().toLowerCase() : null);
 
 /** The customer-facing address for a token: <token>@<own domain>, else the provider's  <local>+<token>@<domain>. */
 export const addressForToken = (token) => {
   if (!token) return null;
-  if (ownDomain()) return `${token}@${ownDomain()}`;
+  const shown = /^stx-\d+$/i.test(token) ? token.toUpperCase() : token;
+  if (ownDomain()) return `${shown}@${ownDomain()}`;
   const parts = parseInboundAddress();
-  return parts ? `${parts.local}+${token}@${parts.domain}` : null;
+  return parts ? `${parts.local}+${shown}@${parts.domain}` : null;
 };
 
 /**
@@ -99,13 +105,10 @@ export const addressForToken = (token) => {
 export const getForwardAddress = async (userId, { reset = false } = {}) => {
   if (!inboundEmailEnabled()) return { address: null, enabled: false };
 
-  let token = null;
-  if (!reset) {
-    const row = unwrap(await supabaseAdmin.from('profiles').select('inbound_email_token').eq('id', userId).single());
-    token = row.inbound_email_token;
-  }
-  if (!token) {
-    token = newToken();
+  const row = unwrap(await supabaseAdmin.from('profiles').select('inbound_email_token, customer_code').eq('id', userId).single());
+  // The address always follows the customer code; older random tokens are migrated here (and still accepted on receive).
+  const token = tokenForCode(row.customer_code) || (!reset && row.inbound_email_token) || newToken();
+  if (token !== row.inbound_email_token) {
     unwrap(await supabaseAdmin.from('profiles').update({ inbound_email_token: token }).eq('id', userId), 'Could not create your shopping address');
   }
   return { address: addressForToken(token), enabled: true };
@@ -118,10 +121,10 @@ const tokenFromRecipients = (recipients) => {
   for (const r of recipients) {
     const email = (/<([^>]+)>/.exec(r)?.[1] || r || '').trim().toLowerCase();
     if (domain) {
-      const own = /^([a-z0-9]{8,40})@([^@\s]+)$/.exec(email);
+      const own = /^([a-z0-9-]{8,40})@([^@\s]+)$/.exec(email);
       if (own && own[2] === domain) return own[1];
     }
-    const m = /^([^@+\s]+)\+([a-z0-9]{8,40})@([^@\s]+)$/.exec(email);
+    const m = /^([^@+\s]+)\+([a-z0-9-]{8,40})@([^@\s]+)$/.exec(email);
     if (m && (!parts || (m[1] === parts.local && m[3] === parts.domain))) return m[2];
   }
   return null;
@@ -226,7 +229,7 @@ export const resolveInboundToken = (email) => {
   const fromRecipients = tokenFromRecipients(email.recipients);
   if (fromRecipients) return fromRecipients;
   const hash = String(email.mailboxHash || '').trim().toLowerCase();
-  return /^[a-z0-9]{8,40}$/.test(hash) ? hash : null;
+  return /^[a-z0-9-]{8,40}$/.test(hash) ? hash : null;
 };
 
 /** Normalise Postmark-style or generic JSON inbound payloads. */
@@ -281,19 +284,23 @@ const htmlToText = (html) =>
     .join('\n');
 
 /** Without AI: brand from the original sender, order number from subject/body. */
-const basicEmailDraft = (email, bodyText) => {
+const basicEmailDraft = (email, bodyText, courierNames = []) => {
   const draft = emptyDraft();
   const fwd = /From:\s*"?([^"<\n]*)"?\s*<([^>\s]+@[^>\s]+)>/i.exec(bodyText) || /From:\s*"?([^"<\n]*)"?\s*<([^>\s]+@[^>\s]+)>/i.exec(email.from);
   if (fwd) draft.brand = brandFromHost(`https://${fwd[2].split('@')[1]}`, fwd[1].trim() || null);
-  const orderRe = /\border\s*(?:no\.?|number|#|id)?\s*[:#]?\s*#?\s*([A-Z0-9][A-Z0-9-]{3,24})\b/i;
-  draft.order_number = orderRe.exec(email.subject)?.[1] || orderRe.exec(bodyText)?.[1] || null;
+  const orderRe = /\border\s*(?:no\.?|number|#|id)?\s*[:#]?\s*#?\s*([A-Z0-9][A-Z0-9-]{3,24})\b/gi;
+  // an order number always has a digit ("order shipped" is not one)
+  const numberIn = (text) => [...String(text || '').matchAll(orderRe)].map((m) => m[1]).find((v) => /\d/.test(v)) || null;
+  draft.order_number = numberIn(email.subject) || numberIn(bodyText);
+  Object.assign(draft, readShippingFromText(bodyText, courierNames));
   return draft;
 };
 
 /** Cheap pre-check so promotions and verification codes do not cost an AI call: only order-like mail gets a draft. */
 const looksLikeOrder = (email) =>
-  /\b(order|invoice|receipt|purchase|payment|shipment|shipped|dispatch(?:ed)?|tracking|delivery|confirmed|confirmation)\b/i.test(email.subject) ||
-  /\border\s*(?:no\.?|number|#|id)\b/i.test((email.text || email.html || '').slice(0, 6000));
+  /\b(order|invoice|receipt|purchase|payment|shipment|shipped|shipping|dispatch(?:ed)?|tracking|track|delivery|delivered|parcel|package|courier|confirmed|confirmation|on its way|out for delivery)\b/i.test(email.subject) ||
+  /\border\s*(?:no\.?|number|#|id)\b/i.test((email.text || email.html || '').slice(0, 6000)) ||
+  /\btrack(?:ing)?\s*(?:number|no\.?|id|code|#)\b/i.test((email.text || email.html || '').slice(0, 6000));
 
 const MAX_HTML = 400_000;
 const MAX_TEXT = 100_000;
@@ -308,7 +315,9 @@ export const receiveForwardedEmail = async (payload) => {
   const token = resolveInboundToken(email);
   if (!token) return { accepted: false, reason: 'no customer token in recipients' };
 
-  const { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('inbound_email_token', token).maybeSingle();
+  // token is the lower-cased customer code (or an older random token)
+  let { data: profile } = await supabaseAdmin.from('profiles').select('id').eq('inbound_email_token', token).maybeSingle();
+  if (!profile) ({ data: profile } = await supabaseAdmin.from('profiles').select('id').ilike('customer_code', token).maybeSingle());
   if (!profile) return { accepted: false, reason: 'unknown token' };
 
   const receivedAt = email.date && !Number.isNaN(Date.parse(email.date)) ? new Date(email.date).toISOString() : new Date().toISOString();
@@ -370,6 +379,11 @@ export const receiveForwardedEmail = async (payload) => {
 
 // ───────────────────────── automatic draft order ─────────────────────────
 
+/** The active default partner (Partners > Make default), or null when there is none. */
+const defaultPartnerId = async () =>
+  (await supabaseAdmin.from('partners').select('id').eq('is_default', true).eq('status', 'active').limit(1).maybeSingle()).data?.id ?? null;
+
+
 const cleanBrandName = (v) =>
   String(v || '')
     .replace(/[\u0000-\u001f]/g, ' ')
@@ -395,13 +409,30 @@ const ensureBrand = async (name, userId) => {
   return null;
 };
 
+/** An order can hold at most this many articles (the same limit the order form enforces). */
+const MAX_ARTICLES = 30;
+
+/**
+ * One article record per unit: Product A x2 + Product B x3 = 5 articles, each with quantity 1 and the product's own
+ * details and unit price. Returns how many units did not fit in an order.
+ */
+export const expandItemsToUnits = (items) => {
+  const all = [];
+  for (const it of items || []) {
+    const copies = Math.max(1, Math.min(20, Math.round(Number(it.quantity)) || 1));
+    for (let n = 0; n < copies; n++) all.push(it);
+  }
+  return { units: all.slice(0, MAX_ARTICLES), dropped: Math.max(0, all.length - MAX_ARTICLES) };
+};
+
 /**
  * Turn a read order email into a DRAFT order for the customer: brand saved in the catalogue, products, order number,
  * tracking and total filled in. Nobody but the customer sees it (no partner, no staff notification) until they add
- * the courier / sizes and submit it from the app, which sends it on like any new order.
- * @returns {Promise<object|null>} the order, or null when the draft was already used
+ * the sizes and submit it from the app, which sends it on like any new order. The order starts at the central location;
+ * the admin chooses the partner later.
+ * @returns {Promise<{ order: object, dropped: number }|null>} null when the draft was already used
  */
-export const createDraftOrder = async (userId, importId, extracted) => {
+export const createDraftOrder = async (userId, importId, extracted, { receivedAt = null } = {}) => {
   // Claiming the draft is one atomic update, so a retried delivery can never make two orders
   const { data: claimed } = await supabaseAdmin
     .from('order_imports')
@@ -421,6 +452,8 @@ export const createDraftOrder = async (userId, importId, extracted) => {
     const due = new Date();
     due.setUTCDate(due.getUTCDate() + 12);
     const total = Number(extracted.total);
+    const courier = extracted.courier_name ? pickCourier(unwrap(await supabaseAdmin.from('couriers').select('id, name').eq('status', 'active')), extracted.courier_name) : null;
+    const shippedAt = extracted.tracking_number || extracted.courier_name ? new Date(receivedAt || Date.now()).toISOString() : null;
 
     const order = unwrap(
       await supabaseAdmin
@@ -434,9 +467,14 @@ export const createDraftOrder = async (userId, importId, extracted) => {
           brand_id: brand?.id || null,
           brand_order_number: extracted.order_number || null,
           tracking_number: extracted.tracking_number || null,
+          courier_id: courier?.id ?? null,
+          courier_name: courier ? null : extracted.courier_name || null,
+          shipping_updated_at: shippedAt,
           international_shipping: international,
           shipping_service: international ? 'express' : 'standard',
+          partner_id: await defaultPartnerId(), // the default partner sees the draft in Receiving at once, so it can receive the parcel; the admin can change the partner
           import_source: 'email',
+          order_source: 'email',
           import_id: importId,
           brand_order_total: Number.isFinite(total) && total > 0 ? total : null,
           brand_order_currency: extracted.currency || null,
@@ -445,14 +483,16 @@ export const createDraftOrder = async (userId, importId, extracted) => {
           destination_country: profile.country || null,
           destination_city: profile.city || null,
           destination_address: profile.address || null,
+          destination_phone: profile.phone || null,
         })
         .select('*')
         .single(),
       'Could not create the draft order'
     );
 
-    const units = await supabaseAdmin.from('order_units').insert(
-      extracted.items.slice(0, 30).map((it, i) => ({
+    const { units, dropped } = expandItemsToUnits(extracted.items);
+    const inserted = await supabaseAdmin.from('order_units').insert(
+      units.map((it, i) => ({
         order_id: order.id,
         line_no: i + 1,
         unit_title: it.title.slice(0, 160),
@@ -460,23 +500,42 @@ export const createDraftOrder = async (userId, importId, extracted) => {
         product_image_url: it.image_url,
         brand_sku: it.sku,
         notes: it.notes,
-        quantity: it.quantity,
+        quantity: 1,
         unit_price: it.unit_price,
         currency: extracted.currency || null,
       }))
     );
-    if (units.error) {
+    if (inserted.error) {
       await supabaseAdmin.from('orders').delete().eq('id', order.id);
-      throw units.error;
+      throw inserted.error;
     }
 
     await supabaseAdmin.from('order_imports').update({ order_id: order.id, updated_at: new Date().toISOString() }).eq('id', importId);
-    return order;
+    return { order, dropped };
   } catch (err) {
     // give the draft back so the customer can still create the order by hand from the email
     await supabaseAdmin.from('order_imports').update({ status: 'ready', order_id: null }).eq('id', importId);
     throw err;
   }
+};
+
+/**
+ * A follow-up email (or a repeat of the confirmation) about an order the customer already has: save its courier / tracking
+ * on that order, or flag it for review. No second order and no second draft are made.
+ * @returns {Promise<boolean>} true when the email was dealt with
+ */
+const linkEmailToExistingOrder = async ({ importId, userId, inboxId, extracted, extractedBy, stored, receivedAt, target }) => {
+  const result = await matchEmailToOrder({ userId, inboxId, extracted, receivedAt, target });
+  if (!result.handled) return false;
+  if (result.kind === 'matched') {
+    // the draft row stays as the record of what was read, marked used so it can never be turned into another order
+    await updateImport(importId, { status: 'used', order_id: result.order.id, extracted, extracted_by: extractedBy, error: null, attachments: stored });
+  } else {
+    await supabaseAdmin.from('order_imports').delete().eq('id', importId);
+  }
+  emitTo(rooms.user(userId), 'mailbox:update', { id: inboxId });
+  if (result.kind === 'matched') emitTo(rooms.user(userId), 'order:update', { orderId: result.order.id });
+  return true;
 };
 
 const processForwardedEmail = async (importId, userId, email, inboxId) => {
@@ -495,6 +554,7 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
     }
   }
 
+  const receivedAt = email.date && !Number.isNaN(Date.parse(email.date)) ? new Date(email.date).toISOString() : new Date().toISOString();
   const bodyText = [`Subject: ${email.subject}`, `From: ${email.from}`, '', email.html ? htmlToText(email.html) : email.text].join('\n');
   let extracted;
   let extractedBy = 'basic';
@@ -505,7 +565,7 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
     try {
       extracted = await extractOrderWithAi(
         [{ type: 'text', text: bodyText }, ...readable],
-        'This is an email the customer forwarded after ordering from a clothing brand (it may contain the original message below a "Forwarded message" line, and may have an invoice attached). Extract the original brand, its order number, currency, total and every product line.'
+        'This is an email the customer forwarded after ordering from a clothing brand (it may contain the original message below a "Forwarded message" line, and may have an invoice attached). It is either an order confirmation or a later shipping / tracking update. Extract the original brand, its order number exactly as printed, currency, total, the courier name and tracking number if shown, and every product line (none for a pure shipping update).'
       );
       extractedBy = 'ai';
       if (!extracted.is_order) {
@@ -518,12 +578,25 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
       }
     } catch (err) {
       console.warn('[Import] email AI read failed:', err.message);
-      extracted = basicEmailDraft(email, bodyText);
+      extracted = basicEmailDraft(email, bodyText, await loadCourierNames().catch(() => []));
       error = "We couldn't read the products automatically — check the details and add them by hand.";
     }
   } else {
-    extracted = basicEmailDraft(email, bodyText);
+    extracted = basicEmailDraft(email, bodyText, await loadCourierNames().catch(() => []));
     error = 'We saved this email. Automatic product reading is not switched on yet — add the products by hand.';
+  }
+
+  // Is this about an order the customer already has? Then update that order instead of making another one.
+  const target = await resolveEmailTarget(userId, extracted).catch((err) => {
+    console.warn('[Import] order lookup failed:', err.message);
+    return { kind: 'none' };
+  });
+  if (target.kind !== 'none') {
+    try {
+      if (await linkEmailToExistingOrder({ importId, userId, inboxId, extracted, extractedBy, stored, receivedAt, target })) return;
+    } catch (err) {
+      console.warn('[Import] could not update the order from the email:', err.message);
+    }
   }
 
   // product pictures: from the email, or from the products' own pages; saved with the order
@@ -537,19 +610,26 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
   // Products found: the backend makes the order itself (as a draft) so the customer only has to complete and submit it
   if (n && extractedBy === 'ai') {
     try {
-      const order = await createDraftOrder(userId, importId, extracted);
-      if (order) {
+      const made = await createDraftOrder(userId, importId, extracted, { receivedAt });
+      if (made) {
+        const { order, dropped } = made;
+        const { units } = expandItemsToUnits(extracted.items);
         emitTo(rooms.user(userId), 'mailbox:update', { id: inboxId });
         await notifyUser(userId, {
           type: 'order',
           title: 'Draft order created from your email',
-          body: `${order.brand ? `${order.brand} · ` : ''}${n} product${n === 1 ? '' : 's'}${extracted.order_number ? ` · order ${extracted.order_number}` : ''}. Add your courier and sizes, then submit it.`,
+          body: `${order.brand ? `${order.brand} · ` : ''}${units.length} article${units.length === 1 ? '' : 's'}${extracted.order_number ? ` · order ${extracted.order_number}` : ''}.${dropped ? ` An order holds at most ${MAX_ARTICLES} articles, so ${dropped} more were left out — add them in a new order.` : ''} Add your sizes, then submit it.`,
           link: `/app/orders/${order.id}`,
           orderId: order.id,
         });
         return;
       }
     } catch (err) {
+      // Another email about the same order number made the draft a moment earlier: this one is its follow-up
+      if (err?.statusCode === 409) {
+        const again = await resolveEmailTarget(userId, extracted).catch(() => ({ kind: 'none' }));
+        if (again.kind !== 'none' && (await linkEmailToExistingOrder({ importId, userId, inboxId, extracted, extractedBy, stored, receivedAt, target: again }).catch(() => false))) return;
+      }
       console.warn('[Import] draft order failed, the customer can create it from the email:', err.message);
     }
   }

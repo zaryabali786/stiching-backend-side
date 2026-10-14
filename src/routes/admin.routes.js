@@ -13,6 +13,14 @@ import {
   setUserActive,
   getAdminReports,
   getAdminBadges,
+  getShipTo,
+  setShipTo,
+  getExpressStitching,
+  getPostexSettings,
+  setPostexSettings,
+  testPostexSettings,
+  getPostexAddresses,
+  setExpressStitching,
 } from '../controllers/admin.controller.js';
 import {
   getPermissionCatalogue,
@@ -60,9 +68,16 @@ import { getDashboard, getDashboardLayout, setDashboardLayout, resetDashboardLay
 import { getPortalTheme, setPortalTheme, resetPortalTheme, createPortalPreset, deletePortalPreset } from '../controllers/portal-theme.controller.js';
 import { getBanners, createBanner, updateBanner, deleteBanner } from '../controllers/banner.controller.js';
 
+import { getSupportConversations, getSupportThread, sendSupportAsAdmin, readSupportAsAdmin } from '../controllers/support.controller.js';
 import { inActivePartnerOrder } from '../middlewares/ownership.middleware.js';
 
 const router = Router();
+
+// General chat with customers (not about an order)
+router.get('/support/conversations', getSupportConversations);
+router.get('/support/:customerId/messages', getSupportThread);
+router.post('/support/:customerId/messages', sendSupportAsAdmin);
+router.post('/support/:customerId/read', readSupportAsAdmin);
 
 router.get('/overview', getAdminOverview);
 router.get('/badges', getAdminBadges);
@@ -85,6 +100,14 @@ router.patch('/users/:id/active', setUserActive);
 router.get('/permissions', getPermissionCatalogue);
 router.get('/settings/order-assignment', getOrderAssignment);
 router.put('/settings/order-assignment', setOrderAssignment);
+router.get('/settings/ship-to', getShipTo);
+router.put('/settings/ship-to', setShipTo);
+router.get('/settings/express-stitching', getExpressStitching);
+router.get('/settings/postex', getPostexSettings);
+router.put('/settings/postex', setPostexSettings);
+router.post('/settings/postex/test', testPostexSettings);
+router.get('/settings/postex/addresses', getPostexAddresses);
+router.put('/settings/express-stitching', setExpressStitching);
 router.get('/partners', listPartners);
 router.post('/partners', createPartner);
 router.get('/partners/:id', getPartner);

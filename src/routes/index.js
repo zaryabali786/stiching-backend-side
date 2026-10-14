@@ -8,6 +8,7 @@ import { authenticate, requireRole } from '../middlewares/auth.middleware.js';
 import { getPublicConfig } from '../controllers/auth.controller.js';
 import { getRedisStatus } from '../config/redis.js';
 import { inboundEmailWebhook } from '../controllers/order-import.controller.js';
+import { courierTrackingWebhook } from '../controllers/courier-webhook.controller.js';
 
 const apiRouter = Router();
 
@@ -24,6 +25,8 @@ apiRouter.get('/config', getPublicConfig);
 
 // Inbound-mail provider webhook (forwarded brand emails) — authenticated by a shared secret, not a user token
 apiRouter.post('/inbound/email', inboundEmailWebhook);
+// Courier tracking events of return parcels: authenticated by a shared secret
+apiRouter.post('/webhooks/courier', courierTrackingWebhook);
 
 apiRouter.use('/auth', authRoutes);
 apiRouter.use('/notifications', authenticate, notificationRoutes);

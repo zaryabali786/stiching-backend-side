@@ -1,6 +1,7 @@
 import { catchAsync, ApiResponse, NotFoundError } from '../utils/error.helper.js';
 import { parseListQuery, sendPage } from '../utils/pagination.js';
 import { getForwardAddress } from '../services/order-import.service.js';
+import { sendEmail, outboundEnabled } from '../services/outbound-email.service.js';
 import { deleteEmail, listInbox, markAllRead, openEmail, unreadCount } from '../services/mailbox.service.js';
 
 const isId = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v));
@@ -8,13 +9,26 @@ const isId = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 /** GET /api/client/inbox?page&limit&unread=1&search= — the customer's emails, newest first (meta.unread = unread total). */
 export const getInbox = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 20, maxLimit: 50 });
-  const { rows, total } = await listInbox(req.userId, { from: q.from, to: q.to, unreadOnly: req.query.unread === '1', search: q.search });
+  const { rows, total } = await listInbox(req.userId, { from: q.from, to: q.to, unreadOnly: req.query.unread === '1', sent: req.query.box === 'sent', search: q.search });
   return sendPage(res, rows, q, total, { unread: await unreadCount(req.userId) });
 });
 
 /** GET /api/client/inbox/address — the customer's personal shopping address (created on first use) */
 export const getMailbox = catchAsync(async (req, res) => {
-  return ApiResponse.success(res, { ...(await getForwardAddress(req.userId)), unread: await unreadCount(req.userId) });
+  return ApiResponse.success(res, { ...(await getForwardAddress(req.userId)), can_send: outboundEnabled(), unread: await unreadCount(req.userId) });
+});
+
+/** POST /api/client/inbox/send  { to?, subject?, text, replyToId?, attachments?: [{ name, dataUrl }] } — a new email or a reply */
+export const send = catchAsync(async (req, res) => {
+  const b = req.body || {};
+  const sent = await sendEmail(req.userId, {
+    to: b.to,
+    subject: b.subject,
+    text: b.text,
+    replyToId: b.replyToId || b.reply_to_id,
+    attachments: Array.isArray(b.attachments) ? b.attachments : [],
+  });
+  return ApiResponse.success(res, sent, 'Email sent.');
 });
 
 /** GET /api/client/inbox/unread-count */

@@ -3,9 +3,23 @@ import {
   getPartnerOverview,
   getReceiving,
   receiveUnit,
+  setUnitWeight,
+  receiveCorrectedArticle,
+  bookReturnCn,
+  cancelReturnBooking,
+  routeReturn,
+  createReturnLoadsheet,
+  downloadReturnLoadsheet,
+  confirmReturnHandover,
+  updateReturnTracking,
+  refreshReturnTracking,
   reportUnitIssue,
   receiveAllUnits,
+  addParcelMedia,
+  sendArticleBack,
   getUnmatchedParcels,
+  findParcelElsewhere,
+  forwardParcel,
   createUnmatchedParcel,
   updateUnmatchedParcel,
   getTeams,
@@ -16,11 +30,21 @@ import {
   getPartnerWarehouse,
   setOrderWeight,
   setDispatchRoute,
-  shipDirect,
+  bookDispatchCn,
+  cancelDispatchCn,
+  createDispatchSheet,
+  markDispatchSheetDownloaded,
+  confirmDispatchSheetHandover,
+  updateDispatchTracking,
+  confirmDispatchReturnReceived,
+  getApiCouriers,
+  printDispatchCn,
+  refreshDispatchTracking,
   getTransfers,
   dispatchTransfer,
   getEarningsSummary,
   getEarnings,
+  getPartnerOrders,
   getPartnerBadges,
 } from '../controllers/partner.controller.js';
 import {
@@ -41,13 +65,17 @@ import {
   requestCustomerApproval,
   requestCardApproval,
   packOrder,
+  scanReceive,
+  getProductionReceiving,
+  getMasterTracking,
+  getProductionOrders,
 } from '../controllers/production.controller.js';
 
 import {
   listBrands, createBrand, updateBrand, deleteBrand,
   listCouriers, createCourier, updateCourier, deleteCourier,
   listArticleTypes, createArticleType, updateArticleType, deleteArticleType,
-  listArticles, createArticle, updateArticle, deleteArticle,
+  listArticles, createArticle, updateArticle, deleteArticle, copyStandardSet,
 } from '../controllers/catalogue.controller.js';
 import {
   getMessages, postMessage, uploadVoice, readMessages, getConversations, getUnreadCount, getOrderSummary, uploadVoiceNote, getConversationScopes,
@@ -70,10 +98,25 @@ router.get('/badges', getPartnerBadges); // counts only the modules the caller m
 
 // Receiving
 router.get('/receiving', need('receiving.view'), getReceiving);
+router.post('/receiving/units/:unitId/weight', need('receiving.update'), ownsUnit('unitId'), setUnitWeight);
 router.post('/receiving/units/:unitId/receive', need('receiving.update'), ownsUnit('unitId'), receiveUnit);
+router.post('/receiving/units/:unitId/receive-corrected', need('receiving.update'), ownsUnit('unitId'), receiveCorrectedArticle);
 router.post('/receiving/units/:unitId/issue', need('receiving.update'), ownsUnit('unitId'), reportUnitIssue);
 router.post('/receiving/orders/:orderId/receive-all', need('receiving.update'), ownsOrder('orderId'), receiveAllUnits);
+router.post('/receiving/orders/:orderId/parcel-media', need('receiving.update'), ownsOrder('orderId'), addParcelMedia);
 router.get('/receiving/unmatched', need('receiving.view'), getUnmatchedParcels);
+router.get('/receiving/elsewhere', need('receiving.view'), findParcelElsewhere);
+router.post('/receiving/units/:unitId/return/book', need('receiving.update'), ownsUnit('unitId'), bookReturnCn);
+router.post('/receiving/units/:unitId/return/route', need('receiving.update'), ownsUnit('unitId'), routeReturn);
+router.post('/receiving/units/:unitId/return/cancel', need('receiving.update'), ownsUnit('unitId'), cancelReturnBooking);
+router.post('/receiving/returns/loadsheet', need('receiving.update'), createReturnLoadsheet);
+router.get('/receiving/returns/loadsheets/:id/download', need('receiving.view'), downloadReturnLoadsheet);
+router.post('/receiving/returns/loadsheets/:id/handed-over', need('receiving.update'), confirmReturnHandover);
+router.get('/receiving/couriers/api', need('receiving.view'), getApiCouriers);
+router.post('/receiving/returns/:shipmentId/refresh-tracking', need('receiving.update'), refreshReturnTracking);
+router.post('/receiving/returns/:shipmentId/tracking', need('receiving.update'), updateReturnTracking);
+router.post('/receiving/units/:unitId/sent-back', need('receiving.update'), ownsUnit('unitId'), sendArticleBack);
+router.post('/receiving/orders/:orderId/forward', need('receiving.update'), forwardParcel);
 router.post('/receiving/unmatched', need('receiving.update'), createUnmatchedParcel);
 router.patch('/receiving/unmatched/:id', need('receiving.update'), ownsParcel(), updateUnmatchedParcel);
 
@@ -89,6 +132,10 @@ router.get('/production/board', need('production.view'), getBoard);
 router.get('/production/columns/:stage', need('production.view'), getColumnPage);
 router.get('/production/suggestions', needAny('production.view', 'receiving.view'), getSuggestions);
 router.get('/production/scan', need('production.view'), scanCards);
+router.post('/production/scan-receive', needAny('production.update', 'quality.update'), scanReceive);
+router.get('/production/receiving', needAny('production.view', 'quality.view'), getProductionReceiving);
+router.get('/production/master-tracking', needAny('production.view', 'teams.view'), getMasterTracking);
+router.get('/production/orders', need('production.view'), getProductionOrders);
 router.get('/production/cards/:id', need('production.view'), ownsCard(), getCardDetail);
 router.patch('/production/cards/:id', need('production.update'), ownsCard(), updateCard);
 router.put('/production/cards/:id/move', need('production.update'), ownsCard(), moveCard);
@@ -109,12 +156,23 @@ router.post('/qc/orders/:orderId/pack', need('quality.update'), ownsOrder('order
 router.get('/warehouse', need('warehouse.view'), getPartnerWarehouse);
 router.post('/warehouse/orders/:id/weight', need('warehouse.update'), ownsOrder(), setOrderWeight);
 router.post('/warehouse/orders/:id/route', need('warehouse.update'), ownsOrder(), setDispatchRoute);
-router.post('/warehouse/orders/:id/ship', need('warehouse.update'), ownsOrder(), shipDirect);
+router.post('/warehouse/orders/:id/book', need('warehouse.update'), ownsOrder(), bookDispatchCn);
+router.post('/warehouse/orders/:id/book/cancel', need('warehouse.update'), ownsOrder(), cancelDispatchCn);
+router.post('/warehouse/dispatch/loadsheet', need('warehouse.update'), createDispatchSheet);
+router.get('/warehouse/loadsheets/:id/download', need('warehouse.view'), downloadReturnLoadsheet);
+router.post('/warehouse/dispatch/loadsheets/:id/downloaded', need('warehouse.update'), markDispatchSheetDownloaded);
+router.post('/warehouse/dispatch/loadsheets/:id/handed-over', need('warehouse.update'), confirmDispatchSheetHandover);
+router.post('/warehouse/shipments/:shipmentId/tracking', need('warehouse.update'), updateDispatchTracking);
+router.get('/warehouse/cn/print', need('warehouse.view'), printDispatchCn);
+router.get('/warehouse/couriers/api', need('warehouse.view'), getApiCouriers);
+router.post('/warehouse/shipments/:shipmentId/refresh-tracking', need('warehouse.update'), refreshDispatchTracking);
+router.post('/warehouse/shipments/:shipmentId/received-back', need('warehouse.update'), confirmDispatchReturnReceived);
 router.get('/warehouse/transfers', need('warehouse.view'), getTransfers);
 router.post('/warehouse/transfers/:id/dispatch', need('warehouse.update'), ownsTransfer(), dispatchTransfer);
 
 // Earnings
 router.get('/earnings/summary', need('earnings.view'), getEarningsSummary);
+router.get('/orders', need('overview.view'), getPartnerOrders);
 router.get('/earnings', need('earnings.view'), getEarnings);
 
 // Catalogues the customer order form is built from (partner staff and admins manage them)
@@ -133,6 +191,7 @@ router.post('/article-types', need('catalogue.update'), createArticleType);
 router.patch('/article-types/:id', need('catalogue.update'), updateArticleType);
 router.delete('/article-types/:id', need('catalogue.update'), deleteArticleType);
 
+router.post('/catalogue/standard-set', need('catalogue.update'), copyStandardSet);
 router.get('/articles', need('catalogue.view'), listArticles);
 router.post('/articles', need('catalogue.update'), createArticle);
 router.patch('/articles/:id', need('catalogue.update'), updateArticle);

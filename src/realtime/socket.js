@@ -68,6 +68,10 @@ export const initSocket = (httpServer) => {
     // chat service only to those who may read that chat right now (so a permission change needs no reconnect).
     const access = await resolveAccess(profile);
     if (access.isAdmin) socket.join(rooms.admins);
+    // a partner's production / quality / receiving people follow their own partner's articles in real time
+    if (access.partnerId && ['production.view', 'quality.view', 'receiving.view', 'warehouse.view'].some((p) => access.permissions.has(p))) {
+      socket.join(rooms.production(access.partnerId));
+    }
 
     /** Re-read the profile (30s cache) so a deactivated account stops working mid-connection. */
     const current = async () => {

@@ -6,6 +6,7 @@ import { setOrderStatus, addEvent, getOrderOr404, STATUS_LABELS } from '../servi
 import { notifyUser, notifyPartner, notifyAdmins } from '../services/notification.service.js';
 import { resolveCourier } from '../services/courier.service.js';
 import { inActivePartner } from '../services/access.service.js';
+import { orderWeightInfo, requireOrderWeight, syncOrderWeight } from '../services/weight.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
 
@@ -292,9 +293,12 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
   );
   order.units.sort((a, b) => a.line_no - b.line_no);
   const invoice = one(order.invoice);
+  // the shipment weight is the sum of the article weights entered in Receiving (never typed here, never assumed 0)
+  const weight = await orderWeightInfo(order);
+  order.weight_kg = weight.total_kg;
   const [priceItems, shippingOptions] = await Promise.all([
     supabaseAdmin.from('price_items').select('*').eq('is_active', true).order('category').order('name'),
-    ratesFor(shipCountry(order), order.weight_kg, order.shipping_service),
+    weight.total_kg == null ? [] : ratesFor(shipCountry(order), weight.total_kg, order.shipping_service),
   ]);
   const items = unwrap(priceItems);
   const currency = invoice?.currency || currencyFor(shipCountry(order));
@@ -306,6 +310,7 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
     order: { ...order, destination_country: order.destination_country || shipCountry(order) || null, invoice: undefined, status_label: STATUS_LABELS[order.status] },
     invoice: invoice ? { ...invoice, lines: (invoice.lines || []).sort((a, b) => a.sort_order - b.sort_order) } : null,
     suggestedLines: invoice ? null : await suggestLines(order, items, shippingOptions),
+    weight: { total_kg: weight.total_kg, source: weight.source, missing: weight.missing, articles: weight.units.map((u) => ({ id: u.id, title: u.unit_title, code: u.code, weight_kg: u.weight_kg == null ? null : Number(u.weight_kg) })) },
     priceItems: items,
     shippingOptions,
     currency,
@@ -337,6 +342,10 @@ const computeTotals = (lines, fxRate) => {
 export const saveInvoiceDraft = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.orderId);
   if (order.status !== 'packed') throw new BadRequestError(`Invoices can only be built for packed orders (this order is ${STATUS_LABELS[order.status]}).`);
+  // every article of the shipment must have its weight (Receiving) before an invoice is made
+  const weightInfo = await requireOrderWeight(order);
+  await syncOrderWeight(order);
+  order.weight_kg = weightInfo.total_kg;
 
   const b = req.body || {};
   const currency = String(b.currency || 'PKR').toUpperCase().slice(0, 3);
@@ -411,6 +420,7 @@ export const issueInvoice = catchAsync(async (req, res) => {
   if (!(Number(invoice.total_pkr) > 0)) throw new BadRequestError('The invoice total must be more than zero.');
   const order = await getOrderOr404(invoice.order_id);
   if (order.status !== 'packed') throw new BadRequestError('Only packed orders can be invoiced.');
+  await requireOrderWeight(order);
 
   const now = new Date().toISOString();
   unwrap(await supabaseAdmin.from('invoices').update({ status: 'issued', issued_at: now, updated_at: now }).eq('id', invoice.id));

@@ -1,6 +1,8 @@
 import app from './app.js';
 import { config } from './config/env.js';
 import { initSocket } from './realtime/socket.js';
+import { loadPostexSettings, applyPostexSettings, onPostexSettingsChange } from './services/postex.service.js';
+import { startPostexPolling } from './services/postex-tracking.service.js';
 
 const server = app.listen(config.port, () => {
   console.log(`=========================================`);
@@ -13,6 +15,10 @@ const server = app.listen(config.port, () => {
   console.log(` Realtime:      Socket.IO on http://localhost:${config.port}`);
   console.log(`=========================================`);
 });
+
+// PostEx: API booking and tracking are on only when POSTEX_API_TOKEN is set
+onPostexSettingsChange(startPostexPolling);
+loadPostexSettings().catch(() => ({})).finally(applyPostexSettings);
 
 // Real-time order conversations share the HTTP server (same port, path /socket.io)
 initSocket(server);

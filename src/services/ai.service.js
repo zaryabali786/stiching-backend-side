@@ -29,16 +29,17 @@ const ORDER_TOOL = {
   input_schema: {
     type: 'object',
     properties: {
-      is_order: { type: 'boolean', description: 'True only if this is an order confirmation, invoice, receipt or product page from a shop.' },
+      is_order: { type: 'boolean', description: 'True only if this is an order confirmation, invoice, receipt, shipping / dispatch / tracking notification or product page from a shop.' },
       brand: { type: ['string', 'null'], description: 'Shop / brand the order was placed with, e.g. "Sapphire", "Khaadi".' },
       order_number: { type: ['string', 'null'], description: "The brand's order / invoice number exactly as printed." },
       order_date: { type: ['string', 'null'], description: 'YYYY-MM-DD' },
       currency: { type: ['string', 'null'], description: 'ISO 4217 code of the prices, e.g. PKR, GBP, USD, AED.' },
       total: { type: ['number', 'null'], description: 'Order grand total as a number.' },
       tracking_number: { type: ['string', 'null'], description: 'Courier tracking number if shown.' },
+      courier_name: { type: ['string', 'null'], description: 'Name of the courier / carrier delivering the parcel if shown, e.g. "DHL", "TCS", "Leopards". Not the shop.' },
       items: {
         type: 'array',
-        description: 'Each product line. Do not include shipping, tax or discount lines.',
+        description: 'Each product line. Do not include shipping, tax or discount lines. Empty when the email only reports shipping / tracking.',
         items: {
           type: 'object',
           properties: {
@@ -189,7 +190,7 @@ const currencyCode = (v) => {
 
 /**
  * @returns {{ is_order: boolean, brand: string|null, order_number: string|null, order_date: string|null,
- *   currency: string|null, total: number|null, tracking_number: string|null,
+ *   currency: string|null, total: number|null, tracking_number: string|null, courier_name: string|null,
  *   items: { title: string, quantity: number, unit_price: number|null, sku: string|null, url: string|null, image_url: string|null, notes: string|null }[] }}
  */
 export const normaliseExtracted = (raw = {}) => {
@@ -219,6 +220,7 @@ export const normaliseExtracted = (raw = {}) => {
     currency: currencyCode(raw.currency),
     total: money(raw.total),
     tracking_number: str(raw.tracking_number, 60),
+    courier_name: str(raw.courier_name, 80),
     items,
   };
 };

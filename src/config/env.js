@@ -45,6 +45,20 @@ export const config = {
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
   },
   // Google sign-in (authorization-code flow). The secret never leaves the server.
+  // PostEx (Pakistan) merchant API. Without a token PostEx works like any other courier: the CN is typed in. The token stays on the server.
+  postex: {
+    token: process.env.POSTEX_API_TOKEN || '',
+    baseUrl: process.env.POSTEX_BASE_URL || 'https://api.postex.pk',
+    // the address codes of your PostEx account (Merchant addresses); needed when the account has more than one pickup address
+    pickupAddressCode: process.env.POSTEX_PICKUP_ADDRESS_CODE || '',
+    storeAddressCode: process.env.POSTEX_STORE_ADDRESS_CODE || '',
+    orderType: process.env.POSTEX_ORDER_TYPE || 'Normal',
+    timeoutMs: Number(process.env.POSTEX_TIMEOUT_MS) || 15000,
+    // how often parcels dispatched with PostEx are checked for tracking updates (minutes); 0 switches the polling off
+    pollMinutes: process.env.POSTEX_POLL_MINUTES === undefined ? 15 : Number(process.env.POSTEX_POLL_MINUTES) || 0,
+  },
+  // The courier's tracking webhook (POST /api/webhooks/courier) is accepted only with this secret in the x-webhook-secret header.
+  courier: { webhookSecret: process.env.COURIER_WEBHOOK_SECRET || '' },
   google: {
     clientId: process.env.GOOGLE_CLIENT_ID || '',
     clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
@@ -56,6 +70,11 @@ export const config = {
     domain: process.env.INBOUND_EMAIL_DOMAIN || '',
     address: process.env.INBOUND_EMAIL_ADDRESS || '',
     secret: process.env.INBOUND_EMAIL_SECRET || '',
+  },
+  // Sending email from the customer's Inbox (Postmark outbound). The sender domain must be verified in Postmark.
+  outboundEmail: {
+    postmarkToken: (process.env.POSTMARK_SERVER_TOKEN || process.env.POSTMARK_API_KEY || '').trim(),
+    stream: process.env.POSTMARK_MESSAGE_STREAM || 'outbound',
   },
   urls: {
     clientApp: process.env.CLIENT_APP_URL || 'http://localhost:4201',

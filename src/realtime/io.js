@@ -25,4 +25,6 @@ export const rooms = {
   // every admin, and the people of one partner who may read messages (never another partner's)
   admins: 'admins',
   partner: (partnerId) => `partner:${partnerId}`,
+  // the people of one partner who watch production (boards, scans): they hear about every article's step
+  production: (partnerId) => `production:${partnerId}`,
 };

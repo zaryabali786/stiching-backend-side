@@ -12,6 +12,17 @@ const unreadCount = async (userId) => {
   return count || 0;
 };
 
+/** Unread notifications about an order (status changes, payments, shipping): the badge on the Orders tab. */
+const unreadOrderCount = async (userId) => {
+  const { count } = await supabaseAdmin
+    .from('notifications')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .is('read_at', null)
+    .or('order_id.not.is.null,link.like./app/orders*');
+  return count || 0;
+};
+
 /**
  * GET /api/notifications?page=1&limit=15&unread=true
  */
@@ -27,11 +38,11 @@ export const listNotifications = catchAsync(async (req, res) => {
 
   const result = await query;
   const rows = unwrap(result, 'Could not load notifications');
-  return sendPage(res, rows, q, result.count, { unreadCount: await unreadCount(req.userId) });
+  return sendPage(res, rows, q, result.count, { unreadCount: await unreadCount(req.userId), orders: await unreadOrderCount(req.userId) });
 });
 
 export const getUnreadCount = catchAsync(async (req, res) =>
-  ApiResponse.success(res, { unreadCount: await unreadCount(req.userId) }));
+  ApiResponse.success(res, { unreadCount: await unreadCount(req.userId), orders: await unreadOrderCount(req.userId) }));
 
 export const markRead = catchAsync(async (req, res) => {
   unwrap(
@@ -42,7 +53,20 @@ export const markRead = catchAsync(async (req, res) => {
       .eq('user_id', req.userId)
       .is('read_at', null)
   );
-  return ApiResponse.success(res, { unreadCount: await unreadCount(req.userId) }, 'Marked as read.');
+  return ApiResponse.success(res, { unreadCount: await unreadCount(req.userId), orders: await unreadOrderCount(req.userId) }, 'Marked as read.');
+});
+
+/** POST /api/notifications/read-orders — the customer opened the Orders tab: its changes are seen */
+export const markOrdersRead = catchAsync(async (req, res) => {
+  unwrap(
+    await supabaseAdmin
+      .from('notifications')
+      .update({ read_at: new Date().toISOString() })
+      .eq('user_id', req.userId)
+      .is('read_at', null)
+      .or('order_id.not.is.null,link.like./app/orders*')
+  );
+  return ApiResponse.success(res, { unreadCount: await unreadCount(req.userId), orders: 0 });
 });
 
 export const markAllRead = catchAsync(async (req, res) => {

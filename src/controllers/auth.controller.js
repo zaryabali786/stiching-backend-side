@@ -1,6 +1,8 @@
 import UserModel from '../models/user.model.js';
 import { supabase, supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
+import { loadShipTo } from '../services/ship-to.service.js';
+import { loadExpressStitching } from '../services/express-stitching.service.js';
 import { loadClientTheme } from './theme.controller.js';
 import { loadPortalTheme } from './portal-theme.controller.js';
 import { catchAsync, BadRequestError, UnauthorizedError, ForbiddenError, ApiResponse } from '../utils/error.helper.js';
@@ -9,7 +11,7 @@ import { resolveAccess, accessPayload } from '../services/access.service.js';
 import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { randomBytes } from 'node:crypto';
 import { notifyAdmins } from '../services/notification.service.js';
-import { addressForToken, getForwardAddress } from '../services/order-import.service.js';
+import { addressForToken, getForwardAddress, tokenForCode } from '../services/order-import.service.js';
 
 const toTokens = (session) => ({
   tokenType: 'Bearer',
@@ -30,7 +32,7 @@ const publicProfile = async (profile) => {
   // One created before this feature existed gets theirs the first time they load their profile.
   let mailbox = {};
   if (profile.role === 'customer') {
-    let address = addressForToken(token);
+    let address = addressForToken(tokenForCode(profile.customer_code) || token);
     if (!address) address = await getForwardAddress(profile.id).then((r) => r.address, () => null);
     mailbox = { mailbox_address: address };
   }
@@ -233,6 +235,8 @@ export const getPublicConfig = catchAsync(async (req, res) =>
     res,
     {
       ...config.platform,
+      ...(await loadShipTo().catch(() => ({}))), // the admin's own address wins over the .env defaults
+      expressStitching: await loadExpressStitching().catch(() => ({ enabled: true, days: 5 })),
       // the publishable key is safe to expose; the secret key never leaves the server
       google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null },
       payments: { stripe: { enabled: !!config.stripe.secretKey && !!config.stripe.publishableKey, publishableKey: config.stripe.publishableKey || null } },
