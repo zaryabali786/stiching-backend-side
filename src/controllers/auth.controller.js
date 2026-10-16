@@ -236,21 +236,37 @@ export const changePassword = catchAsync(async (req, res) => {
 
 /**
  * GET /api/config — public platform settings (ship-to address etc.)
+ * Every app asks for it on start (and the Google button depends on it), so it must be quick: the five settings are read
+ * together instead of one after the other, and the finished answer is kept for a few seconds.
  */
-export const getPublicConfig = catchAsync(async (req, res) =>
-  ApiResponse.success(
-    res,
-    {
-      ...config.platform,
-      ...(await loadShipTo().catch(() => ({}))), // the admin's own address wins over the .env defaults
-      expressStitching: await loadExpressStitching().catch(() => ({ enabled: true, days: 5 })),
-      expressShipping: await loadExpressShipping().catch(() => ({ enabled: true, days: 3 })),
-      // the publishable key is safe to expose; the secret key never leaves the server
-      google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null, iosClientId: isGoogleEnabled() ? config.google.iosClientId || null : null },
-      payments: { stripe: { enabled: !!config.stripe.secretKey && !!config.stripe.publishableKey, publishableKey: config.stripe.publishableKey || null } },
-      theme: await loadClientTheme(),
-      portalTheme: await loadPortalTheme(),
-    },
-    'Platform config'
-  )
-);
+const PUBLIC_CONFIG_TTL_MS = 15_000;
+let publicConfigCache = { at: 0, data: null };
+
+const buildPublicConfig = async () => {
+  const [shipTo, expressStitching, expressShipping, theme, portalTheme] = await Promise.all([
+    loadShipTo().catch(() => ({})), // the admin's own address wins over the .env defaults
+    loadExpressStitching().catch(() => ({ enabled: true, days: 5 })),
+    loadExpressShipping().catch(() => ({ enabled: true, days: 3 })),
+    loadClientTheme(),
+    loadPortalTheme(),
+  ]);
+  return {
+    ...config.platform,
+    ...shipTo,
+    expressStitching,
+    expressShipping,
+    // the publishable key is safe to expose; the secret key never leaves the server
+    google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null, iosClientId: isGoogleEnabled() ? config.google.iosClientId || null : null },
+    payments: { stripe: { enabled: !!config.stripe.secretKey && !!config.stripe.publishableKey, publishableKey: config.stripe.publishableKey || null } },
+    theme,
+    portalTheme,
+  };
+};
+
+export const getPublicConfig = catchAsync(async (req, res) => {
+  const now = Date.now();
+  if (!publicConfigCache.data || now - publicConfigCache.at > PUBLIC_CONFIG_TTL_MS) {
+    publicConfigCache = { at: now, data: await buildPublicConfig() };
+  }
+  return ApiResponse.success(res, publicConfigCache.data, 'Platform config');
+});
