@@ -7,7 +7,7 @@ import { loadExpressShipping } from '../services/express-shipping.service.js';
 import { loadClientTheme } from './theme.controller.js';
 import { loadPortalTheme } from './portal-theme.controller.js';
 import { catchAsync, BadRequestError, UnauthorizedError, ForbiddenError, ApiResponse } from '../utils/error.helper.js';
-import { identityFromCode, isGoogleEnabled } from '../services/google-auth.service.js';
+import { identityFromCode, identityFromIdToken, isGoogleEnabled } from '../services/google-auth.service.js';
 import { resolveAccess, accessPayload } from '../services/access.service.js';
 import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { randomBytes } from 'node:crypto';
@@ -26,8 +26,8 @@ const toTokens = (session) => ({
  * What the apps get after login: the profile plus who they are in the hierarchy. `permissions` is the EFFECTIVE list
  * (what this person may really use today), never the raw stored one. The server decides it, the apps only display it.
  */
-const publicProfile = async (profile) => {
-  const access = await resolveAccess(profile);
+const publicProfile = async (profile, knownAccess = null) => {
+  const access = knownAccess ?? (await resolveAccess(profile));
   const { permissions: _stored, inbound_email_token: token, ...rest } = profile;
   // Customers get a personal shopping address (their Inbox); the secret token itself is not sent on.
   // One created before this feature existed gets theirs the first time they load their profile.
@@ -71,9 +71,10 @@ const makeGooglePartner = async (profile, who) => {
 
 /** A partner user cannot sign in while their partner is switched off. */
 const assertPartnerActive = async (profile) => {
-  if (profile.role !== 'partner_staff') return;
+  if (profile.role !== 'partner_staff') return null;
   const access = await resolveAccess(profile);
   if (!access.partner || access.partner.status !== 'active') throw new ForbiddenError('Your partner account is switched off. Contact the platform admin.');
+  return access; // handed on so the reply does not look the same partner up again
 };
 
 /** Every new customer gets a personal shopping address at sign-up. A failure must never block the sign-up (it is created on first Inbox visit instead). */
@@ -129,18 +130,22 @@ export const login = catchAsync(async (req, res) => {
   const profile = await UserModel.getProfile(user.id);
   if (!profile) throw new UnauthorizedError('No profile found for this account. Run the database migrations, then register again.');
   if (profile.is_active === false) throw new UnauthorizedError('This account has been deactivated. Contact the platform admin.');
-  await assertPartnerActive(profile);
+  const access = await assertPartnerActive(profile);
 
-  return ApiResponse.success(res, { user: await publicProfile(profile), tokens: toTokens(session) }, 'Login successful.');
+  return ApiResponse.success(res, { user: await publicProfile(profile, access), tokens: toTokens(session) }, 'Login successful.');
 });
 
 /**
- * POST /api/auth/google  body: { code, redirectUri, portal: 'customer' | 'staff' }
+ * POST /api/auth/google  body: { code, redirectUri, portal } (website)  or  { idToken, portal } (phone app, native Google sign-in)
+ *   portal: 'customer' | 'staff'
  * Same answer as /login. A first-time Google user becomes a customer; staff accounts are never created this way.
  */
 export const googleLogin = catchAsync(async (req, res) => {
   const portal = req.body?.portal === 'staff' ? 'staff' : 'customer';
-  const who = await identityFromCode({ code: req.body?.code, redirectUri: req.body?.redirectUri });
+  // the website sends the authorization `code`; the phone app (native Google sign-in) sends the signed `idToken`
+  const who = req.body?.idToken
+    ? await identityFromIdToken(req.body.idToken)
+    : await identityFromCode({ code: req.body?.code, redirectUri: req.body?.redirectUri });
 
   let profile = await UserModel.findProfileByEmail(who.email);
   let created = false;
@@ -158,11 +163,12 @@ export const googleLogin = catchAsync(async (req, res) => {
     if (portal === 'staff') profile = await makeGooglePartner(profile, who);
   }
   if (profile.is_active === false) throw new UnauthorizedError('This account has been deactivated. Contact the platform admin.');
-  await assertPartnerActive(profile);
+  const access = await assertPartnerActive(profile);
 
-  const { session } = await UserModel.signInVerifiedEmail(who.email);
+  // the session (two calls to Supabase) and the reply's profile do not depend on each other: run them together
+  const [{ session }, user] = await Promise.all([UserModel.signInVerifiedEmail(who.email), publicProfile(profile, access)]);
   if (!session) throw new UnauthorizedError('Google sign-in could not be completed. Please try again.');
-  return ApiResponse.success(res, { user: await publicProfile(profile), tokens: toTokens(session), created }, 'Login successful.');
+  return ApiResponse.success(res, { user, tokens: toTokens(session), created }, 'Login successful.');
 });
 
 export const getMe = catchAsync(async (req, res) => {
@@ -240,7 +246,7 @@ export const getPublicConfig = catchAsync(async (req, res) =>
       expressStitching: await loadExpressStitching().catch(() => ({ enabled: true, days: 5 })),
       expressShipping: await loadExpressShipping().catch(() => ({ enabled: true, days: 3 })),
       // the publishable key is safe to expose; the secret key never leaves the server
-      google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null },
+      google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null, iosClientId: isGoogleEnabled() ? config.google.iosClientId || null : null },
       payments: { stripe: { enabled: !!config.stripe.secretKey && !!config.stripe.publishableKey, publishableKey: config.stripe.publishableKey || null } },
       theme: await loadClientTheme(),
       portalTheme: await loadPortalTheme(),

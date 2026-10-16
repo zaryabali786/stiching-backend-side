@@ -1,3 +1,4 @@
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { config } from '../config/env.js';
 import { AppError, BadRequestError, UnauthorizedError } from '../utils/error.helper.js';
 
@@ -56,7 +57,31 @@ export const identityFromCode = async ({ code, redirectUri }) => {
   const claims = decodePayload(body.id_token);
   const issuerOk = claims.iss === 'https://accounts.google.com' || claims.iss === 'accounts.google.com';
   if (!issuerOk || claims.aud !== config.google.clientId || !(claims.exp * 1000 > Date.now())) throw new UnauthorizedError('Google sign-in could not be verified.');
-  if (!claims.email || claims.email_verified !== true) throw new UnauthorizedError('Your Google email is not verified.');
+  return identityFromClaims(claims);
+};
 
+const identityFromClaims = (claims) => {
+  if (!claims.email || claims.email_verified !== true) throw new UnauthorizedError('Your Google email is not verified.');
   return { email: String(claims.email).trim().toLowerCase(), name: String(claims.name || '').trim(), picture: claims.picture || null, sub: claims.sub };
+};
+
+const googleKeys = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'));
+
+/**
+ * Native Google sign-in (phone app): the Google SDK on the phone hands the app a signed id_token. Unlike the code flow
+ * there is no secret to swap, so the token itself is verified here against Google's public keys: signature, issuer,
+ * expiry and that it was issued for OUR Google client (web client id, or the iOS one). The email comes only from it.
+ * @returns {Promise<{ email: string, name: string, picture: string|null, sub: string }>}
+ */
+export const identityFromIdToken = async (idToken) => {
+  if (!isGoogleEnabled()) throw new AppError('Google sign-in is not set up yet.', 503);
+  if (!idToken || typeof idToken !== 'string' || idToken.length > 4096) throw new BadRequestError('Google did not return a sign-in token.');
+  const audience = [config.google.clientId, config.google.iosClientId].filter(Boolean);
+  let claims;
+  try {
+    ({ payload: claims } = await jwtVerify(idToken, googleKeys, { issuer: ['https://accounts.google.com', 'accounts.google.com'], audience }));
+  } catch {
+    throw new UnauthorizedError('Google sign-in could not be verified. Please try again.');
+  }
+  return identityFromClaims(claims);
 };
