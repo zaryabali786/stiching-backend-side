@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../config/supabase.js';
-import { catchAsync, ApiResponse } from '../utils/error.helper.js';
+import { catchAsync, ApiResponse, BadRequestError } from '../utils/error.helper.js';
+import { registerDevice, unregisterDevice } from '../services/push.service.js';
 import { parseListQuery, sendPage } from '../utils/pagination.js';
 import { unwrap } from '../utils/db.js';
 
@@ -83,4 +84,19 @@ export const markAllRead = catchAsync(async (req, res) => {
 export const deleteNotification = catchAsync(async (req, res) => {
   unwrap(await supabaseAdmin.from('notifications').delete().eq('id', req.params.id).eq('user_id', req.userId));
   return ApiResponse.success(res, { unreadCount: await unreadCount(req.userId) }, 'Notification removed.');
+});
+
+/** POST /api/notifications/devices  body: { token, platform: 'android'|'ios'|'web', app?: 'client'|'admin' } — this phone/browser now gets MY pushes */
+export const registerPushDevice = catchAsync(async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  if (token.length < 20 || token.length > 4096) throw new BadRequestError('A valid push token is required.');
+  await registerDevice(req.userId, { token, platform: req.body?.platform, app: req.body?.app });
+  return ApiResponse.success(res, { registered: true }, 'Push notifications are on for this device.');
+});
+
+/** POST /api/notifications/devices/remove  body: { token } — sign-out: this device stops getting my pushes */
+export const unregisterPushDevice = catchAsync(async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  if (token) await unregisterDevice(req.userId, token);
+  return ApiResponse.success(res, { registered: false }, 'Push notifications are off for this device.');
 });

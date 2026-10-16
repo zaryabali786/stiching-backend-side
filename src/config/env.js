@@ -76,6 +76,13 @@ export const config = {
     postmarkToken: (process.env.POSTMARK_SERVER_TOKEN || process.env.POSTMARK_API_KEY || '').trim(),
     stream: process.env.POSTMARK_MESSAGE_STREAM || 'outbound',
   },
+  // Push notifications (Firebase Cloud Messaging). The service account is a SECRET: keep it in the server .env only.
+  // Give it as FIREBASE_SERVICE_ACCOUNT_JSON (the JSON, one line), _BASE64, or _PATH (a file outside the repo).
+  firebase: {
+    serviceAccountJson: process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '',
+    serviceAccountBase64: process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || '',
+    serviceAccountPath: process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '',
+  },
   urls: {
     // Production defaults match the live sites, so Google sign-in works even when the server .env does not set these
     clientApp: process.env.CLIENT_APP_URL || (process.env.NODE_ENV === 'production' ? 'https://client.stitchnship.com' : 'http://localhost:4201'),

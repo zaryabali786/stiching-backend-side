@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { emitTo, rooms } from '../realtime/io.js';
 import { loadPartner } from './access.service.js';
+import { pushToUser } from './push.service.js';
 
 /**
  * Notifications are stored one row per recipient so each user has their own read state.
@@ -17,6 +18,8 @@ const insertMany = async (rows) => {
   // nudge open apps to refresh their bell right away (they also poll as a fallback)
   // (the rows are pushed too, so open apps can add them to the list immediately)
   for (const row of rows) emitTo(rooms.user(row.user_id), 'notification:new', { notification: row.saved ?? null });
+  // and a push to that user's own phones / browsers (never anybody else's)
+  for (const row of rows) pushToUser(row.user_id, { ...row, ...(row.saved ?? {}) });
 };
 
 /**
