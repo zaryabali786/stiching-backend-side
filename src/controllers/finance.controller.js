@@ -1,3 +1,5 @@
+import { getFxRate, saveInvoiceFx, loadInvoiceFx, DATE as FX_DATE } from '../services/fx-rate.service.js';
+import { adjustUnitCounts } from '../services/return-order.service.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError } from '../utils/error.helper.js';
 import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
@@ -9,7 +11,6 @@ import { inActivePartner } from '../services/access.service.js';
 import { orderWeightInfo, requireOrderWeight, syncOrderWeight } from '../services/weight.service.js';
 import { listExtraCosts, extraCostLine } from '../services/extra-cost.service.js';
 import { loadExpressStitching } from '../services/express-stitching.service.js';
-import { loadExpressShipping } from '../services/express-shipping.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
 
@@ -194,7 +195,7 @@ const INVOICE_TABS = ['to_invoice', 'issued', 'paid'];
 export const getAdminInvoices = catchAsync(async (req, res) => {
   const tab = INVOICE_TABS.includes(req.query.tab) ? req.query.tab : 'to_invoice';
   const q = parseListQuery(req, { defaultLimit: 12 });
-  const orderCols = 'id, reference, brand, status, customer_name, customer_code, destination_city, destination_country, weight_kg, packed_at, units:order_units!order_units_order_id_fkey(count)';
+  const orderCols = 'id, reference, brand, status, order_kind, return_unit_id, customer_name, customer_code, destination_city, destination_country, weight_kg, packed_at, units:order_units!order_units_order_id_fkey(count)';
 
   let rows;
   let total;
@@ -204,7 +205,8 @@ export const getAdminInvoices = catchAsync(async (req, res) => {
       .eq('status', 'packed').order('packed_at', { ascending: true, nullsFirst: false }).range(q.from, q.to));
     if (q.search) query = query.or(ilikeAny(['reference', 'customer_name', 'customer_code', 'destination_country'], q.search));
     const result = await query;
-    rows = unwrap(result).map(({ invoice, ...order }) => ({ order: { ...order, units_count: order.units?.[0]?.count ?? 0, units: undefined }, invoice: one(invoice) }));
+    const orders = await adjustUnitCounts(unwrap(result).map(({ invoice, ...order }) => ({ ...order, units_count: order.units?.[0]?.count ?? 0, units: undefined, invoice })));
+    rows = orders.map(({ invoice, ...order }) => ({ order, invoice: one(invoice) }));
     total = result.count;
   } else {
     let query = inActivePartner(req.access, supabaseAdmin.from('invoices')
@@ -217,7 +219,9 @@ export const getAdminInvoices = catchAsync(async (req, res) => {
       query = query.or(ids.length ? `number.ilike.%${q.search}%,order_id.in.(${ids.join(',')})` : `number.ilike.%${q.search}%`);
     }
     const result = await query;
-    rows = unwrap(result).map(({ order, ...invoice }) => ({ order: order ? { ...order, units_count: order.units?.[0]?.count ?? 0, units: undefined } : null, invoice }));
+    const invoices = unwrap(result);
+    const adjusted = new Map((await adjustUnitCounts(invoices.filter((i) => i.order).map((i) => ({ ...i.order, units_count: i.order.units?.[0]?.count ?? 0, units: undefined })))).map((o) => [o.id, o]));
+    rows = invoices.map(({ order, ...invoice }) => ({ order: order ? adjusted.get(order.id) : null, invoice }));
     total = result.count;
   }
 
@@ -290,10 +294,16 @@ const suggestLines = async (order, priceItems, shippingOptions) => {
 export const getInvoiceBuilder = catchAsync(async (req, res) => {
   const order = unwrapOne(
     await supabaseAdmin.from('orders')
-      .select('*, units:order_units!order_units_order_id_fkey(id, unit_title, stitching_type, quantity, notes, line_no, created_at), invoice:invoices!invoices_order_id_fkey(*, lines:invoice_lines(*)), customer:profiles!orders_customer_id_fkey(full_name, email, phone, customer_code)')
+      .select('*, units:order_units!order_units_order_id_fkey(id, unit_title, stitching_type, quantity, notes, line_no, created_at, review_status), invoice:invoices!invoices_order_id_fkey(*, lines:invoice_lines(*)), customer:profiles!orders_customer_id_fkey(full_name, email, phone, customer_code)')
       .eq('id', req.params.orderId).maybeSingle(),
     'Order not found'
   );
+  // a return order carries its one article (shown on the builder); the return invoice charges shipping only, so no article price lines come from it
+  const returnedUnit = order.order_kind === 'return' && order.return_unit_id
+    ? (await supabaseAdmin.from('order_units').select('id, unit_title, stitching_type, quantity, notes, line_no, created_at').eq('id', order.return_unit_id).maybeSingle()).data
+    : null;
+  if (returnedUnit) order.units = [{ ...returnedUnit, line_no: 1 }];
+  else order.units = order.units.filter((u) => u.review_status !== 'rejected'); // a rejected article leaves on its own and is not invoiced here
   order.units.sort((a, b) => a.line_no - b.line_no);
   const invoice = one(order.invoice);
   // the shipment weight is the sum of the article weights entered in Receiving (never typed here, never assumed 0)
@@ -316,9 +326,9 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
 
   return ApiResponse.success(res, {
     order: { ...order, destination_country: order.destination_country || shipCountry(order) || null, invoice: undefined, status_label: STATUS_LABELS[order.status] },
-    invoice: invoice ? { ...invoice, lines: (invoice.lines || []).sort((a, b) => a.sort_order - b.sort_order) } : null,
+    invoice: invoice ? { ...invoice, lines: (invoice.lines || []).sort((a, b) => a.sort_order - b.sort_order), fx: await loadInvoiceFx(invoice.id) } : null,
     // a new invoice starts with the approved extra items already on it (the admin never retypes them)
-    suggestedLines: invoice ? null : [...(await suggestLines(order, items, shippingOptions)), ...expressLines(order), ...extras.filter((c) => c.status === 'approved').map(extraCostLine)].map((l, i) => ({ ...l, sort_order: i })),
+    suggestedLines: invoice ? null : [...(await suggestLines(returnedUnit ? { ...order, units: [] } : order, items, shippingOptions)), ...expressLines(order), ...extras.filter((c) => c.status === 'approved').map(extraCostLine)].map((l, i) => ({ ...l, sort_order: i })),
     extraCosts: extras,
     weight: { total_kg: weight.total_kg, source: weight.source, missing: weight.missing, articles: weight.units.map((u) => ({ id: u.id, title: u.unit_title, code: u.code, weight_kg: u.weight_kg == null ? null : Number(u.weight_kg) })) },
     priceItems: items,
@@ -331,14 +341,13 @@ export const getInvoiceBuilder = catchAsync(async (req, res) => {
 const LINE_KINDS = ['stitching', 'accessory', 'accessory_stitching', 'shipping', 'duties', 'discount', 'other', 'express_stitching', 'express_shipping'];
 
 /**
- * The express charges of an order, from the prices saved on the order when express was chosen. The server decides these lines: the
- * invoice always has exactly one of each when express is on (and none when it is off), whatever the browser sends.
+ * The priority stitching charge of an order, from the price saved on the order when it was chosen. The server decides this line: the
+ * invoice has exactly one when priority stitching is on (and none when it is off), whatever the browser sends.
  */
 /** An order made before the prices existed (express on, no price saved) takes the admin's current price now, once, and keeps it. */
 export const ensureExpressPrices = async (order) => {
   const patch = {};
   if (order.express_stitching && order.express_stitching_price == null) patch.express_stitching_price = (await loadExpressStitching()).price_pkr;
-  if (order.express_shipping && order.express_shipping_price == null) patch.express_shipping_price = (await loadExpressShipping()).price_pkr;
   if (!Object.keys(patch).length) return order;
   const { error } = await supabaseAdmin.from('orders').update(patch).eq('id', order.id);
   if (error && !/express_(stitching|shipping)_price/.test(error.message || '')) throw error;
@@ -348,11 +357,9 @@ export const ensureExpressPrices = async (order) => {
 export const expressLines = (order) => {
   const out = [];
   if (order.express_stitching && Number(order.express_stitching_price) > 0) {
-    out.push({ kind: 'express_stitching', label: 'Express stitching', description: order.express_days ? `Ready in ${order.express_days} days` : null, quantity: 1, customer_amount: round2(order.express_stitching_price), partner_amount: 0 });
+    out.push({ kind: 'express_stitching', label: 'Priority stitching', description: order.express_days ? `Ready in ${order.express_days} days` : null, quantity: 1, customer_amount: round2(order.express_stitching_price), partner_amount: 0 });
   }
-  if (order.express_shipping && Number(order.express_shipping_price) > 0) {
-    out.push({ kind: 'express_shipping', label: 'Express shipping', description: order.express_shipping_days ? `Delivered in ${order.express_shipping_days} days` : null, quantity: 1, customer_amount: round2(order.express_shipping_price), partner_amount: 0 });
-  }
+  // Fast shipping has no price: it never becomes an invoice line (an old saved shipping price is ignored)
   return out;
 };
 
@@ -372,6 +379,16 @@ const computeTotals = (lines, fxRate) => {
 };
 
 /**
+ * GET /api/admin/invoices/fx-rate?currency=USD[&refresh=1]
+ * The latest available rate of a currency against PKR (PKR per 1 unit), with the day it is for. `refresh=1` skips the one-hour cache.
+ */
+export const getInvoiceFxRate = catchAsync(async (req, res) => {
+  const rate = await getFxRate(req.query.currency, { force: req.query.refresh === '1' });
+  res.setHeader('Cache-Control', 'no-store');
+  return ApiResponse.success(res, rate);
+});
+
+/**
  * PUT /api/admin/invoices/builder/:orderId  body: { currency, fx_rate, notes, lines: [...] }
  * Saves (or replaces) the draft invoice.
  */
@@ -388,6 +405,10 @@ export const saveInvoiceDraft = catchAsync(async (req, res) => {
   const currency = String(b.currency || 'PKR').toUpperCase().slice(0, 3);
   const fxRate = currency === 'PKR' ? 1 : Number(b.fx_rate);
   if (!(fxRate > 0)) throw new BadRequestError(`Enter the exchange rate (PKR per 1 ${currency}).`);
+  // where the rate came from: the live rate of a day (its date), or typed by hand
+  const fxSource = currency === 'PKR' ? 'live' : b.fx_source === 'manual' ? 'manual' : 'live';
+  const fxDate = currency === 'PKR' || fxSource === 'manual' ? null : String(b.fx_rate_date || '');
+  if (fxSource === 'live' && currency !== 'PKR' && fxDate && !FX_DATE.test(fxDate)) throw new BadRequestError('The exchange rate date is not valid.');
   if (!Array.isArray(b.lines) || !b.lines.length) throw new BadRequestError('Add at least one charge.');
 
   const lines = b.lines.map((l, i) => {
@@ -463,7 +484,8 @@ export const saveInvoiceDraft = catchAsync(async (req, res) => {
 
   unwrap(await supabaseAdmin.from('invoice_lines').delete().eq('invoice_id', invoice.id));
   const saved = unwrap(await supabaseAdmin.from('invoice_lines').insert(lines.map((l) => ({ ...l, invoice_id: invoice.id }))).select('*'));
-  return ApiResponse.success(res, { ...invoice, lines: saved.sort((a, b) => a.sort_order - b.sort_order) }, `Draft ${invoice.number} saved.`);
+  const fx = await saveInvoiceFx(invoice.id, { rate_date: fxDate || null, source: fxSource }, req.userId);
+  return ApiResponse.success(res, { ...invoice, fx, lines: saved.sort((a, b) => a.sort_order - b.sort_order) }, `Draft ${invoice.number} saved.`);
 });
 
 /**

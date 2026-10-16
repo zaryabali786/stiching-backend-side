@@ -7,6 +7,7 @@ import { unwrap, unwrapOne, round2 } from '../utils/db.js';
 import { STATUS_GROUPS, STATUS_LABELS, setOrderStatus, addEvent, notifyPartnerAboutOrder, syncOrderFromCards, logUnitEvent, buildUnitTimeline } from '../services/order.service.js';
 import { notifyStaff, notifyAdmins, notifyPartner, notifyUser } from '../services/notification.service.js';
 import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
+import { isCod } from '../services/email-order-match.service.js';
 import { fallbackPrices, priceKey } from '../services/article-price.service.js';
 import { resolveOrderRefs, internationalFromCountry, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
 import { createMessage } from '../services/chat.service.js';
@@ -95,6 +96,8 @@ const shapeUnit = ({ picks, unit_price, currency, card, unit_events, ...unit }, 
     .map(({ type_sort, ...rest }) => rest),
 });
 
+export const COD_MESSAGE = 'COD is not allowed. This order cannot be created.';
+
 const shapeOrderDetail = (order) => {
   const invoice = one(order.invoice);
   const returns = returnSummary(order.units || []);
@@ -104,6 +107,8 @@ const shapeOrderDetail = (order) => {
     : null;
   return {
     ...order,
+    // a draft whose email says cash on delivery cannot be created
+    payment_cod: isCod(order.brand_payment_method),
     return_summary: returns,
     // website / email orders finish their articles, sizes and notes after the parcel is approved
     details_pending: needsDetails(order) && !order.details_completed_at && order.parcel_review !== 'none',
@@ -293,6 +298,8 @@ const cleanUnit = (u, i) => {
     unit_title: title.slice(0, 160),
     product_link: link ? link.slice(0, 500) : null,
     product_image_url: cleanHttpUrl(u.product_image_url),
+    // a brand typed for this article only ("Other"): kept as text on the article, not in the brand list
+    brand: String(u.brand_name ?? '').replace(/\s+/g, ' ').trim().slice(0, 80) || null,
     brand_id: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(u.brand_id || '')) ? u.brand_id : null,
     brand_sku: u.brand_sku ? String(u.brand_sku).slice(0, 80) : null,
     stitching_type: u.stitching_type ? String(u.stitching_type).slice(0, 120) : null,
@@ -321,7 +328,12 @@ export const createClientOrder = catchAsync(async (req, res) => {
   // A brand chosen for the whole order = a website purchase (or an import of one); brands per article = the customer's own parcel
   const explicitBrand = !!body.brand_id;
   // "Direct from customer": the brand is chosen per article; the order takes the first article's brand
-  if (!body.brand_id) body.brand_id = body.units.find((u) => u.brand_id)?.brand_id;
+  // the order takes the first article's brand: one from the list, or the name typed for it
+  if (!body.brand_id) {
+    const first = body.units.find((u) => u.brand_id || String(u.brand_name ?? '').trim());
+    if (first?.brand_id) body.brand_id = first.brand_id;
+    else if (first) body.brand_text = first.brand_name;
+  }
   const refs = await resolveOrderRefs({ ...body, destination_country: body.destination_country || req.profile?.country });
 
   const units = body.units.map(cleanUnit);
@@ -331,7 +343,7 @@ export const createClientOrder = catchAsync(async (req, res) => {
     const names = new Map(found.filter((b) => b.status === 'active').map((b) => [b.id, b.name]));
     for (const u of units) {
       if (u.brand_id && !names.has(u.brand_id)) throw new BadRequestError('One of the brands is not available. Choose another.');
-      u.brand = u.brand_id ? names.get(u.brand_id) : null;
+      u.brand = u.brand_id ? names.get(u.brand_id) : u.brand || null;
     }
   }
   const uploads = body.units.map((u) => (Array.isArray(u.reference_uploads) ? u.reference_uploads.slice(0, 4) : []));
@@ -370,7 +382,7 @@ export const createClientOrder = catchAsync(async (req, res) => {
         express_stitching: express,
         express_days: express ? expressSetting.days : null,
         // only written when asked for, so ordering keeps working until database update 0036 is applied
-        ...(expressShip ? { express_shipping: true, express_shipping_days: shippingSetting.days, express_shipping_price: shippingSetting.price_pkr } : {}),
+        ...(expressShip ? { express_shipping: true, express_shipping_days: shippingSetting.days } : {}),
         ...(express ? { express_stitching_price: expressSetting.price_pkr } : {}),
         due_date: express ? dueAfter(new Date(), expressSetting.days) : due.toISOString().slice(0, 10),
         destination_country: (body.destination_country || p.country || '').trim() || (refs.international_shipping === false ? 'Pakistan' : null),
@@ -459,14 +471,19 @@ export const updateClientOrder = catchAsync(async (req, res) => {
   // a website order whose parcel was checked is completed here (its articles, sizes and notes), then it goes to production
   const websiteCompletion = !isDraft && order.order_source === 'website' && order.status === 'received' && order.parcel_review !== 'none' && !order.details_completed_at;
   if (order.status !== 'submitted' && !isDraft && !websiteCompletion) throw new ForbiddenError('This order can no longer be edited because the parcel has arrived.');
-  // an order made from an email: its articles are fixed. The customer completes them only after each one was received and approved.
+  // an order made from an email: its articles come from the email (none added or removed); their sizes, customization and notes are editable.
   const emailOrder = order.order_source === 'email' || order.import_source === 'email';
-  // for both, the articles are the ones that arrived: they cannot be added or removed, and only approved ones can be edited
+  // for both, the articles are the ones from the email / that arrived: they cannot be added or removed, and a received one is edited only after the customer approved it
   const fixedArticles = emailOrder || websiteCompletion;
-  if (isDraft && emailOrder && order.parcel_review === 'none') throw new ForbiddenError('You can complete this order after we receive your parcel.');
+  // cash on delivery is not accepted: the draft stays for review or cancelling, but it cannot become an order
+  if (isDraft && isCod(order.brand_payment_method)) throw new BadRequestError(COD_MESSAGE);
   const body = req.body || {};
   // a customer's own parcel names its brand per article: the order takes the first article's brand (as when it was created)
-  if (order.order_source === 'customer' && !body.brand_id && Array.isArray(body.units)) body.brand_id = body.units.find((u) => u?.brand_id)?.brand_id;
+  if (order.order_source === 'customer' && !body.brand_id && Array.isArray(body.units)) {
+    const first = body.units.find((u) => u?.brand_id || String(u?.brand_name ?? '').trim());
+    if (first?.brand_id) body.brand_id = first.brand_id;
+    else if (first) body.brand_text = first.brand_name;
+  }
 
   const patch = {};
   // customers never choose or change the partner: the admin assigns it (an order without one is at the central location)
@@ -476,7 +493,8 @@ export const updateClientOrder = catchAsync(async (req, res) => {
       patch,
       await resolveOrderRefs(
         {
-          brand_id: body.brand_id ?? order.brand_id,
+          brand_id: body.brand_text ? null : body.brand_id ?? order.brand_id,
+          brand_text: body.brand_text,
           courier_id: body.courier_id === undefined ? order.courier_id : body.courier_id,
           tracking_number: body.tracking_number === undefined ? order.tracking_number : body.tracking_number,
           // the delivery country decides; when it is not known the saved value stays
@@ -504,11 +522,9 @@ export const updateClientOrder = catchAsync(async (req, res) => {
     const setting = await loadExpressShipping();
     patch.express_shipping = body.express_shipping === true && setting.enabled;
     patch.express_shipping_days = patch.express_shipping ? setting.days : null;
-    patch.express_shipping_price = patch.express_shipping ? setting.price_pkr : null;
   }
-  // an order made before express had a price: saving it now fixes the price it is charged (so the form, invoice and payment agree)
+  // an order made before priority stitching had a price: saving it now fixes the price it is charged (so the form, invoice and payment agree)
   if ((patch.express_stitching ?? order.express_stitching) && order.express_stitching_price == null && patch.express_stitching_price === undefined) patch.express_stitching_price = (await loadExpressStitching()).price_pkr;
-  if ((patch.express_shipping ?? order.express_shipping) && order.express_shipping_price == null && patch.express_shipping_price === undefined) patch.express_shipping_price = (await loadExpressShipping()).price_pkr;
   for (const key of ['destination_country', 'destination_city', 'destination_address', 'destination_phone']) {
     if (body[key] !== undefined) patch[key] = String(body[key] || '').trim() || null;
   }
@@ -545,8 +561,8 @@ export const updateClientOrder = catchAsync(async (req, res) => {
     // Update kept articles in place (keeps their photos), insert new ones
     for (const [i, raw] of body.units.entries()) {
       const prev = existing.find((e) => e.id === raw.id);
-      // an article that was not received and approved yet cannot be edited
-      if (fixedArticles && !(prev?.status === 'received' && prev?.review_status === 'approved')) continue;
+      // an article of an email order is editable like any other until the parcel arrives; once it is received it waits for the customer's review
+      if (fixedArticles && prev?.status === 'received' && prev?.review_status !== 'approved') continue;
       const unit = { ...cleaned[i], ...(fixedArticles ? { product_link: prev?.product_link ?? null, unit_title: prev.unit_title, quantity: prev.quantity } : {}), design: picks[i].design, size_snapshot: sizeSnapshotOf(editCharts.get(cleaned[i].size_chart_id)), line_no: i + 1, updated_at: new Date().toISOString(), ...(noteAudios[i] !== undefined ? { notes_audio: noteAudios[i] } : {}) };
       const uploads = Array.isArray(raw.reference_uploads) ? raw.reference_uploads.slice(0, 4) : [];
       const refsUploaded = uploads.length ? await uploadDataUrls(`references/${order.id}`, uploads) : [];
@@ -576,7 +592,7 @@ export const updateClientOrder = catchAsync(async (req, res) => {
     const doneAt = new Date().toISOString();
     const submitted = isDraft
       ? unwrap(await supabaseAdmin.from('orders').update({
-          status: parcelIn ? 'received' : 'submitted', ...(parcelIn ? { received_at: order.parcel_received_at || doneAt, details_completed_at: doneAt } : {}), updated_at: doneAt,
+          status: parcelIn ? 'received' : 'submitted', ...(parcelIn ? { received_at: order.parcel_received_at || doneAt } : {}), ...(parcelIn || emailOrder ? { details_completed_at: doneAt } : {}), updated_at: doneAt,
         }).eq('id', order.id).eq('status', 'draft').select('*').single(), 'Could not submit the order')
       : unwrap(await supabaseAdmin.from('orders').update({ details_completed_at: doneAt, updated_at: doneAt }).eq('id', order.id).is('details_completed_at', null).select('*').single(), 'Could not complete the order');
     Object.assign(submitted, await assignPartnerByRule(submitted));
@@ -659,6 +675,22 @@ export const returnArticle = catchAsync(async (req, res) => {
   await requestReturn({ order, unit, note: req.body?.note, profile: req.profile });
   const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
   return ApiResponse.success(res, await orderDetailResponse(full), 'Return requested. We will send the article back and tell you here.');
+});
+
+/**
+ * POST /api/client/orders/:id/payment-method  body: { method }
+ * The customer confirms how an email draft was paid when the email did not say. Cash on delivery can never be set this way, and a
+ * method the email stated is not overwritten.
+ */
+export const confirmPaymentMethod = catchAsync(async (req, res) => {
+  const order = await loadOwnOrder(req);
+  if (order.status !== 'draft') throw new ForbiddenError('The payment method can be confirmed on a draft only.');
+  if (order.brand_payment_method) throw new BadRequestError('The email already states the payment method.');
+  const method = ['Card', 'Bank transfer', 'Online payment'].find((m) => m.toLowerCase() === String(req.body?.method || '').toLowerCase());
+  if (!method) throw new BadRequestError('Choose Card, Bank transfer or Online payment. Cash on delivery is not allowed.');
+  unwrap(await supabaseAdmin.from('orders').update({ brand_payment_method: method, updated_at: new Date().toISOString() }).eq('id', order.id).eq('status', 'draft'));
+  await addEvent(order.id, 'draft', `Payment method confirmed by the customer: ${method}`, req.userId);
+  return ApiResponse.success(res, { brand_payment_method: method }, `Payment method set to ${method}.`);
 });
 
 /**

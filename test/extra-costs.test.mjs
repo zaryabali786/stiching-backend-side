@@ -98,7 +98,7 @@ test('the invoice takes only approved items, each once; the line carries the cos
   await assert.rejects(() => svc.decideExtraCost({ id: cost.id, decision: 'reject', userId: 'admin' }), /on the invoice/);
 });
 
-test('express charges: one line each from the order prices, none when express is off, never twice, whatever the browser sends', async () => {
+test('priority stitching: one line from the order price, none when it is off, never twice, whatever the browser sends; fast shipping is never charged', async () => {
   const o = db.table('orders')[0];
   o.status = 'packed';
   Object.assign(o, { express_stitching: true, express_stitching_price: 1500, express_days: 3, express_shipping: true, express_shipping_price: 800, express_shipping_days: 2 });
@@ -108,12 +108,13 @@ test('express charges: one line each from the order prices, none when express is
   const ok = await call(fin.saveInvoiceDraft, req([base, ...fake]));
   assert.equal(ok.err, undefined, ok.err?.message);
   const express = () => db.table('invoice_lines').filter((l) => l.kind.startsWith('express_'));
-  assert.deepEqual(express().map((l) => [l.kind, l.customer_amount]).sort(), [['express_shipping', 800], ['express_stitching', 1500]]);
-  assert.equal(db.table('invoices')[0].total_pkr, 3300);
+  // the old saved fast-shipping price (800) is ignored: only the priority stitching line is added
+  assert.deepEqual(express().map((l) => [l.kind, l.customer_amount]), [['express_stitching', 1500]]);
+  assert.equal(db.table('invoices')[0].total_pkr, 2500);
   // saving again (regenerating) does not add them twice
   await call(fin.saveInvoiceDraft, req([base]));
-  assert.equal(express().length, 2);
-  assert.equal(db.table('invoices')[0].total_pkr, 3300);
+  assert.equal(express().length, 1);
+  assert.equal(db.table('invoices')[0].total_pkr, 2500);
   // express switched off: the charges leave the payable total
   Object.assign(o, { express_stitching: false, express_stitching_price: null, express_shipping: false, express_shipping_price: null });
   await call(fin.saveInvoiceDraft, req([base]));

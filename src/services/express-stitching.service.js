@@ -1,8 +1,8 @@
 import { supabaseAdmin } from '../config/supabase.js';
 
 /**
- * Express stitching, decided by the admin in Settings > Express stitching (platform_settings 'express_stitching'):
- * whether customers can ask for it and how many days an express order takes.
+ * Priority stitching (stored as 'express_stitching'), decided by the admin in Settings > Priority & fast (platform_settings 'express_stitching'):
+ * whether customers can ask for it, how many days a priority order takes, and its price.
  */
 const DEFAULTS = { enabled: true, days: 5 };
 

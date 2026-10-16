@@ -3,6 +3,7 @@
  * orders, partly received orders, who may see what, and how scanning changes the numbers.
  *   npm run test:unit
  */
+import { expandPermissions } from '../src/config/permissions.js';
 import { test, mock, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createFakeDb } from './fake-supabase.mjs';
@@ -80,7 +81,7 @@ beforeEach(() => {
 const staff = (userId, staffType, permissions, over = {}) => ({
   userId,
   profile: { id: userId, full_name: `User ${userId}`, email: `${userId}@t.dev`, staff_type: staffType, partner_role: 'member', ...over },
-  access: { isAdmin: false, partnerId: P1, permissions: new Set(permissions) },
+  access: { isAdmin: false, partnerId: P1, permissions: new Set(expandPermissions(permissions)) },
 });
 const master1 = staff('u-m1', 'master', ['production.view', 'production.update']);
 const master2 = staff('u-m2', 'master', ['production.view', 'production.update']);

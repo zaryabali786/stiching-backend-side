@@ -231,7 +231,8 @@ export const syncReceiving = async (orderId, actorId) => {
         ? `Parcel received · ${units.length - issues} of ${units.length} units OK, ${issues} with an issue`
         : `Parcel received · all ${units.length} units OK`,
       actorId,
-      extra: { ...extra, received_at: new Date().toISOString() },
+      // an issue reported first already moved parcel_review on, so this branch must still stamp the arrival the customer's review waits for
+      extra: { ...extra, received_at: new Date().toISOString(), ...(order.parcel_received_at ? {} : { parcel_received_at: new Date().toISOString() }) },
     });
     await notifyUser(order.customer_id, {
       type: issues > 0 ? 'alert' : 'update',
@@ -257,10 +258,11 @@ export const syncOrderFromCards = async (orderId, actorId) => {
 
   const cards = unwrap(await supabaseAdmin.from('job_cards').select('stage, qc_passed, approval_status').eq('order_id', orderId));
   if (!cards.length) return order;
-  // an article the customer still has to approve (or has rejected / sent back) has no ticket yet: the order as a whole is
-  // not production-ready, so it stays at "received" while the other articles progress on their own tickets
-  const heldBack = unwrap(await supabaseAdmin.from('order_units').select('id, review_status, return_status').eq('order_id', orderId))
-    .some((u) => u.review_status === 'pending' || u.review_status === 'rejected' || (u.return_status && u.return_status !== 'none'));
+  // an article the customer still has to approve has no ticket yet: the order as a whole is not production-ready, so it stays at
+  // "received" while the other articles progress on their own tickets. An article the customer REJECTED (returned, held or sent back)
+  // carries on separately and never holds up the approved ones: they go on to the Warehouse together.
+  const heldBack = unwrap(await supabaseAdmin.from('order_units').select('id, review_status').eq('order_id', orderId))
+    .some((u) => u.review_status === 'pending');
 
   const minRank = Math.min(...cards.map((c) => STAGE_RANK[c.stage]));
   let target;

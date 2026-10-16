@@ -8,6 +8,7 @@ import {
   updateClientOrder,
   cancelClientOrder,
   deleteClientDraft,
+  confirmPaymentMethod,
   approveParcel,
   reviewArticle,
   returnArticle,
@@ -69,6 +70,7 @@ router.post('/orders/:id/units/:unitId/review', reviewArticle);
 router.post('/orders/:id/reject-parcel', rejectWholeParcel);
 router.post('/orders/:id/units/:unitId/return', returnArticle);
 router.post('/orders/:id/cancel', cancelClientOrder);
+router.post('/orders/:id/payment-method', confirmPaymentMethod);
 router.delete('/orders/:id', deleteClientDraft);
 router.get('/approvals', listPendingApprovals);
 router.post('/orders/:id/approve', approveClientOrder);

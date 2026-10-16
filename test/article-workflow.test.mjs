@@ -24,8 +24,8 @@ test('the stage is found from the person (staff type, team record, permissions);
   assert.deepEqual(resolveScanRole({ staffType: 'qa' }).stage, 'qc');
   assert.deepEqual(resolveScanRole({ staffType: 'pressing' }).stage, 'pressing');
   assert.deepEqual(resolveScanRole({ staffType: 'packing' }).stage, 'packed');
-  assert.equal(resolveScanRole({ staffType: 'master' }).permission, 'production.update');
-  assert.equal(resolveScanRole({ staffType: 'qa' }).permission, 'quality.update');
+  assert.equal(resolveScanRole({ staffType: 'master' }).permission, 'production.scan');
+  assert.equal(resolveScanRole({ staffType: 'qa' }).permission, 'quality.scan');
   // no manual choice: the stage comes from the person's own records
   assert.equal(resolveScanRole({ staffType: 'staff', memberRole: 'master' }).stage, 'cutting', 'a master on the board receives for cutting');
   assert.equal(resolveScanRole({ staffType: 'staff', memberRole: 'tailor' }).stage, 'stitching');
@@ -59,15 +59,17 @@ test('an article assigned to another master cannot be received by this one', () 
 
 test('stages cannot be skipped: the tailor needs the master first, QA the tailor, pressing needs QC passed, packing needs pressing', () => {
   assert.equal(checkReceive({ role: 'tailor', stage: 'stitching', card: card({ stage: 'to_assign' }), member: { id: 't1' } }).code, 'invalid_transition');
-  assert.equal(checkReceive({ role: 'tailor', stage: 'stitching', card: card({ stage: 'cutting', master_id: 'm1' }), member: { id: 't1' } }).ok, true);
+  assert.equal(checkReceive({ role: 'tailor', stage: 'stitching', card: card({ stage: 'cutting', master_id: 'm1', stage_done: { at: 'x' } }), member: { id: 't1' } }).ok, true);
+  assert.equal(checkReceive({ role: 'tailor', stage: 'stitching', card: card({ stage: 'cutting', master_id: 'm1' }), member: { id: 't1' } }).code, 'blocked', 'cutting has to be completed first');
+  assert.equal(checkReceive({ role: 'supervisor', stage: 'stitching', card: card({ stage: 'cutting', master_id: 'm1' }), member: null }).ok, true, 'owner / admin override');
   assert.equal(checkReceive({ role: 'qa', stage: 'qc', card: card({ stage: 'cutting' }), member: null }).code, 'invalid_transition');
-  assert.equal(checkReceive({ role: 'qa', stage: 'qc', card: card({ stage: 'stitching' }), member: null }).ok, true);
+  assert.equal(checkReceive({ role: 'qa', stage: 'qc', card: card({ stage: 'stitching', stage_done: { at: 'x' } }), member: null }).ok, true);
   const notPassed = checkReceive({ role: 'pressing', stage: 'pressing', card: card({ stage: 'qc', qc_passed: false }), member: null });
   assert.equal(notPassed.ok, false);
   assert.equal(notPassed.code, 'blocked');
-  assert.equal(checkReceive({ role: 'pressing', stage: 'pressing', card: card({ stage: 'qc', qc_passed: true }), member: null }).ok, true);
+  assert.equal(checkReceive({ role: 'pressing', stage: 'pressing', card: card({ stage: 'qc', qc_passed: true, stage_done: { at: 'x' } }), member: null }).ok, true);
   assert.equal(checkReceive({ role: 'packing', stage: 'packed', card: card({ stage: 'qc', qc_passed: true }), member: null }).code, 'invalid_transition', 'packing cannot jump over pressing');
-  assert.equal(checkReceive({ role: 'packing', stage: 'packed', card: card({ stage: 'pressing', qc_passed: true }), member: null }).ok, true);
+  assert.equal(checkReceive({ role: 'packing', stage: 'packed', card: card({ stage: 'pressing', qc_passed: true, stage_done: { at: 'x' } }), member: null }).ok, true);
 });
 
 test('an article waiting for the customer to approve its finished photos cannot move on', () => {
@@ -337,7 +339,7 @@ test('an article is classified for the stage of the person looking at it', () =>
   assert.equal(classifyForStage({ stage: 'cutting', card: c({ master_id: 'other' }), unit, role: 'master', member: { id: 'm1' } }).kind, 'assigned');
   assert.equal(classifyForStage({ stage: 'pressing', card: c({ stage: 'qc', qc_passed: false }), unit }).kind, 'not_ready');
   assert.equal(classifyForStage({ stage: 'cutting', card: null, unit: { review_status: 'pending' } }).kind, 'not_ready');
-  assert.equal(permissionForStage('qc'), 'quality.update');
+  assert.equal(permissionForStage('qc'), 'quality.scan');
 });
 
 test('five articles, three scanned: 3 of 5 received, 2 remaining, who received each', () => {
@@ -353,8 +355,11 @@ test('five articles, three scanned: 3 of 5 received, 2 remaining, who received e
   assert.match(p.next_action, /Scan 2 more articles for Cutting/);
 
   // the tailor's view of the same order: three are waiting for them, two are not ready yet (the master has not received them)
+  // only articles the master completed (Scan to complete) can be taken: here the first two
+  cards[0].stage_done = { at: 'x' }; cards[1].stage_done = { at: 'x' };
   const t = progressFor({ order: { id: 'o', reference: 'SA-1' }, units, cards, receipts: [], stage: 'stitching', userId: 'tailor', member: null, role: 'tailor' });
-  assert.deepEqual(t.articles.map((a) => a.kind), ['awaiting', 'awaiting', 'awaiting', 'not_ready', 'not_ready']);
+  assert.deepEqual(t.articles.map((a) => a.kind), ['awaiting', 'awaiting', 'not_ready', 'not_ready', 'not_ready']);
+  assert.match(t.articles[2].reason, /not completed/i);
   assert.deepEqual([t.received, t.remaining], [0, 5]);
 });
 

@@ -16,11 +16,11 @@ export const PREVIOUS_STAGE = { cutting: 'to_assign', stitching: 'cutting', qc: 
 
 /** What each kind of staff member receives (scans). `permission` is the module permission they need. */
 export const SCAN_ROLES = {
-  master: { stage: 'cutting', permission: 'production.update', label: 'Master' },
-  tailor: { stage: 'stitching', permission: 'production.update', label: 'Tailor' },
-  qa: { stage: 'qc', permission: 'quality.update', label: 'Quality check' },
-  pressing: { stage: 'pressing', permission: 'production.update', label: 'Pressing' },
-  packing: { stage: 'packed', permission: 'production.update', label: 'Packing' },
+  master: { stage: 'cutting', permission: 'production.scan', label: 'Master' },
+  tailor: { stage: 'stitching', permission: 'production.scan', label: 'Tailor' },
+  qa: { stage: 'qc', permission: 'quality.scan', label: 'Quality check' },
+  pressing: { stage: 'pressing', permission: 'production.scan', label: 'Pressing' },
+  packing: { stage: 'packed', permission: 'production.scan', label: 'Packing' },
 };
 export const STAFF_TYPES = ['master', 'tailor', 'qa', 'pressing', 'packing', 'staff'];
 
@@ -42,6 +42,30 @@ export const resolveScanRole = ({ staffType, memberRole, qualityOnly, isSupervis
   if (qualityOnly) return typed('qa');
   if (isSupervisor) return { ok: true, role: 'supervisor', stage: null, permission: null, supervisor: true };
   return { ok: false, message: 'Your account is not set up to receive articles. Ask the admin to give you a production role (master, tailor, quality check, pressing or packing).' };
+};
+
+/**
+ * May this person mark the article's CURRENT stage as finished (Scan to complete)?
+ * Master: cutting, tailor: stitching, QA: quality check, pressing: pressing. Packed is the last stage: nothing comes after it.
+ * Owners / admins ('supervisor') may complete any stage. Master / tailor only their own articles.
+ * @returns {{ ok: true, assign: object } | { ok: false, code: 'duplicate' | 'invalid_transition' | 'blocked' | 'forbidden', message: string }}
+ */
+export const checkComplete = ({ role, card, member, title = 'This article' }) => {
+  const stage = card.stage;
+  if (stage === 'to_assign') return { ok: false, code: 'invalid_transition', message: `${title} has not been received by a master yet. Use Scan to receive first.` };
+  if (stage === 'packed') return { ok: false, code: 'invalid_transition', message: `${title} is already packed. Packed is the last stage.` };
+  const mine = role === 'supervisor' ? stage : SCAN_ROLES[role]?.stage;
+  if (mine !== stage) return { ok: false, code: 'forbidden', message: `${title} is in ${STAGE_LABELS[stage]}. Only the ${STAGE_LABELS[stage]} person can complete it.` };
+  if (card.stage_done) return { ok: false, code: 'duplicate', message: `${title} is already completed in ${STAGE_LABELS[stage]}. Waiting for ${STAGE_LABELS[NEXT_STAGE[stage]]} to receive it.` };
+  if (card.approval_status === 'pending') return { ok: false, code: 'blocked', message: `${title} is waiting for the customer to approve its photos.` };
+  if (stage === 'qc' && !card.qc_passed) return { ok: false, code: 'blocked', message: `${title} has not passed quality check yet.` };
+  const assign = {};
+  if (role === 'master' || role === 'tailor') {
+    const column = role === 'master' ? 'master_id' : 'tailor_id';
+    if (card[column] && (!member || card[column] !== member.id)) return { ok: false, code: 'forbidden', message: `${title} is assigned to another ${role}.` };
+    if (!card[column] && member) assign[column] = member.id;
+  }
+  return { ok: true, assign };
 };
 
 /** The permission a stage needs (used for owners / admins, whose stage follows the article). */
@@ -66,6 +90,10 @@ export const checkReceive = ({ role, stage, card, member, title = 'This article'
   }
   if (stage === 'pressing' && !card.qc_passed) {
     return { ok: false, code: 'blocked', message: `${title} has not passed quality check yet.` };
+  }
+  // the stage before has to be finished (Scan to complete) before the next person may take the article; owners / admins may override
+  if (from !== 'to_assign' && role !== 'supervisor' && !card.stage_done) {
+    return { ok: false, code: 'blocked', message: `${title} is not completed in ${STAGE_LABELS[from]} yet. The ${STAGE_LABELS[from]} person must scan it to complete first.` };
   }
 
   const assign = {};
@@ -291,6 +319,7 @@ export const classifyForStage = ({ stage, card, unit, receipt, member, role }) =
   if (card.stage !== PREVIOUS_STAGE[stage]) return { kind: 'not_ready', reason: `Still in ${STAGE_LABELS[card.stage] || card.stage}` };
   if (card.approval_status === 'pending') return { kind: 'not_ready', reason: 'Waiting for the customer to approve the photos' };
   if (stage === 'pressing' && !card.qc_passed) return { kind: 'not_ready', reason: 'Quality check not passed yet' };
+  if (PREVIOUS_STAGE[stage] !== 'to_assign' && role !== 'supervisor' && !card.stage_done) return { kind: 'not_ready', reason: `${STAGE_LABELS[card.stage]} is not completed yet` };
   if (role === 'master' || role === 'tailor') {
     const column = role === 'master' ? 'master_id' : 'tailor_id';
     if (card[column] && (!member || card[column] !== member.id)) return { kind: 'assigned', reason: `Assigned to another ${role}` };

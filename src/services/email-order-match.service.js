@@ -171,6 +171,38 @@ export const applyShippingUpdate = async (order, extracted, { receivedAt }) => {
 export const isCod = (method) => /\b(cod|cash\s*(on|upon)\s*delivery)\b/i.test(String(method || ''));
 
 /**
+ * The payment method an order email states in its own words: a line such as "Payment method: Visa ending 4242". Only labelled lines
+ * count, so a footer ("we also offer cash on delivery"), a signature or a quoted older message never decides the payment.
+ * @returns {string|null}
+ */
+export const detectPaymentFromText = (text) => {
+  const lines = String(text || '').split(/\r?\n/);
+  const stop = lines.findIndex((l) => /^\s*(-- ?|_{5,}|sent from my |on .{5,80} wrote:)/i.test(l));
+  for (const raw of stop >= 0 ? lines.slice(0, stop) : lines) {
+    if (/^\s*>/.test(raw)) continue; // quoted earlier message
+    const m = /\bpayment\s*(?:method|type|mode|option)\s*[:\-]\s*([^\n|]{2,80})/i.exec(raw) || /\bpaid\s+(?:by|with|via)\s*[:\-]?\s*([^\n|.]{2,60})/i.exec(raw);
+    if (m) return m[1].replace(/\s+/g, ' ').trim().replace(/[.;,]+$/, '') || null;
+  }
+  return null;
+};
+
+/**
+ * Settle the payment method of a read email (mutates `extracted`). The method is the one the order itself states: what the reader found,
+ * or the labelled line of the text. When the two disagree about cash on delivery, nothing is guessed: the method stays unknown for the
+ * customer to review. Never marks anything as paid.
+ */
+export const reconcilePayment = (extracted, text) => {
+  const labelled = detectPaymentFromText(text);
+  const read = String(extracted.payment_method || '').trim() || null;
+  if (!read && labelled) extracted.payment_method = labelled.slice(0, 80);
+  else if (read && labelled && isCod(read) !== isCod(labelled)) {
+    extracted.payment_method = null;
+    extracted.payment_status = null;
+  }
+  return extracted;
+};
+
+/**
  * Save how the brand order was paid, as the email states it. A method already saved is kept (the first confirmation wins);
  * a "paid" status is never taken back by a later "pending", and nothing is saved when the email does not say.
  */
@@ -178,7 +210,8 @@ export const applyPaymentUpdate = async (order, extracted) => {
   const method = String(extracted?.payment_method ?? '').trim().slice(0, 80);
   const status = ['paid', 'pending'].includes(extracted?.payment_status) ? extracted.payment_status : null;
   const patch = {};
-  if (method && !order.brand_payment_method) patch.brand_payment_method = method;
+  // the first method stays, except that a confirmed non-COD method replaces COD (a later email can correct it)
+  if (method && (!order.brand_payment_method || (isCod(order.brand_payment_method) && !isCod(method)))) patch.brand_payment_method = method;
   if (status && order.brand_payment_status !== status && !(order.brand_payment_status === 'paid' && status === 'pending')) patch.brand_payment_status = status;
   if (!Object.keys(patch).length) return { changed: false };
   unwrap(await supabaseAdmin.from('orders').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', order.id));

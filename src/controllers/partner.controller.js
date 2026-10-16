@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError } from '../utils/error.helper.js';
-import { createUser, updateUser } from '../services/partner-users.service.js';
+import { createUser, updateUser, setMemberUser } from '../services/partner-users.service.js';
 import { UserModel } from '../models/user.model.js';
 import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
@@ -11,12 +11,13 @@ import { uploadDataUrls } from '../services/storage.service.js';
 import { STAGE_LABELS, articleGroup, groupReference } from '../services/unit-flow.service.js';
 import { resubmitCorrected, receiveCorrectedHold, requestIssueDecision } from '../services/unit-review.service.js';
 import { cnSlipsHtml } from '../services/cn-slip.service.js';
+import { loadOrderArticles, cnRemarks, orderListHtml } from '../services/order-list.service.js';
 import { parseWeight, saveUnitWeight, orderWeightInfo, syncOrderWeight } from '../services/weight.service.js';
-import { createReturnOrder, returnOrdersForUnits } from '../services/return-order.service.js';
+import { createReturnOrder, returnOrdersForUnits, adjustUnitCounts } from '../services/return-order.service.js';
 import { addOrderToTransfer } from '../services/transfer.service.js';
 import { postexConfigured, getOperationalCities, airwayBillPdf } from '../services/postex.service.js';
 import { syncPostexShipment, syncPostexReturn } from '../services/postex-tracking.service.js';
-import { bookDispatch, cancelDispatchBooking, createDispatchLoadsheet, markDownloaded, confirmDispatchHandover, recordDispatchTracking, confirmReturnedToPartner, dispatchEventsFor } from '../services/dispatch-shipment.service.js';
+import { bookDispatch, setDispatchCn, cancelDispatchBooking, createDispatchLoadsheet, markDownloaded, confirmDispatchHandover, recordDispatchTracking, confirmReturnedToPartner, dispatchEventsFor } from '../services/dispatch-shipment.service.js';
 import { bookReturn, cancelBooking, createLoadsheet, confirmHandover, loadsheetCsv, recordTracking, shipmentsForUnits } from '../services/return-shipment.service.js';
 import { notifyAdmins, notifyUser, notifyPartner } from '../services/notification.service.js';
 import { unreadConversationCount } from '../services/chat.service.js';
@@ -392,7 +393,7 @@ export const bookReturnCn = catchAsync(async (req, res) => {
 export const routeReturn = catchAsync(async (req, res) => {
   const destination = req.body?.destination;
   if (destination !== 'customer') throw new BadRequestError('A return goes to the Warehouse to be returned directly to the customer.');
-  if (!can(req.access, 'warehouse.update')) throw new ForbiddenError('You need the Warehouse permission to move a parcel there.');
+  if (!can(req.access, 'warehouse.book')) throw new ForbiddenError('You need the Warehouse permission to move a parcel there.');
   const unit = await loadUnit(req.params.unitId);
   const full = unwrapOne(await supabaseAdmin.from('order_units').select('*').eq('id', unit.id).maybeSingle(), 'Unit not found');
   const order = unwrapOne(await supabaseAdmin.from('orders').select('*').eq('id', unit.order.id).maybeSingle(), 'Order not found');
@@ -540,7 +541,6 @@ const syncLogin = async (member, patch) => {
   if (!member.user_id) return;
   const change = {};
   if (patch.is_active !== undefined) change.is_active = !!patch.is_active;
-  if (patch.name !== undefined) change.full_name = patch.name;
   if (!Object.keys(change).length) return;
   await supabaseAdmin.from('profiles').update({ ...change, updated_at: new Date().toISOString() }).eq('id', member.user_id);
   invalidateProfile(member.user_id);
@@ -555,6 +555,16 @@ export const createTeamMember = catchAsync(async (req, res) => {
   const login = req.body?.login;
   if (login && !can(req.access, 'users.create')) throw new ForbiddenError('You need the Users permission to create a login.');
   const created = unwrap(await supabaseAdmin.from('team_members').insert(row).select('*').single());
+  // the usual way: the person was added as a user first, and is linked here
+  if (req.body?.user_id) {
+    try {
+      await setMemberUser(created.partner_id, created.id, String(req.body.user_id));
+    } catch (err) {
+      await supabaseAdmin.from('team_members').delete().eq('id', created.id);
+      throw err;
+    }
+    return ApiResponse.created(res, { ...created, user_id: String(req.body.user_id) }, `${created.name} added and linked to their user.`);
+  }
   if (!login) return ApiResponse.created(res, created, `${created.name} added.`);
   try {
     const credential = await createLoginFor(req, created, login);
@@ -616,6 +626,10 @@ export const updateTeamMember = catchAsync(async (req, res) => {
     await assertMemberOfPartner(patch.master_id, current.partner_id, 'Master');
   }
   const updated = unwrap(await supabaseAdmin.from('team_members').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', req.params.id).select('*').single());
+  if (req.body?.user_id !== undefined) {
+    await setMemberUser(updated.partner_id, updated.id, req.body.user_id ? String(req.body.user_id) : null);
+    updated.user_id = req.body.user_id || null;
+  }
   await syncLogin(updated, patch);
   if (req.body?.login) await changeMemberLogin(req, updated, req.body.login);
   return ApiResponse.success(res, updated, `${updated.name} updated.`);
@@ -696,10 +710,10 @@ export const getPartnerWarehouse = catchAsync(async (req, res) => {
   if (result.error && /order_kind|return_destination|return_unit/.test(result.error.message || '')) result = await listQuery(WAREHOUSE_SELECT_BEFORE_0032);
   if (result.error && /booking_source|loadsheet_id|failure_reason|proof/.test(result.error.message || '')) result = await listQuery(WAREHOUSE_SELECT_BEFORE_0030);
 
-  const rows = unwrap(result).map((o) => ({
+  // the count follows the shipment: an article that was rejected or returned on its own is not counted here
+  const counted = await adjustUnitCounts(unwrap(result).map((o) => ({ ...o, units_count: o.units?.[0]?.count ?? 0, units: undefined, return_unit_id: one(o.return_unit)?.id ?? null })));
+  const rows = counted.map((o) => ({
     ...o,
-    units_count: o.units?.[0]?.count ?? 0,
-    units: undefined,
     invoice: one(o.invoice),
     return_unit: one(o.return_unit),
     shipment: one(o.shipment),
@@ -750,6 +764,59 @@ export const bookDispatchCn = catchAsync(async (req, res) => {
   return ApiResponse.success(res, shipment, shipment.booking_source === 'api' ? `Booked with ${shipment.courier}: CN ${shipment.tracking_number}. The parcel is ready for dispatch.` : `CN ${shipment.tracking_number} saved. The parcel is ready for dispatch.`);
 });
 
+/**
+ * POST /api/partner/warehouse/dispatch/bulk-book
+ * body: { order_ids, route: 'direct_dispatch'|'admin_warehouse', mode?: 'api'|'manual', courier?: 'PostEx' (api) | courier_id (manual) }
+ * Each paid order is handled on its own: one failing never stops the others. The answer lists every order's result.
+ *   direct_dispatch + api     the courier is booked through its API and the CN saved
+ *   direct_dispatch + manual  the courier is chosen, the CN is added later
+ *   admin_warehouse           no courier is booked: the orders join the open transfer to the admin warehouse
+ */
+export const bulkBookDispatch = catchAsync(async (req, res) => {
+  const ids = [...new Set((Array.isArray(req.body?.order_ids) ? req.body.order_ids : []).filter(Boolean))];
+  if (!ids.length) throw new BadRequestError('Select at least one order.');
+  if (ids.length > 50) throw new BadRequestError('Select up to 50 orders at a time.');
+  const route = req.body?.route;
+  if (!['direct_dispatch', 'admin_warehouse'].includes(route)) throw new BadRequestError('Choose Dispatch directly to customer or Send to admin warehouse.');
+  const mode = req.body?.mode === 'manual' ? 'manual' : 'api';
+  if (route === 'direct_dispatch') {
+    if (mode === 'api' && !String(req.body?.courier || '').trim()) throw new BadRequestError('Choose the courier to book with.');
+    if (mode === 'manual' && !req.body?.courier_id) throw new BadRequestError('Choose the courier for the manual booking.');
+  }
+  const can = partnerCanAccess(req);
+  const results = [];
+  for (const id of ids) {
+    const order = (await supabaseAdmin.from('orders').select('*').eq('id', id).maybeSingle()).data;
+    const ref = order?.reference || id;
+    try {
+      if (!order) throw new BadRequestError('Order not found.');
+      if (!can(order.partner_id)) throw new ForbiddenError('This order belongs to another partner.');
+      if (route === 'admin_warehouse') {
+        if (order.status !== 'paid' || order.partner_route) throw new BadRequestError('Only paid orders without a route can be sent.');
+        const transfer = await addOrderToTransfer({ order, userId: req.userId });
+        results.push({ order_id: id, reference: ref, ok: true, message: `Added to ${transfer.code}` });
+      } else if (mode === 'manual') {
+        await bookDispatch({ order, courierId: req.body.courier_id, cnPending: true, profile: req.profile });
+        results.push({ order_id: id, reference: ref, ok: true, message: 'Booked · CN to be added' });
+      } else {
+        const shipment = await bookDispatch({ order, courierName: req.body.courier, profile: req.profile });
+        results.push({ order_id: id, reference: ref, ok: true, message: `Booked · CN ${shipment.tracking_number}`, cn: shipment.tracking_number });
+      }
+    } catch (e) {
+      results.push({ order_id: id, reference: ref, ok: false, message: e?.message || 'Could not be booked.' });
+    }
+  }
+  const done = results.filter((r) => r.ok).length;
+  return ApiResponse.success(res, { results, done, failed: results.length - done }, done === results.length ? `${done} order${done === 1 ? '' : 's'} done.` : `${done} of ${results.length} done. See the list for the others.`);
+});
+
+/** POST /api/partner/warehouse/shipments/:shipmentId/cn  body: { cn_number } — the CN of a parcel booked by hand without one. */
+export const addDispatchCn = catchAsync(async (req, res) => {
+  const shipment = await shipmentWithAccess(req, req.params.shipmentId);
+  const saved = await setDispatchCn({ shipment, cn: req.body?.cn_number, profile: req.profile });
+  return ApiResponse.success(res, saved, `CN ${saved.tracking_number} saved.`);
+});
+
 export const cancelDispatchCn = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.id);
   const result = await cancelDispatchBooking({ order, profile: req.profile });
@@ -791,7 +858,7 @@ export const printDispatchCn = catchAsync(async (req, res) => {
   if (ids.length > 100) throw new BadRequestError('Print up to 100 parcels at a time.');
   const rows = unwrap(await supabaseAdmin.from('shipments').select('*').in('id', ids));
   if (rows.length !== ids.length) throw new BadRequestError('One of the selected parcels was not found.');
-  const orders = unwrap(await supabaseAdmin.from('orders').select('id, reference, partner_id, customer_name, customer_code, destination_address, destination_city, destination_country, destination_phone, weight_kg').in('id', rows.map((x) => x.order_id)));
+  const orders = unwrap(await supabaseAdmin.from('orders').select('id, reference, partner_id, order_kind, return_unit_id, brand, customer_name, customer_code, destination_address, destination_city, destination_country, destination_phone, weight_kg').in('id', rows.map((x) => x.order_id)));
   const orderOf = new Map(orders.map((o) => [o.id, o]));
   const scope = scopeOf(req.access);
   for (const s of rows) {
@@ -813,10 +880,31 @@ export const printDispatchCn = catchAsync(async (req, res) => {
     res.setHeader('Content-Disposition', `inline; filename="postex-cn-${rows.length}.pdf"`);
     return res.send(pdf);
   }
+  const articlesOf = await loadOrderArticles(orders);
   const html = cnSlipsHtml(rows.map((s) => {
     const o = orderOf.get(s.order_id) || {};
-    return { courier: s.courier || '', cn: s.tracking_number, order: o.reference, code: o.customer_code, customer: o.customer_name, phone: o.destination_phone, address: o.destination_address, city: [o.destination_city, o.destination_country].filter(Boolean).join(', '), weight: o.weight_kg };
+    return { remarks: cnRemarks(articlesOf.get(o.id)), courier: s.courier || '', cn: s.tracking_number, order: o.reference, code: o.customer_code, customer: o.customer_name, phone: o.destination_phone, address: o.destination_address, city: [o.destination_city, o.destination_country].filter(Boolean).join(', '), weight: o.weight_kg };
   }));
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.send(html);
+});
+
+/**
+ * GET /api/partner/warehouse/orders/list?order_ids=a,b,c — the order list for the warehouse team: every order with its QR code and its
+ * articles (code, name, quantity, brand, QR code). A printable HTML page.
+ */
+export const printOrderList = catchAsync(async (req, res) => {
+  const ids = [...new Set(String(req.query.order_ids || '').split(',').map((x) => x.trim()).filter(Boolean))];
+  if (!ids.length) throw new BadRequestError('Select at least one order.');
+  if (ids.length > 100) throw new BadRequestError('Select up to 100 orders at a time.');
+  const orders = unwrap(await supabaseAdmin.from('orders').select('id, reference, partner_id, order_kind, return_unit_id, brand, customer_name, customer_code, destination_city, destination_country, shipping_service, weight_kg, created_at').in('id', ids));
+  if (orders.length !== ids.length) throw new BadRequestError('One of the selected orders was not found.');
+  const can = partnerCanAccess(req);
+  if (orders.some((o) => !can(o.partner_id))) throw new ForbiddenError('One of the selected orders belongs to another partner.');
+  const articlesOf = await loadOrderArticles(orders);
+  const sorted = ids.map((id) => orders.find((o) => o.id === id));
+  const html = await orderListHtml(sorted.map((o) => ({ order: o, articles: articlesOf.get(o.id) || [] })));
+  res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.send(html);
 });
@@ -941,7 +1029,9 @@ export const getEarnings = catchAsync(async (req, res) => {
     query = query.or(ids.length ? `number.ilike.%${q.search}%,order_id.in.(${ids.join(',')})` : `number.ilike.%${q.search}%`);
   }
   const result = await query;
-  const rows = unwrap(result).map((r) => ({ ...r, order: r.order ? { ...r.order, units_count: r.order.units?.[0]?.count ?? 0, units: undefined } : null }));
+  const invoices = unwrap(result);
+  const adjusted = new Map((await adjustUnitCounts(invoices.filter((r) => r.order).map((r) => ({ ...r.order, units_count: r.order.units?.[0]?.count ?? 0, units: undefined })))).map((o) => [o.id, o]));
+  const rows = invoices.map((r) => ({ ...r, order: r.order ? adjusted.get(r.order.id) : null }));
   return sendPage(res, rows, q, result.count);
 });
 
@@ -953,7 +1043,7 @@ export const getPartnerOrders = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 10, sortable: ['created_at', 'due_date', 'reference', 'customer_name'], defaultSort: 'created_at' });
   const buildList = (logoSelect) => scoped(req.access, supabaseAdmin
     .from('orders')
-        .select(`id, reference, brand, created_at, due_date, customer_name, customer_code, status, order_kind${logoSelect}, units:order_units!order_units_order_id_fkey(count)`, { count: 'exact' })
+        .select(`id, reference, brand, created_at, due_date, customer_name, customer_code, status, order_kind, return_unit_id${logoSelect}, units:order_units!order_units_order_id_fkey(count)`, { count: 'exact' })
     .order(q.sort, { ascending: q.ascending, nullsFirst: false })
     .range(q.from, q.to));
   const listQuery = (logoSelect) => {
@@ -964,7 +1054,8 @@ export const getPartnerOrders = catchAsync(async (req, res) => {
   // the brand's logo comes with database update 0037: until then the list works without it
   let result = await listQuery(', brand_ref:brands!orders_brand_id_fkey(id, name, logo_url)');
   if (result.error && /logo_url|brand_ref|brands/.test(result.error.message || '')) result = await listQuery('');
-  const rows = unwrap(result);
+  // an article sent to the Warehouse counts on its return order, not on the original (same rule as the admin list)
+  const rows = (await adjustUnitCounts(unwrap(result).map((o) => ({ ...o, units_count: o.units?.[0]?.count ?? 0 })))).map(({ units_count, ...o }) => ({ ...o, units: [{ count: units_count }] }));
   const cards = rows.length ? unwrap(await supabaseAdmin.from('job_cards').select('order_id, stage').in('order_id', rows.map((o) => o.id))) : [];
   const stagesOf = new Map();
   for (const c of cards) {

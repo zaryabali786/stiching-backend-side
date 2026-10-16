@@ -1,5 +1,6 @@
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
+import { getAdminModules, createAdminUser, setAdminUserAccess, resetAdminUserPassword, listAdminRoles, createAdminRole, updateAdminRole, deleteAdminRole } from '../controllers/admin-users.controller.js';
 import {
   getAdminOverview,
   getAdminOrders,
@@ -51,6 +52,7 @@ import {
   deleteShippingRate,
   getAdminInvoices,
   getInvoiceBuilder,
+  getInvoiceFxRate,
   saveInvoiceDraft,
   issueInvoice,
   reopenInvoice,
@@ -95,6 +97,14 @@ router.post('/orders/:id/units/:unitId/resolve', inActivePartnerOrder(), resolve
 // Customers & users
 router.get('/customers', getAdminCustomers);
 router.get('/customers/:id', getAdminCustomer);
+router.get('/admin-modules', getAdminModules);
+router.get('/roles', listAdminRoles);
+router.post('/roles', createAdminRole);
+router.patch('/roles/:id', updateAdminRole);
+router.delete('/roles/:id', deleteAdminRole);
+router.post('/users', createAdminUser);
+router.patch('/users/:id/access', setAdminUserAccess);
+router.post('/users/:id/reset-password', resetAdminUserPassword);
 router.get('/users', getUsers);
 router.patch('/users/:id/role', setUserRole);
 router.patch('/users/:id/active', setUserActive);
@@ -167,6 +177,7 @@ router.delete('/banners/:id', deleteBanner);
 // Invoices
 router.get('/invoices', getAdminInvoices);
 router.post('/extra-costs/:id/decision', decideOrderExtra);
+router.get('/invoices/fx-rate', getInvoiceFxRate);
 router.get('/invoices/builder/:orderId', inActivePartnerOrder('orderId'), getInvoiceBuilder);
 router.put('/invoices/builder/:orderId', inActivePartnerOrder('orderId'), saveInvoiceDraft);
 router.post('/invoices/:id/issue', issueInvoice);

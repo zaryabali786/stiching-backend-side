@@ -28,8 +28,9 @@ export const parseWeight = (value) => {
 export const orderWeightInfo = async (order) => {
   const unitQuery = order.order_kind === 'return' && order.return_unit_id
     ? supabaseAdmin.from('order_units').select('id, code, unit_title, line_no, weight_kg').eq('id', order.return_unit_id)
-    : supabaseAdmin.from('order_units').select('id, code, unit_title, line_no, weight_kg').eq('order_id', order.id);
-  const units = (unwrap(await unitQuery) || []).sort((a, b) => (a.line_no || 0) - (b.line_no || 0));
+    : supabaseAdmin.from('order_units').select('id, code, unit_title, line_no, weight_kg, review_status').eq('order_id', order.id);
+  // an article the customer rejected leaves on its own (return / hold): it is not part of this order's shipment
+  const units = (unwrap(await unitQuery) || []).filter((u) => u.review_status !== 'rejected').sort((a, b) => (a.line_no || 0) - (b.line_no || 0));
   const missing = units.filter((u) => !(Number(u.weight_kg) > 0)).map((u) => ({ id: u.id, title: u.unit_title, code: u.code || null }));
   const weighed = units.length - missing.length;
   if (units.length && !missing.length) {

@@ -99,6 +99,30 @@ export const createReturnOrder = async ({ order, unit, destination, profile }) =
   return created;
 };
 
+/**
+ * Once an article is routed to the Warehouse it belongs to its return order in the admin / partner screens:
+ * it leaves the original order's article list and shows on the return order instead. (The article row itself stays on
+ * the original order, so the customer's review and return tracking keep working.)
+ * @returns {Promise<Set<string>>} the ids of the given articles that have a live return order
+ */
+export const routedUnitIds = async (unitIds) => {
+  if (!unitIds.length) return new Set();
+  const rows = unwrap(await supabaseAdmin.from('orders').select('return_unit_id').in('return_unit_id', unitIds).neq('status', 'cancelled'));
+  return new Set(rows.map((r) => r.return_unit_id));
+};
+
+/** Article counts for a page of orders: a routed article counts on its return order, not on the original. */
+export const adjustUnitCounts = async (orders) => {
+  const ids = orders.map((o) => o.id);
+  if (!ids.length) return orders;
+  const units = unwrap(await supabaseAdmin.from('order_units').select('id, order_id, review_status').in('order_id', ids));
+  const routed = await routedUnitIds(units.map((u) => u.id));
+  // an article the customer rejected, or that already left on its own return order, is not part of the order's shipment any more
+  const routedPer = new Map();
+  for (const u of units) if (routed.has(u.id) || u.review_status === 'rejected') routedPer.set(u.order_id, (routedPer.get(u.order_id) || 0) + 1);
+  return orders.map((o) => (o.order_kind === 'return' && o.return_unit_id ? { ...o, units_count: 1 } : { ...o, units_count: Math.max(0, o.units_count - (routedPer.get(o.id) || 0)) }));
+};
+
 /** The return orders of some articles, for the partner's Receiving list. */
 export const returnOrdersForUnits = async (unitIds) => {
   if (!unitIds.length) return new Map();

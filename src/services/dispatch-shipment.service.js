@@ -5,6 +5,7 @@ import { notifyUser } from './notification.service.js';
 import { addEvent, setOrderStatus } from './order.service.js';
 import { resolveCourier } from './courier.service.js';
 import { obtainCn, cancelWithProvider } from './courier-provider.service.js';
+import { loadOrderArticles, cnRemarks } from './order-list.service.js';
 import { loadsheetCsv } from './return-shipment.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
 
@@ -65,18 +66,21 @@ const assertPaid = async (order) => {
  * Book the courier for a paid order and save its CN. The order becomes "Dispatching from partner" (direct dispatch) only after
  * the booking succeeded: a courier API error or a missing CN changes nothing.
  */
-export const bookDispatch = async ({ order, courierId, cn, manual = false, profile }) => {
+export const bookDispatch = async ({ order, courierId, courierName, cn, manual = false, cnPending = false, profile }) => {
   const existing = (await supabaseAdmin.from('shipments').select('*').eq('order_id', order.id).maybeSingle()).data;
   // a paid order not routed yet, or one whose earlier booking was cancelled (it stays "dispatching from partner" without a CN)
   const open = (order.status === 'paid' && !order.partner_route) || (order.status === 'partner_dispatch' && existing?.status === 'needs_label');
   if (!open) throw new BadRequestError(existing && existing.status !== 'needs_label' ? 'This parcel already has a booking.' : 'Only a paid order that has not been routed yet can be booked for dispatch.');
   await assertPaid(order);
-  const courier = await resolveCourier({ courier_id: courierId });
+  const courier = await resolveCourier({ courier_id: courierId, courier: courierName });
   const units = unwrap(await supabaseAdmin.from('order_units').select('unit_title, quantity').eq('order_id', order.id));
   const itemsCount = units.reduce((n, u) => n + (Number(u.quantity) || 1), 0) || 1;
   const description = units.map((u) => u.unit_title).filter(Boolean).join(', ').slice(0, 180);
-  const booking = await obtainCn({ courier, manualCn: cn, forceManual: manual === true, parcel: { order, itemsCount, description } });
-  const { data: dup } = await supabaseAdmin.from('shipments').select('id').eq('courier_id', courier.id).ilike('tracking_number', booking.cn.replace(/[%_\\]/g, (c) => `\\${c}`)).neq('order_id', order.id).maybeSingle();
+  // the CN's remarks: "<article code> X <qty>", articles separated by a comma
+  const remarks = cnRemarks((await loadOrderArticles([order])).get(order.id)) || undefined;
+  // booked by hand without a CN yet: the courier is chosen now, the CN is added later (the parcel cannot go on a loadsheet before that)
+  const booking = cnPending ? { cn: null, source: 'manual', response: null } : await obtainCn({ courier, manualCn: cn, forceManual: manual === true, parcel: { order, itemsCount, description, notes: remarks } });
+  const { data: dup } = !booking.cn ? { data: null } : await supabaseAdmin.from('shipments').select('id').eq('courier_id', courier.id).ilike('tracking_number', booking.cn.replace(/[%_\\]/g, (c) => `\\${c}`)).neq('order_id', order.id).maybeSingle();
   if (dup) throw new ConflictError(`The CN ${booking.cn} is already used for another parcel with ${courier.name}.`);
 
   const now = new Date().toISOString();
@@ -92,9 +96,32 @@ export const bookDispatch = async ({ order, courierId, cn, manual = false, profi
     if (error.code === '23505') throw new ConflictError('That CN is already used, or this parcel is already booked.');
     throw error;
   }
-  await addShipmentEvent({ shipmentId: data.id, status: 'booked', note: `${courier.name} · CN ${booking.cn}`, source: booking.source === 'api' ? 'system' : 'manual', userId: profile.id });
-  if (order.status !== 'partner_dispatch') await setOrderStatus(order.id, 'partner_dispatch', { note: `Courier booked: ${courier.name} · CN ${booking.cn}`, actorId: profile.id, extra: { partner_route: 'direct_dispatch' } });
+  await addShipmentEvent({ shipmentId: data.id, status: 'booked', note: `${courier.name} · ${booking.cn ? `CN ${booking.cn}` : 'CN to be added'}`, source: booking.source === 'api' ? 'system' : 'manual', userId: profile.id });
+  if (order.status !== 'partner_dispatch') await setOrderStatus(order.id, 'partner_dispatch', { note: `Courier booked: ${courier.name} · ${booking.cn ? `CN ${booking.cn}` : 'CN to be added'}`, actorId: profile.id, extra: { partner_route: 'direct_dispatch' } });
   emitShipmentUpdate(order, data);
+  return data;
+};
+
+/**
+ * Add the CN of a parcel that was booked by hand without one. Only a manual booking still waiting for its CN can take it.
+ */
+export const setDispatchCn = async ({ shipment, cn, profile }) => {
+  if (shipment.status !== 'booked' || shipment.tracking_number) throw new BadRequestError('This parcel already has a CN, or it is not waiting for one.');
+  const clean = String(cn ?? '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  if (clean.length < 4) throw new BadRequestError('Enter the CN (consignment) number the courier gave for this parcel.');
+  const { data: dup } = await supabaseAdmin.from('shipments').select('id').eq('courier_id', shipment.courier_id).ilike('tracking_number', clean.replace(/[%_\\]/g, (c) => `\\${c}`)).neq('id', shipment.id).maybeSingle();
+  if (dup) throw new ConflictError(`The CN ${clean} is already used for another parcel with ${shipment.courier}.`);
+  const { data, error } = await supabaseAdmin.from('shipments').update({ tracking_number: clean, updated_at: new Date().toISOString() }).eq('id', shipment.id).eq('status', 'booked').is('tracking_number', null).select('*').single();
+  if (error) {
+    if (error.code === '23505') throw new ConflictError('That CN is already used for another parcel.');
+    throw error;
+  }
+  const order = await loadOrder(shipment.order_id);
+  await addShipmentEvent({ shipmentId: data.id, status: 'booked', note: `${shipment.courier} · CN ${clean}`, source: 'manual', userId: profile.id });
+  if (order) {
+    await addEvent(order.id, order.status, `CN added: ${shipment.courier} · ${clean}`, profile.id);
+    emitShipmentUpdate(order, data);
+  }
   return data;
 };
 
@@ -137,6 +164,7 @@ export const createDispatchLoadsheet = async ({ shipmentIds, profile, canAccess 
   for (const s of shipments) {
     if (canAccess && !canAccess(s.order?.partner_id)) throw new ForbiddenError('One of the selected parcels belongs to another partner.');
     if (!['booked', 'labelled'].includes(s.status)) throw new BadRequestError(`${s.order?.reference || 'A parcel'} is not ready for dispatch (${DISPATCH_LABELS[s.status] || s.status}).`);
+    if (!s.tracking_number) throw new BadRequestError(`${s.order?.reference || 'A parcel'} has no CN yet. Add its CN number first.`);
     if (!String(s.tracking_number || '').trim() || !s.courier_id) throw new BadRequestError(`${s.order?.reference || 'A parcel'} has no valid CN.`);
   }
   if (new Set(shipments.map((s) => s.courier_id)).size > 1) throw new BadRequestError('A loadsheet is for one courier. Select parcels of the same courier.');

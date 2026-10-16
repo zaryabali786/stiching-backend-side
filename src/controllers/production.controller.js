@@ -5,7 +5,7 @@ import { parseListQuery, sanitizeSearch, ilikeAny, sendPage } from '../utils/pag
 import { unwrap, unwrapOne, todayISO } from '../utils/db.js';
 import { syncOrderFromCards, setOrderStatus, getOrderOr404, addEvent, articleDisplayStatus, STATUS_LABELS } from '../services/order.service.js';
 import { scoped, scopeOf, assertMemberOfPartner, can } from '../services/access.service.js';
-import { STAGES, STAGE_RANK, STAGE_LABELS, PREVIOUS_STAGE, NEXT_STAGE, SCAN_ROLES, resolveScanRole, permissionForStage, checkReceive, progressFor, articleState, ARTICLE_STATE_LABELS } from '../services/unit-flow.service.js';
+import { STAGES, STAGE_RANK, STAGE_LABELS, PREVIOUS_STAGE, NEXT_STAGE, SCAN_ROLES, resolveScanRole, permissionForStage, checkReceive, checkComplete, progressFor, articleState, ARTICLE_STATE_LABELS } from '../services/unit-flow.service.js';
 import { emitUnitUpdate } from '../services/unit-review.service.js';
 import { buildMasterTracking } from '../services/master-tracking.service.js';
 import { suggestAssignees } from '../services/team.service.js';
@@ -14,6 +14,7 @@ import { notifyUser } from '../services/notification.service.js';
 import { withSizeSnapshot } from '../utils/measurements.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
 import { logUnitEvent } from '../services/order.service.js';
+import { attachStageDone, markStageDone, clearStageDone } from '../services/stage-done.service.js';
 
 export { STAGES };
 const GAP = 1024;
@@ -22,7 +23,7 @@ const CARD_SELECT = `
   *,
   master:team_members!job_cards_master_id_fkey(id, name),
   tailor:team_members!job_cards_tailor_id_fkey(id, name),
-  unit:order_units!job_cards_unit_id_fkey(id, line_no, unit_title, stitching_type, notes, product_link, quantity, design, reference_images, received_at, notes_audio, issue_audio, size_snapshot, size_chart:size_charts(id, name, person_name, variation, nearest_size, measurements, fit_feedback, notes, notes_audio)),
+  unit:order_units!job_cards_unit_id_fkey(id, code, line_no, unit_title, stitching_type, notes, product_link, product_image_url, quantity, design, reference_images, received_at, notes_audio, issue_audio, size_snapshot, size_chart:size_charts(id, name, person_name, variation, nearest_size, measurements, fit_feedback, notes, notes_audio)),
   order:orders!job_cards_order_id_fkey(id, reference, import_source, brand, customer_id, customer_name, customer_code, destination_country, destination_city, destination_address, destination_phone, status, priority, due_date, received_at, paid_at, change_request, change_request_audio, customer_notes, approval_photos, created_at),
   comments:job_card_comments(count)
 `;
@@ -88,7 +89,7 @@ const fetchColumn = async (stage, src, limit) => {
   if (cursor) query = query.or(`position.gt.${cursor.position},and(position.eq.${cursor.position},id.gt.${cursor.id})`);
 
   const result = await query;
-  const rows = unwrap(result, 'Could not load production cards').map(shapeCard);
+  const rows = (await attachStageDone(unwrap(result, 'Could not load production cards'))).map(shapeCard);
   return {
     stage,
     label: STAGE_LABELS[stage],
@@ -127,8 +128,10 @@ export const getColumnPage = catchAsync(async (req, res) => {
   return ApiResponse.success(res, await fetchColumn(stage, { ...req.query, scopePartner: scopeOf(req.access) }, limit));
 });
 
-const getCard = async (id) =>
-  shapeCard(unwrapOne(await supabaseAdmin.from('job_cards').select(CARD_SELECT).eq('id', id).maybeSingle(), 'Card not found'));
+const getCard = async (id) => {
+  const [card] = await attachStageDone([unwrapOne(await supabaseAdmin.from('job_cards').select(CARD_SELECT).eq('id', id).maybeSingle(), 'Card not found')]);
+  return shapeCard(card);
+};
 
 const logActivity = async (cardId, req, body, kind = 'activity', audio = null) => {
   await supabaseAdmin.from('job_card_comments').insert({
@@ -268,6 +271,7 @@ export const moveCard = catchAsync(async (req, res) => {
   }
 
   unwrap(await supabaseAdmin.from('job_cards').update(patch).eq('id', card.id), 'Could not move card');
+  if (stage !== card.stage) await clearStageDone(card.id);
   for (const n of notes) await logActivity(card.id, req, n);
   if (stage !== card.stage) await logUnitEvent(card.unit_id, card.order_id, stage, { actorId: req.userId });
 
@@ -345,6 +349,7 @@ export const assignCard = catchAsync(async (req, res) => {
     cutting_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }).eq('id', card.id));
+  await clearStageDone(card.id);
   await logActivity(card.id, req, `Assigned to Master ${master.name} · moved to Cutting`);
   await logUnitEvent(card.unit_id, card.order_id, 'cutting', { actorId: req.userId });
   const order = await syncOrderFromCards(card.order_id, req.userId);
@@ -378,7 +383,7 @@ export const scanCards = catchAsync(async (req, res) => {
   // an article's own QR code (SA-1001-1) finds that article's card
   const article = (await supabaseAdmin.from('order_units').select('id').ilike('code', code).limit(1).maybeSingle()).data;
   if (article) {
-    const one = unwrap(await scoped(req.access, supabaseAdmin.from('job_cards').select(CARD_SELECT).eq('unit_id', article.id).limit(1))).map(shapeCard);
+    const one = (await attachStageDone(unwrap(await scoped(req.access, supabaseAdmin.from('job_cards').select(CARD_SELECT).eq('unit_id', article.id).limit(1))))).map(shapeCard);
     return ApiResponse.success(res, one, one.length ? 'Job card found.' : 'That article has no job card yet (it is not released to production).');
   }
   const rows = unwrap(
@@ -414,7 +419,7 @@ const teamMemberOf = async (userId, partnerId) => {
 const scanRoleFor = async (req) => {
   const supervisor = req.access.isAdmin || req.profile.partner_role === 'owner';
   const member = await teamMemberOf(req.userId, req.access.partnerId || null);
-  const qualityOnly = can(req.access, 'quality.update') && !can(req.access, 'production.update') && !req.access.isAdmin;
+  const qualityOnly = can(req.access, 'quality.scan') && !can(req.access, 'production.scan') && !req.access.isAdmin;
   const r = resolveScanRole({ staffType: req.profile.staff_type, memberRole: member?.role, qualityOnly, isSupervisor: supervisor });
   if (!r.ok) throw new ForbiddenError(r.message);
   if (r.permission && !can(req.access, r.permission)) throw new ForbiddenError('You do not have permission to receive articles for your stage.');
@@ -430,6 +435,7 @@ const receivingProgress = async ({ orderIds, stage, userId, member, role }) => {
     supabaseAdmin.from('job_cards').select('id, unit_id, order_id, stage, qc_passed, approval_status, master_id, tailor_id').in('order_id', orderIds),
     supabaseAdmin.from('unit_stage_receipts').select('unit_id, order_id, stage, role, user_id, user_name, received_at').in('order_id', orderIds).eq('stage', stage).order('received_at'),
   ].map((p) => p.then((r) => unwrap(r))));
+  await attachStageDone(cards);
   return orders.map((o) => progressFor({
     order: o, stage, userId, member, role,
     units: units.filter((u) => u.order_id === o.id), cards: cards.filter((c) => c.order_id === o.id), receipts: receipts.filter((r) => r.order_id === o.id),
@@ -466,6 +472,7 @@ export const scanReceive = catchAsync(async (req, res) => {
     throw new BadRequestError(`${unit.code || unit.unit_title} ${why}.`);
   }
   if (!req.access.isAdmin && card.partner_id !== req.access.partnerId) throw new ForbiddenError('This article belongs to another partner.');
+  await attachStageDone([card]);
 
   // an owner / admin receives the article into the stage that follows the one it is in
   const stage = role.stage || NEXT_STAGE[card.stage];
@@ -495,6 +502,7 @@ export const scanReceive = catchAsync(async (req, res) => {
   const { data: moved, error } = await supabaseAdmin.from('job_cards').update(patch).eq('id', card.id).eq('stage', card.stage).select('id');
   if (error) throw error;
   if (!moved?.length) throw new ConflictError(`${unit.code || unit.unit_title} was just received by someone else.`);
+  await clearStageDone(card.id);
 
   const userName = req.profile.full_name || req.profile.email;
   const receipt = unwrap(await supabaseAdmin.from('unit_stage_receipts').insert({
@@ -515,6 +523,50 @@ export const scanReceive = catchAsync(async (req, res) => {
     res,
     { kind: 'article', card: await getCard(card.id), receipt, orderStatus: updatedOrder.status, stage, progress },
     `${unit.code || unit.unit_title} received for ${STAGE_LABELS[stage]}.${progress ? ` ${progress.received} of ${progress.total} received.` : ''}`,
+  );
+});
+
+/**
+ * POST /api/partner/production/scan-complete  body: { code }
+ * The person who holds the article scans it again when their work is finished. This only marks the stage as completed
+ * (who and when are saved and written to the Activity); the article stays where it is until the next person scans it to
+ * receive. Master: cutting, tailor: stitching, QA: quality check, pressing: pressing. Owners / admins may complete any stage.
+ */
+export const scanComplete = catchAsync(async (req, res) => {
+  const code = String(req.body?.code || '').trim().slice(0, 80);
+  if (!code) throw new BadRequestError('Scan an article QR code or type its code.');
+  const role = await scanRoleFor(req);
+
+  const unit = (await supabaseAdmin.from('order_units').select('id, code, unit_title, order_id').ilike('code', code.replace(/[%_]/g, '\\$&')).limit(1).maybeSingle()).data;
+  if (!unit) throw new BadRequestError('No article has that code. Scan the QR code of one article.');
+  const card = (await supabaseAdmin.from('job_cards').select('*').eq('unit_id', unit.id).maybeSingle()).data;
+  if (!card) throw new BadRequestError(`${unit.code || unit.unit_title} is not in production yet.`);
+  if (!req.access.isAdmin && card.partner_id !== req.access.partnerId) throw new ForbiddenError('This article belongs to another partner.');
+  await attachStageDone([card]);
+
+  if (role.supervisor) {
+    const need = permissionForStage(card.stage);
+    if (need && !can(req.access, need)) throw new ForbiddenError('You do not have permission to complete that stage.');
+  }
+  const member = role.supervisor ? null : role.member || (await teamMemberOf(req.userId, card.partner_id));
+  const title = unit.code || unit.unit_title;
+  const verdict = checkComplete({ role: role.role, card, member, title });
+  if (!verdict.ok) {
+    if (verdict.code === 'duplicate' || verdict.code === 'invalid_transition') throw new ConflictError(verdict.message);
+    if (verdict.code === 'forbidden') throw new ForbiddenError(verdict.message);
+    throw new BadRequestError(verdict.message);
+  }
+
+  const userName = req.profile.full_name || req.profile.email;
+  const mark = await markStageDone(card, { userId: req.userId, name: userName });
+  if (Object.keys(verdict.assign).length) unwrap(await supabaseAdmin.from('job_cards').update({ ...verdict.assign, updated_at: mark.at }).eq('id', card.id));
+  await logActivity(card.id, req, `${STAGE_LABELS[card.stage]} completed by ${userName} (scan)`);
+  const [progress] = await receivingProgress({ orderIds: [card.order_id], stage: card.stage, userId: req.userId, member, role: role.role });
+  const next = NEXT_STAGE[card.stage];
+  return ApiResponse.success(
+    res,
+    { kind: 'complete', card: await getCard(card.id), stage: card.stage, done: mark, progress },
+    `${title} completed in ${STAGE_LABELS[card.stage]}. ${next ? `${STAGE_LABELS[next]} can receive it now.` : ''}`.trim(),
   );
 });
 

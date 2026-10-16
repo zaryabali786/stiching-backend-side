@@ -51,3 +51,12 @@ test('a saved shared customization with no price of its own shows the partner pr
   assert.equal(map.get(price.priceKey('Neckline', 'Round')), 700, 'the price is found');
   assert.equal(map.has(price.priceKey('Neckline', 'Square')), false, 'no price anywhere stays "on request", never 0');
 });
+
+test('an "Other" brand typed for an article is only text on that order and creates no brand', async () => {
+  const before = db.table('brands').length;
+  const refs = await input.resolveOrderRefs({ brand_text: '  Local   Boutique ', destination_country: 'Pakistan' });
+  assert.equal(refs.brand, 'Local Boutique');
+  assert.equal(refs.brand_id, null);
+  assert.equal(db.table('brands').length, before, 'the brand list is untouched');
+  await assert.rejects(() => input.resolveOrderRefs({ destination_country: 'Pakistan' }), /Choose the brand/);
+});

@@ -8,7 +8,7 @@ import { isDocumentType, uploadDocumentBuffer, withSignedUrl } from './storage.s
 import { notifyUser } from './notification.service.js';
 import { attachProductImages } from './email-images.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
-import { loadCourierNames, matchEmailToOrder, readShippingFromText, resolveEmailTarget, pickCourier } from './email-order-match.service.js';
+import { loadCourierNames, matchEmailToOrder, readShippingFromText, resolveEmailTarget, pickCourier, reconcilePayment } from './email-order-match.service.js';
 
 /**
  * Turns an uploaded brand invoice, a list of product links, or a forwarded brand email into an
@@ -567,7 +567,7 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
     try {
       extracted = await extractOrderWithAi(
         [{ type: 'text', text: bodyText }, ...readable],
-        'This is an email the customer forwarded after ordering from a clothing brand (it may contain the original message below a "Forwarded message" line, and may have an invoice attached). It is either an order confirmation or a later shipping / tracking update. Extract the original brand, its order number exactly as printed, currency, total, how it was paid (payment method and whether it is paid or pending, only if the email says so), the courier name and tracking number if shown, and every product line (none for a pure shipping update).'
+        'This is an email the customer forwarded after ordering from a clothing brand (it may contain the original message below a "Forwarded message" line, and may have an invoice attached). It is either an order confirmation or a later shipping / tracking update. Extract the original brand, its order number exactly as printed, currency, total, how it was paid (the payment method of this order and whether it is paid or pending, only if the order confirmation itself says so; ignore signatures, footers and older quoted messages), the courier name and tracking number if shown, and every product line (none for a pure shipping update).'
       );
       extractedBy = 'ai';
       if (!extracted.is_order) {
@@ -587,6 +587,9 @@ const processForwardedEmail = async (importId, userId, email, inboxId) => {
     extracted = basicEmailDraft(email, bodyText, await loadCourierNames().catch(() => []));
     error = 'We saved this email. Automatic product reading is not switched on yet — add the products by hand.';
   }
+
+  // the payment method is the one the order itself states (never inferred from a signature or an older message)
+  reconcilePayment(extracted, bodyText);
 
   // Is this about an order the customer already has? Then update that order instead of making another one.
   const target = await resolveEmailTarget(userId, extracted).catch((err) => {

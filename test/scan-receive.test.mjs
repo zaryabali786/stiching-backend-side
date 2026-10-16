@@ -3,6 +3,7 @@
  * roles, permissions, assignment, stage order, duplicates, per-article receipts and the real-time broadcast.
  *   npm run test:unit
  */
+import { expandPermissions } from '../src/config/permissions.js';
 import { test, mock, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createFakeDb } from './fake-supabase.mjs';
@@ -52,7 +53,7 @@ const receipts = (unitId) => db.table('unit_stage_receipts').filter((r) => r.uni
 const person = (userId, staffType, permissions, over = {}) => ({
   userId,
   profile: { id: userId, full_name: `User ${userId}`, email: `${userId}@t.dev`, staff_type: staffType, partner_role: 'member', ...over },
-  access: { isAdmin: false, partnerId: PARTNER, permissions: new Set(permissions) },
+  access: { isAdmin: false, partnerId: PARTNER, permissions: new Set(expandPermissions(permissions)) },
 });
 const master1 = person('u-master1', 'master', ['production.update', 'production.view']);
 const master2 = person('u-master2', 'master', ['production.update', 'production.view']);
@@ -67,6 +68,14 @@ const scan = (who, code, extra = {}) =>
     const req = { ...who, body: { code, ...extra }, query: {}, params: {} };
     const res = { status() { return this; }, json: (payload) => resolve({ ok: true, ...payload }) };
     controller.scanReceive(req, res, (err) => resolve({ ok: false, err }));
+  });
+
+/** Scan to complete: the holder of the article marks their stage finished. */
+const complete = (who, code) =>
+  new Promise((resolve) => {
+    const req = { ...who, body: { code }, query: {}, params: {} };
+    const res = { status() { return this; }, json: (payload) => resolve({ ok: true, ...payload }) };
+    controller.scanComplete(req, res, (err) => resolve({ ok: false, err }));
   });
 
 test('the master scans an article: it moves to Cutting, the receipt names who and when, everyone is told', async () => {
@@ -106,6 +115,7 @@ test('each article has its own receipt: three articles, three different people, 
   assert.equal(card(2).stage, 'cutting');
   assert.equal(card(3).stage, 'to_assign', 'article 3 is still waiting');
 
+  assert.equal((await complete(master1, 'SA-3001-1')).ok, true);
   assert.equal((await scan(tailor, 'SA-3001-1')).ok, true);
   assert.equal(card(1).stage, 'stitching');
   assert.equal(card(1).tailor_id, 't1');
@@ -133,7 +143,9 @@ test('stages cannot be skipped and the wrong person is refused', async () => {
 
 test('QA, pressing and packing follow in order; pressing needs QC passed', async () => {
   await scan(master1, 'SA-3001-1');
+  await complete(master1, 'SA-3001-1');
   await scan(tailor, 'SA-3001-1');
+  await complete(tailor, 'SA-3001-1');
   assert.equal((await scan(qa, 'SA-3001-1')).ok, true);
   assert.equal(card(1).stage, 'qc');
 
@@ -143,8 +155,11 @@ test('QA, pressing and packing follow in order; pressing needs QC passed', async
   assert.match(notPassed.err.message, /not passed quality check/i);
 
   card(1).qc_passed = true;
+  assert.equal((await scan(pressing, 'SA-3001-1')).err.statusCode, 400, 'quality check has to be completed first');
+  assert.equal((await complete(qa, 'SA-3001-1')).ok, true);
   assert.equal((await scan(pressing, 'SA-3001-1')).ok, true);
   assert.equal(card(1).stage, 'pressing');
+  await complete(pressing, 'SA-3001-1');
 
   const skip = await scan(packing, 'SA-3001-2'); // article 2 never got past to_assign
   assert.equal(skip.err.statusCode, 409);
@@ -265,16 +280,18 @@ test('articles of one order at different stages are tracked on their own, each p
   fiveArticles();
   await scan(master1, 'SA-3001-1');
   await scan(master1, 'SA-3001-2');
+  await complete(master1, 'SA-3001-1');
   await scan(tailor, 'SA-3001-1'); // article 1 moved on to stitching, article 2 is at cutting, 3-5 wait
 
   const masters = (await receivingList(master1)).data.orders[0];
   assert.deepEqual(masters.articles.map((a) => a.kind), ['done', 'received', 'awaiting', 'awaiting', 'awaiting'], 'article 1 is processed for the master, 2 is still with them');
   const tailors = (await receivingList(tailor)).data.orders[0];
   assert.equal(tailors.stage, 'stitching');
-  assert.deepEqual(tailors.articles.map((a) => a.kind), ['received', 'awaiting', 'not_ready', 'not_ready', 'not_ready']);
+  assert.deepEqual(tailors.articles.map((a) => a.kind), ['received', 'not_ready', 'not_ready', 'not_ready', 'not_ready'], 'article 2 is still being cut: the tailor cannot take it');
+  await complete(tailor, 'SA-3001-1');
   const qaView = await receivingList(qa);
   assert.equal(qaView.data.stage, 'qc');
-  assert.equal(qaView.data.orders.length, 1, 'article 1 is stitched, so quality check has one article waiting');
+  assert.equal(qaView.data.orders.length, 1, 'article 1 is stitched and completed, so quality check has one article waiting');
   assert.deepEqual(qaView.data.orders[0].articles.map((a) => a.kind), ['awaiting', 'not_ready', 'not_ready', 'not_ready', 'not_ready']);
 });
 
@@ -284,7 +301,9 @@ test('the stage comes from the person: a master on the board, a quality-only log
   assert.equal(card(1).stage, 'cutting');
   assert.equal(receipts('u1')[0].role, 'master');
 
+  await complete(boardMaster, 'SA-3001-1');
   await scan(tailor, 'SA-3001-1');
+  await complete(tailor, 'SA-3001-1');
   const qualityOnly = person('u-q', 'staff', ['quality.update', 'production.view']);
   assert.equal((await scan(qualityOnly, 'SA-3001-1')).ok, true);
   assert.equal(card(1).stage, 'qc');
@@ -292,4 +311,52 @@ test('the stage comes from the person: a master on the board, a quality-only log
 
   const nobody = person('u-nobody', 'staff', ['production.view']);
   assert.equal((await receivingList(nobody)).err.statusCode, 403);
+});
+
+// ───────────────────────── Scan to complete ─────────────────────────
+
+test('scan to complete: the stitching person cannot take an article until the master completed cutting', async () => {
+  await scan(master1, 'SA-3001-1');
+  const early = await scan(tailor, 'SA-3001-1');
+  assert.equal(early.ok, false);
+  assert.match(early.err.message, /not completed in Cutting/i);
+  assert.equal(card(1).stage, 'cutting');
+
+  const done = await complete(master1, 'SA-3001-1');
+  assert.equal(done.ok, true, done.err?.message);
+  assert.equal(card(1).stage, 'cutting', 'completing does not move the article, the next person receives it');
+  assert.ok(done.data.card.stage_done?.at, 'the card shows it is completed');
+  assert.match(db.table('job_card_comments').at(-1).body, /Cutting completed by User u-master1/);
+
+  assert.equal((await scan(tailor, 'SA-3001-1')).ok, true);
+  assert.equal(card(1).stage, 'stitching');
+  // entering the next stage clears the mark: the tailor has not completed anything yet
+  assert.equal((await scan(qa, 'SA-3001-1')).ok, false);
+});
+
+test('scan to complete is refused for the wrong person, twice, or before receiving', async () => {
+  assert.match((await complete(master1, 'SA-3001-1')).err.message, /not been received/i);
+  await scan(master1, 'SA-3001-1');
+  assert.equal((await complete(master2, 'SA-3001-1')).err.statusCode, 403, 'another master');
+  assert.equal((await complete(tailor, 'SA-3001-1')).err.statusCode, 403, 'the tailor does not complete cutting');
+  assert.equal((await complete(master1, 'SA-3001-1')).ok, true);
+  const again = await complete(master1, 'SA-3001-1');
+  assert.equal(again.err.statusCode, 409);
+  assert.match(again.err.message, /already completed/i);
+});
+
+test('quality check completes only after QC passed; an owner may complete and receive over the gate', async () => {
+  await scan(master1, 'SA-3001-1'); await complete(master1, 'SA-3001-1');
+  await scan(tailor, 'SA-3001-1'); await complete(tailor, 'SA-3001-1');
+  await scan(qa, 'SA-3001-1');
+  assert.match((await complete(qa, 'SA-3001-1')).err.message, /not passed quality check/i);
+  card(1).qc_passed = true;
+  assert.equal((await complete(qa, 'SA-3001-1')).ok, true);
+
+  const owner = person('u-owner', null, ['production.update', 'quality.update'], { partner_role: 'owner' });
+  await scan(master1, 'SA-3001-2'); // article 2 is in cutting and NOT completed
+  const over = await scan(owner, 'SA-3001-2');
+  assert.equal(over.ok, true, 'the owner moves it on without the completion');
+  assert.equal(card(2).stage, 'stitching');
+  assert.equal((await complete(owner, 'SA-3001-2')).ok, true, 'the owner completes any stage');
 });

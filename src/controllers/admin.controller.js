@@ -4,6 +4,7 @@ import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
 import { unwrap, unwrapOne, todayISO, startOfMonthISO, daysAgoISO, sum, round2 } from '../utils/db.js';
 import { STATUS_GROUPS, STATUS_LABELS, ORDER_STATUSES, setOrderStatus, addEvent, getOrderOr404, syncReceiving, articleDisplayStatus } from '../services/order.service.js';
 import { notifyUser } from '../services/notification.service.js';
+import { adminModulesOf, adminActionsOf, roleIdsOf } from '../config/admin-modules.js';
 import UserModel from '../models/user.model.js';
 import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { withSignedUrl } from '../services/storage.service.js';
@@ -12,6 +13,7 @@ import { signNoteAudio } from '../services/voice-note.service.js';
 import { logUnitEvent } from '../services/order.service.js';
 import { unreadConversationCount } from '../services/chat.service.js';
 import { activePartnerOf, inActivePartner } from '../services/access.service.js';
+import { routedUnitIds, adjustUnitCounts } from '../services/return-order.service.js';
 import { loadShipTo, saveShipTo } from '../services/ship-to.service.js';
 import { postexSettingsView, savePostexSettings, getOperationalCities, listMerchantAddresses } from '../services/postex.service.js';
 import { loadExpressStitching, saveExpressStitching } from '../services/express-stitching.service.js';
@@ -115,6 +117,8 @@ export const getAdminOverview = catchAsync(async (req, res) => {
 
 // ─────────────────────────────── Orders ───────────────────────────────
 
+const ADMIN_UNIT_DETAIL = '*, size_chart:size_charts(id, name, person_name, variation, nearest_size, measurements, notes, notes_audio), picks:order_unit_articles(type:article_types(id, name, sort_order), article:articles(id, name, image_url, customer_price, partner_cost))';
+
 const ADMIN_ORDER_DETAIL = `
   *,
   customer:profiles!orders_customer_id_fkey(id, full_name, email, phone, customer_code, country, city, address),
@@ -146,7 +150,7 @@ export const getAdminOrders = catchAsync(async (req, res) => {
   let query = scope(
     supabaseAdmin
       .from('orders')
-      .select('id, reference, brand, status, has_issue, priority, customer_name, customer_code, destination_city, destination_country, due_date, created_at, partner_id, partner:partners!orders_partner_id_fkey(id, name), units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
+      .select('id, reference, brand, status, order_kind, return_unit_id, has_issue, priority, customer_name, customer_code, destination_city, destination_country, due_date, created_at, partner_id, partner:partners!orders_partner_id_fkey(id, name), units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
   )
     .order(q.sort, { ascending: q.ascending, nullsFirst: false })
     .range(q.from, q.to);
@@ -171,7 +175,7 @@ export const getAdminOrders = catchAsync(async (req, res) => {
     countOrders().eq('status', 'cancelled'),
   ]);
 
-  const rows = unwrap(result).map((o) => ({ ...o, units_count: o.units?.[0]?.count ?? 0, units: undefined, status_label: STATUS_LABELS[o.status] }));
+  const rows = await adjustUnitCounts(unwrap(result).map((o) => ({ ...o, units_count: o.units?.[0]?.count ?? 0, units: undefined, status_label: STATUS_LABELS[o.status] })));
   const countMap = { all: counts[0].count || 0, draft: counts[counts.length - 3].count || 0, issues: counts[counts.length - 2].count || 0, cancelled: counts[counts.length - 1].count || 0 };
   groups.forEach((g, i) => (countMap[g] = counts[i + 1].count || 0));
   return sendPage(res, rows, q, result.count, { counts: countMap });
@@ -179,10 +183,19 @@ export const getAdminOrders = catchAsync(async (req, res) => {
 
 export const getAdminOrder = catchAsync(async (req, res) => {
   const order = unwrapOne(await inActivePartner(req.access, supabaseAdmin.from('orders').select(ADMIN_ORDER_DETAIL).eq('id', req.params.id)).maybeSingle(), 'Order not found');
+  // an article sent to the Warehouse moves to its return order: it leaves this order's list and the return order lists it
+  let units = order.units || [];
+  if (order.order_kind === 'return' && order.return_unit_id) {
+    const own = (await supabaseAdmin.from('order_units').select(ADMIN_UNIT_DETAIL).eq('id', order.return_unit_id).maybeSingle()).data;
+    units = own ? [{ ...own, line_no: 1 }] : [];
+  } else {
+    const routed = await routedUnitIds(units.map((u) => u.id));
+    units = units.filter((u) => !routed.has(u.id));
+  }
   return ApiResponse.success(res, await signNoteAudio({
     ...order,
     status_label: STATUS_LABELS[order.status],
-    units: (order.units || [])
+    units: units
       .sort((a, b) => a.line_no - b.line_no)
       // admins also see the internal article price
       .map(({ picks, ...rawUnit }) => ({
@@ -234,7 +247,7 @@ export const updateAdminOrder = catchAsync(async (req, res) => {
   }
   if (b.express_days !== undefined && b.express_stitching !== false) {
     const days = b.express_days === null || b.express_days === '' ? null : Number(b.express_days);
-    if (days !== null && (!Number.isInteger(days) || days < 1 || days > 90)) throw new BadRequestError('Express days must be a whole number from 1 to 90.');
+    if (days !== null && (!Number.isInteger(days) || days < 1 || days > 90)) throw new BadRequestError('Priority days must be a whole number from 1 to 90.');
     patch.express_days = days;
     // the due date follows from the days the admin decided, unless they set a date themselves
     if (days !== null && b.due_date === undefined) {
@@ -374,16 +387,23 @@ export const getUsers = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 15, sortable: ['created_at', 'full_name', 'email', 'role'] });
   let query = supabaseAdmin
     .from('profiles')
-    .select('id, full_name, email, phone, role, customer_code, is_active, partner_id, partner_role, job_title, created_at, partner:partners!profiles_partner_id_fkey(id, name)', { count: 'exact' })
+    .select('id, full_name, email, phone, role, customer_code, is_active, partner_id, partner_role, job_title, permissions, created_at, partner:partners!profiles_partner_id_fkey(id, name)', { count: 'exact' })
     .order(q.sort, { ascending: q.ascending })
     .range(q.from, q.to);
   const role = req.query.role;
   if (role === 'staff') query = query.in('role', ['admin', 'partner_staff']);
   else if (['admin', 'partner_staff', 'customer'].includes(role)) query = query.eq('role', role);
-  if (q.search) query = query.or(ilikeAny(['full_name', 'email', 'customer_code', 'phone'], q.search));
+  if (q.search) query = query.or(ilikeAny(['full_name', 'email', 'customer_code', 'phone', 'job_title'], q.search));
 
   const result = await query;
-  return sendPage(res, unwrap(result), q, result.count);
+  // an admin row says how much of the admin portal that person may use (permissions of other roles are not sent on)
+  const rows = unwrap(result).map(({ permissions, ...u }) => {
+    if (u.role !== 'admin') return u;
+    const modules = adminModulesOf({ role: 'admin', permissions });
+    const actions = adminActionsOf({ role: 'admin', permissions });
+    return { ...u, admin_access: modules ? 'restricted' : 'full', admin_modules: modules, admin_actions: actions ? Object.fromEntries([...actions].map(([m, set]) => [m, [...set]])) : null, role_ids: roleIdsOf(permissions) };
+  });
+  return sendPage(res, rows, q, result.count);
 });
 
 /** The partner a Google sign-up created and then left behind (no users, team, orders or modules) is removed with its owner's promotion. */
@@ -532,7 +552,7 @@ export const setShipTo = catchAsync(async (req, res) => {
 });
 
 
-// ─────────────────────────────── Express stitching ───────────────────────────────
+// ─────────────────────────────── Priority stitching ───────────────────────────────
 
 /** GET /api/admin/settings/express-stitching -> { enabled, days } */
 export const getExpressStitching = catchAsync(async (req, res) => ApiResponse.success(res, await loadExpressStitching()));
@@ -543,22 +563,22 @@ export const setExpressStitching = catchAsync(async (req, res) => {
   const days = Number(b.days);
   if (!Number.isInteger(days) || days < 1 || days > 90) throw new BadRequestError('Days must be a whole number from 1 to 90.');
   const saved = await saveExpressStitching(b, req.userId);
-  return ApiResponse.success(res, saved, 'Express stitching saved. Customers now see it when they create an order.');
+  return ApiResponse.success(res, saved, 'Priority stitching saved. Customers now see it when they create an order.');
 });
 
 
-// ─────────────────────────────── Express shipping ───────────────────────────────
+// ─────────────────────────────── Fast shipping ───────────────────────────────
 
 /** GET /api/admin/settings/express-shipping -> { enabled, days } */
 export const getExpressShipping = catchAsync(async (req, res) => ApiResponse.success(res, await loadExpressShipping()));
 
-/** PUT /api/admin/settings/express-shipping  body: { enabled, days } */
+/** PUT /api/admin/settings/express-shipping  body: { enabled, days }: Fast shipping has no price */
 export const setExpressShipping = catchAsync(async (req, res) => {
   const b = req.body || {};
   const days = Number(b.days);
   if (!Number.isInteger(days) || days < 1 || days > 90) throw new BadRequestError('Days must be a whole number from 1 to 90.');
   const saved = await saveExpressShipping(b, req.userId);
-  return ApiResponse.success(res, saved, 'Express shipping saved. Customers now see it when they create an order.');
+  return ApiResponse.success(res, saved, 'Fast shipping saved. Customers now see it when they create an order.');
 });
 
 

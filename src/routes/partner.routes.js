@@ -31,6 +31,9 @@ import {
   setOrderWeight,
   setDispatchRoute,
   bookDispatchCn,
+  bulkBookDispatch,
+  addDispatchCn,
+  printOrderList,
   cancelDispatchCn,
   createDispatchSheet,
   markDispatchSheetDownloaded,
@@ -68,6 +71,7 @@ import {
   packOrder,
   sendOrderToPressing,
   scanReceive,
+  scanComplete,
   getProductionReceiving,
   getMasterTracking,
   getProductionOrders,
@@ -86,7 +90,7 @@ import {
 import { requirePermission as need, requireAnyPermission as needAny } from '../middlewares/auth.middleware.js';
 import { getOrderExtras, addOrderExtra, editOrderExtra, removeOrderExtra } from '../controllers/extra-costs.controller.js';
 import { ownsOrder, ownsUnit, ownsCard, ownsMember, ownsTransfer, ownsParcel } from '../middlewares/ownership.middleware.js';
-import { listPartnerUsers, createPartnerUser, updatePartnerUser, resetPartnerUserPassword, deactivatePartnerUser, getPartnerAccess } from '../controllers/partner-users.controller.js';
+import { listPartnerUsers, createPartnerUser, updatePartnerUser, resetPartnerUserPassword, deactivatePartnerUser, getPartnerAccess, listTaggableTeamMembers, listTaggableUsers, listPartnerRoles, createPartnerRole, updatePartnerRole, deletePartnerRole } from '../controllers/partner-users.controller.js';
 
 const router = Router();
 
@@ -101,30 +105,31 @@ router.get('/badges', getPartnerBadges); // counts only the modules the caller m
 
 // Receiving
 router.get('/receiving', need('receiving.view'), getReceiving);
-router.post('/receiving/units/:unitId/weight', need('receiving.update'), ownsUnit('unitId'), setUnitWeight);
-router.post('/receiving/units/:unitId/receive', need('receiving.update'), ownsUnit('unitId'), receiveUnit);
-router.post('/receiving/units/:unitId/receive-corrected', need('receiving.update'), ownsUnit('unitId'), receiveCorrectedArticle);
-router.post('/receiving/units/:unitId/issue', need('receiving.update'), ownsUnit('unitId'), reportUnitIssue);
-router.post('/receiving/orders/:orderId/receive-all', need('receiving.update'), ownsOrder('orderId'), receiveAllUnits);
-router.post('/receiving/orders/:orderId/parcel-media', need('receiving.update'), ownsOrder('orderId'), addParcelMedia);
+router.post('/receiving/units/:unitId/weight', need('receiving.receive'), ownsUnit('unitId'), setUnitWeight);
+router.post('/receiving/units/:unitId/receive', need('receiving.receive'), ownsUnit('unitId'), receiveUnit);
+router.post('/receiving/units/:unitId/receive-corrected', need('receiving.returns'), ownsUnit('unitId'), receiveCorrectedArticle);
+router.post('/receiving/units/:unitId/issue', need('receiving.issue'), ownsUnit('unitId'), reportUnitIssue);
+router.post('/receiving/orders/:orderId/receive-all', need('receiving.receive'), ownsOrder('orderId'), receiveAllUnits);
+router.post('/receiving/orders/:orderId/parcel-media', need('receiving.receive'), ownsOrder('orderId'), addParcelMedia);
 router.get('/receiving/unmatched', need('receiving.view'), getUnmatchedParcels);
 router.get('/receiving/elsewhere', need('receiving.view'), findParcelElsewhere);
-router.post('/receiving/units/:unitId/return/book', need('receiving.update'), ownsUnit('unitId'), bookReturnCn);
-router.post('/receiving/units/:unitId/return/route', need('receiving.update'), ownsUnit('unitId'), routeReturn);
-router.post('/receiving/units/:unitId/return/cancel', need('receiving.update'), ownsUnit('unitId'), cancelReturnBooking);
-router.post('/receiving/returns/loadsheet', need('receiving.update'), createReturnLoadsheet);
+router.post('/receiving/units/:unitId/return/book', need('receiving.returns'), ownsUnit('unitId'), bookReturnCn);
+router.post('/receiving/units/:unitId/return/route', need('receiving.returns'), ownsUnit('unitId'), routeReturn);
+router.post('/receiving/units/:unitId/return/cancel', need('receiving.returns'), ownsUnit('unitId'), cancelReturnBooking);
+router.post('/receiving/returns/loadsheet', need('receiving.returns'), createReturnLoadsheet);
 router.get('/receiving/returns/loadsheets/:id/download', need('receiving.view'), downloadReturnLoadsheet);
-router.post('/receiving/returns/loadsheets/:id/handed-over', need('receiving.update'), confirmReturnHandover);
+router.post('/receiving/returns/loadsheets/:id/handed-over', need('receiving.returns'), confirmReturnHandover);
 router.get('/receiving/couriers/api', need('receiving.view'), getApiCouriers);
-router.post('/receiving/returns/:shipmentId/refresh-tracking', need('receiving.update'), refreshReturnTracking);
-router.post('/receiving/returns/:shipmentId/tracking', need('receiving.update'), updateReturnTracking);
-router.post('/receiving/units/:unitId/sent-back', need('receiving.update'), ownsUnit('unitId'), sendArticleBack);
-router.post('/receiving/orders/:orderId/forward', need('receiving.update'), forwardParcel);
-router.post('/receiving/unmatched', need('receiving.update'), createUnmatchedParcel);
-router.patch('/receiving/unmatched/:id', need('receiving.update'), ownsParcel(), updateUnmatchedParcel);
+router.post('/receiving/returns/:shipmentId/refresh-tracking', need('receiving.returns'), refreshReturnTracking);
+router.post('/receiving/returns/:shipmentId/tracking', need('receiving.returns'), updateReturnTracking);
+router.post('/receiving/units/:unitId/sent-back', need('receiving.returns'), ownsUnit('unitId'), sendArticleBack);
+router.post('/receiving/orders/:orderId/forward', need('receiving.returns'), forwardParcel);
+router.post('/receiving/unmatched', need('receiving.unmatched'), createUnmatchedParcel);
+router.patch('/receiving/unmatched/:id', need('receiving.unmatched'), ownsParcel(), updateUnmatchedParcel);
 
 // Teams
 router.get('/teams', needAny('teams.view', 'production.view', 'receiving.view'), getTeams);
+router.get('/teams/users', need('teams.view'), listTaggableUsers);
 router.post('/teams/members', need('teams.update'), createTeamMember);
 router.post('/teams/members/:id/login', need('teams.update'), need('users.create'), ownsMember(), createMemberLogin);
 router.patch('/teams/members/:id', need('teams.update'), ownsMember(), updateTeamMember);
@@ -135,48 +140,52 @@ router.get('/production/board', need('production.view'), getBoard);
 router.get('/production/columns/:stage', need('production.view'), getColumnPage);
 router.get('/production/suggestions', needAny('production.view', 'receiving.view'), getSuggestions);
 router.get('/production/scan', need('production.view'), scanCards);
-router.post('/production/scan-receive', needAny('production.update', 'quality.update'), scanReceive);
+router.post('/production/scan-receive', needAny('production.scan', 'quality.scan'), scanReceive);
+router.post('/production/scan-complete', needAny('production.scan', 'quality.scan'), scanComplete);
 router.get('/production/receiving', needAny('production.view', 'quality.view'), getProductionReceiving);
 router.get('/production/master-tracking', needAny('production.view', 'teams.view'), getMasterTracking);
 router.get('/production/orders', need('production.view'), getProductionOrders);
 router.get('/production/orders/:orderId/extras', need('production.view'), ownsOrder('orderId'), getOrderExtras);
-router.post('/production/orders/:orderId/extras', need('production.update'), ownsOrder('orderId'), addOrderExtra);
-router.patch('/production/extras/:id', need('production.update'), editOrderExtra);
-router.delete('/production/extras/:id', need('production.update'), removeOrderExtra);
+router.post('/production/orders/:orderId/extras', need('production.extras'), ownsOrder('orderId'), addOrderExtra);
+router.patch('/production/extras/:id', need('production.extras'), editOrderExtra);
+router.delete('/production/extras/:id', need('production.extras'), removeOrderExtra);
 router.get('/production/cards/:id', need('production.view'), ownsCard(), getCardDetail);
-router.patch('/production/cards/:id', need('production.update'), ownsCard(), updateCard);
-router.put('/production/cards/:id/move', need('production.update'), ownsCard(), moveCard);
-router.post('/production/cards/:id/assign', need('production.update'), ownsCard(), assignCard);
-router.post('/production/cards/:id/comments', need('production.update'), ownsCard(), addComment);
-router.patch('/production/cards/:id/qc-checklist', needAny('production.update', 'quality.update'), ownsCard(), updateQcChecklist);
-router.post('/production/cards/:id/ask-customer', need('production.update'), ownsCard(), askCustomer);
+router.patch('/production/cards/:id', need('production.assign'), ownsCard(), updateCard);
+router.put('/production/cards/:id/move', need('production.move'), ownsCard(), moveCard);
+router.post('/production/cards/:id/assign', need('production.assign'), ownsCard(), assignCard);
+router.post('/production/cards/:id/comments', need('production.comment'), ownsCard(), addComment);
+router.patch('/production/cards/:id/qc-checklist', needAny('quality.pass', 'production.assign'), ownsCard(), updateQcChecklist);
+router.post('/production/cards/:id/ask-customer', need('production.comment'), ownsCard(), askCustomer);
 
 // Quality check
 router.get('/qc', need('quality.view'), getQcQueue);
-router.post('/qc/cards/:id/pass', need('quality.update'), ownsCard(), passQc);
-router.post('/qc/cards/:id/fail', need('quality.update'), ownsCard(), failQc);
-router.post('/qc/cards/:id/request-approval', need('quality.update'), ownsCard(), requestCardApproval);
-router.post('/qc/orders/:orderId/request-approval', need('quality.update'), ownsOrder('orderId'), requestCustomerApproval);
-router.post('/qc/orders/:orderId/pressing', need('quality.update'), ownsOrder('orderId'), sendOrderToPressing);
-router.post('/qc/orders/:orderId/pack', need('quality.update'), ownsOrder('orderId'), packOrder);
+router.post('/qc/cards/:id/pass', need('quality.pass'), ownsCard(), passQc);
+router.post('/qc/cards/:id/fail', need('quality.pass'), ownsCard(), failQc);
+router.post('/qc/cards/:id/request-approval', need('quality.approval'), ownsCard(), requestCardApproval);
+router.post('/qc/orders/:orderId/request-approval', need('quality.approval'), ownsOrder('orderId'), requestCustomerApproval);
+router.post('/qc/orders/:orderId/pressing', need('quality.pack'), ownsOrder('orderId'), sendOrderToPressing);
+router.post('/qc/orders/:orderId/pack', need('quality.pack'), ownsOrder('orderId'), packOrder);
 
 // Warehouse
 router.get('/warehouse', need('warehouse.view'), getPartnerWarehouse);
-router.post('/warehouse/orders/:id/weight', need('warehouse.update'), ownsOrder(), setOrderWeight);
-router.post('/warehouse/orders/:id/route', need('warehouse.update'), ownsOrder(), setDispatchRoute);
-router.post('/warehouse/orders/:id/book', need('warehouse.update'), ownsOrder(), bookDispatchCn);
-router.post('/warehouse/orders/:id/book/cancel', need('warehouse.update'), ownsOrder(), cancelDispatchCn);
-router.post('/warehouse/dispatch/loadsheet', need('warehouse.update'), createDispatchSheet);
+router.post('/warehouse/orders/:id/weight', need('warehouse.book'), ownsOrder(), setOrderWeight);
+router.post('/warehouse/orders/:id/route', need('warehouse.book'), ownsOrder(), setDispatchRoute);
+router.post('/warehouse/orders/:id/book', need('warehouse.book'), ownsOrder(), bookDispatchCn);
+router.get('/warehouse/orders/list', need('warehouse.view'), printOrderList);
+router.post('/warehouse/dispatch/bulk-book', need('warehouse.book'), bulkBookDispatch);
+router.post('/warehouse/shipments/:shipmentId/cn', need('warehouse.book'), addDispatchCn);
+router.post('/warehouse/orders/:id/book/cancel', need('warehouse.book'), ownsOrder(), cancelDispatchCn);
+router.post('/warehouse/dispatch/loadsheet', need('warehouse.loadsheet'), createDispatchSheet);
 router.get('/warehouse/loadsheets/:id/download', need('warehouse.view'), downloadReturnLoadsheet);
-router.post('/warehouse/dispatch/loadsheets/:id/downloaded', need('warehouse.update'), markDispatchSheetDownloaded);
-router.post('/warehouse/dispatch/loadsheets/:id/handed-over', need('warehouse.update'), confirmDispatchSheetHandover);
-router.post('/warehouse/shipments/:shipmentId/tracking', need('warehouse.update'), updateDispatchTracking);
+router.post('/warehouse/dispatch/loadsheets/:id/downloaded', need('warehouse.loadsheet'), markDispatchSheetDownloaded);
+router.post('/warehouse/dispatch/loadsheets/:id/handed-over', need('warehouse.loadsheet'), confirmDispatchSheetHandover);
+router.post('/warehouse/shipments/:shipmentId/tracking', need('warehouse.tracking'), updateDispatchTracking);
 router.get('/warehouse/cn/print', need('warehouse.view'), printDispatchCn);
 router.get('/warehouse/couriers/api', need('warehouse.view'), getApiCouriers);
-router.post('/warehouse/shipments/:shipmentId/refresh-tracking', need('warehouse.update'), refreshDispatchTracking);
-router.post('/warehouse/shipments/:shipmentId/received-back', need('warehouse.update'), confirmDispatchReturnReceived);
+router.post('/warehouse/shipments/:shipmentId/refresh-tracking', need('warehouse.tracking'), refreshDispatchTracking);
+router.post('/warehouse/shipments/:shipmentId/received-back', need('warehouse.tracking'), confirmDispatchReturnReceived);
 router.get('/warehouse/transfers', need('warehouse.view'), getTransfers);
-router.post('/warehouse/transfers/:id/dispatch', need('warehouse.update'), ownsTransfer(), dispatchTransfer);
+router.post('/warehouse/transfers/:id/dispatch', need('warehouse.transfer'), ownsTransfer(), dispatchTransfer);
 
 // Earnings
 router.get('/earnings/summary', need('earnings.view'), getEarningsSummary);
@@ -207,7 +216,7 @@ router.patch('/articles/:id', need('catalogue.update'), updateArticle);
 router.delete('/articles/:id', need('catalogue.update'), deleteArticle);
 
 // Voice recording for a note (job comment, QC note, receiving issue)
-router.post('/voice-upload', needAny('production.update', 'quality.update', 'receiving.update', 'messages.update'), uploadVoiceNote);
+router.post('/voice-upload', needAny('production.comment', 'production.assign', 'quality.pass', 'receiving.issue', 'messages.update'), uploadVoiceNote);
 
 // Customer conversations
 router.get('/conversations', need('messages.view'), getConversations);
@@ -221,6 +230,11 @@ router.post('/orders/:id/messages/read', need('messages.view'), ownsOrder(), rea
 
 // The partner's own users (each with their own login and permissions)
 router.get('/users', need('users.view'), listPartnerUsers);
+router.get('/users/team-members', need('users.view'), listTaggableTeamMembers);
+router.get('/roles', need('users.view'), listPartnerRoles);
+router.post('/roles', need('users.create'), createPartnerRole);
+router.patch('/roles/:id', need('users.update'), updatePartnerRole);
+router.delete('/roles/:id', need('users.update'), deletePartnerRole);
 router.post('/users', need('users.create'), createPartnerUser);
 router.patch('/users/:id', need('users.update'), updatePartnerUser);
 router.post('/users/:id/reset-password', need('users.update'), resetPartnerUserPassword);

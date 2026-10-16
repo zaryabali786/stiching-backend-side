@@ -5,6 +5,7 @@ import partnerRoutes from './partner.routes.js';
 import clientRoutes from './client.routes.js';
 import notificationRoutes from './notification.routes.js';
 import { authenticate, requireRole } from '../middlewares/auth.middleware.js';
+import { adminModuleGate, partnerPortalGateForAdmins } from '../middlewares/admin-modules.middleware.js';
 import { getPublicConfig } from '../controllers/auth.controller.js';
 import { getRedisStatus } from '../config/redis.js';
 import { inboundEmailWebhook } from '../controllers/order-import.controller.js';
@@ -46,7 +47,7 @@ const staffGate = (req, res, next) => {
   }
   next();
 };
-apiRouter.use('/partner', authenticate, requireRole('partner_staff', 'admin'), staffGate, partnerRoutes);
-apiRouter.use('/admin', authenticate, requireRole('admin'), staffGate, adminRoutes);
+apiRouter.use('/partner', authenticate, requireRole('partner_staff', 'admin'), staffGate, partnerPortalGateForAdmins, partnerRoutes);
+apiRouter.use('/admin', authenticate, requireRole('admin'), staffGate, adminModuleGate, adminRoutes);
 
 export default apiRouter;

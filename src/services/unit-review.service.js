@@ -126,7 +126,7 @@ export const cleanReturnShipping = (input) => {
 export const decideArticle = async ({ order, unit, decision, note, media, returnTo, action, shipping, profile }) => {
   const issue = hasOpenIssue(unit);
   // the customer decides after the whole parcel was received and checked, except for an article with a reported problem
-  if (!issue && order.parcel_received_at === null) throw new BadRequestError('We are still receiving your parcel. You can review it as soon as it is checked.');
+  if (!issue && !order.parcel_received_at && ['draft', 'submitted'].includes(order.status)) throw new BadRequestError('We are still receiving your parcel. You can review it as soon as it is checked.');
   if (unit.review_status !== 'pending') throw new BadRequestError(unit.review_status === 'approved' ? 'You already approved this article.' : 'This article is not waiting for your decision.');
   const now = new Date().toISOString();
 

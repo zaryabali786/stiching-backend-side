@@ -30,5 +30,6 @@ ${items.map((i) => `<section class="slip">
     <div>${esc(i.address)}</div><div class="v">${esc(i.city)}</div>
   </div>
   ${i.weight ? `<div class="k">Weight</div><div class="v">${esc(i.weight)} kg</div>` : ''}
+  ${i.remarks ? `<div class="k">Remarks</div><div class="v">${esc(i.remarks)}</div>` : ''}
 </section>`).join('\n')}
 </body></html>`;

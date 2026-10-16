@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../config/supabase.js';
-import { ALL_PERMISSIONS } from '../config/permissions.js';
+import { ALL_PERMISSIONS, expandPermissions } from '../config/permissions.js';
+import { adminModulesOf, adminActionsOf } from '../config/admin-modules.js';
 import { BadRequestError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 
 /**
@@ -40,14 +41,18 @@ export const loadPartner = async (partnerId) => {
 /** @returns {Promise<Access>} */
 export const resolveAccess = async (profile) => {
   if (!profile) return { isAdmin: false, partnerId: null, partner: null, permissions: new Set() };
-  if (profile.role === 'admin') return { isAdmin: true, partnerId: null, partner: null, permissions: new Set(ALL_PERMISSIONS) };
+  if (profile.role === 'admin') {
+    // adminModules: null for a full admin, otherwise the admin modules this restricted admin may use (checked in middlewares/admin-modules.middleware.js)
+    const modules = adminModulesOf(profile);
+    return { isAdmin: true, partnerId: null, partner: null, permissions: new Set(ALL_PERMISSIONS), adminModules: modules ? new Set(modules) : null, adminActions: adminActionsOf(profile) };
+  }
   if (profile.role !== 'partner_staff' || !profile.partner_id) return { isAdmin: false, partnerId: null, partner: null, permissions: new Set() };
 
   const partner = await loadPartner(profile.partner_id);
   if (!partner || partner.status !== 'active') return { isAdmin: false, partnerId: profile.partner_id, partner, permissions: new Set() };
 
-  const ceiling = new Set(partner.permissions || []);
-  const granted = profile.partner_role === 'owner' ? [...ceiling] : (profile.permissions || []).filter((p) => ceiling.has(p));
+  const ceiling = new Set(expandPermissions(partner.permissions || []));
+  const granted = profile.partner_role === 'owner' ? [...ceiling] : expandPermissions(profile.permissions || []).filter((p) => ceiling.has(p));
   return { isAdmin: false, partnerId: profile.partner_id, partner, permissions: new Set(granted.filter((p) => ALL_PERMISSIONS.includes(p))) };
 };
 
@@ -63,7 +68,8 @@ export const withActivePartner = async (access, headerValue) => {
   if (!access.isAdmin || !raw) return { ...access, activePartnerId: null, activePartner: null };
   if (!UUID.test(String(raw))) throw new BadRequestError('X-Partner-Id is not a valid partner id.');
   const partner = await loadPartner(String(raw));
-  if (!partner) throw new NotFoundError('The selected partner no longer exists.');
+  // a partner that was deleted while the admin still had it selected: carry on as "all partners" instead of failing every page
+  if (!partner) return { ...access, activePartnerId: null, activePartner: null };
   return { ...access, activePartnerId: partner.id, activePartner: partner };
 };
 
@@ -102,6 +108,8 @@ export const accessPayload = (profile, access) => ({
   partner_role: profile.partner_role || null,
   staff_type: profile.staff_type || null,
   permissions: [...access.permissions],
+  // admins only: null = full admin, otherwise the admin modules this person may open
+  ...(profile.role === 'admin' ? { admin_modules: access.adminModules ? [...access.adminModules] : null, admin_actions: access.adminActions ? Object.fromEntries([...access.adminActions].map(([m, set]) => [m, [...set]])) : null } : {}),
 });
 
 /**

@@ -31,7 +31,9 @@ const toBool = (v) => (v === true || v === 'true' ? true : v === false || v === 
  * @returns the order columns derived from brand / courier / tracking / shipping
  */
 export const resolveOrderRefs = async (body, { order = null } = {}) => {
-  if (!isUuid(body.brand_id)) throw new BadRequestError('Choose the brand you ordered from.');
+  // a brand typed for one article ("Other") is just text on that order: it is never added to the brand list
+  const brandText = !isUuid(body.brand_id) ? String(body.brand_text ?? '').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+  if (!isUuid(body.brand_id) && !brandText) throw new BadRequestError('Choose the brand you ordered from.');
   // no question is asked any more: an explicit value (older clients) wins, otherwise the delivery country decides, otherwise domestic
   const international = toBool(body.international_shipping) ?? internationalFromCountry(body.destination_country) ?? false;
 
@@ -39,7 +41,7 @@ export const resolveOrderRefs = async (body, { order = null } = {}) => {
   if (hasCourier && !isUuid(body.courier_id)) throw new BadRequestError('That courier is not valid. Choose another.');
 
   const [brandRes, courierRes] = await Promise.all([
-    supabaseAdmin.from('brands').select('id, name, status').eq('id', body.brand_id).maybeSingle(),
+    brandText ? Promise.resolve({ data: { id: null, name: brandText, status: 'active' }, error: null }) : supabaseAdmin.from('brands').select('id, name, status').eq('id', body.brand_id).maybeSingle(),
     hasCourier ? supabaseAdmin.from('couriers').select('id, name, status, requires_tracking').eq('id', body.courier_id).maybeSingle() : Promise.resolve({ data: null, error: null }),
   ]);
   const brand = unwrap(brandRes, 'Could not check the brand');
@@ -99,15 +101,6 @@ export const resolveUnitArticles = async (rawUnits, alreadyPicked = [], partnerI
       const keptFromBefore = alreadyPicked[i]?.has(id);
       if (!keptFromBefore && (article.status !== 'active' || type?.status !== 'active')) {
         throw new BadRequestError(`"${article.name}" is not available any more. Please choose again.`);
-      }
-      // a partner only offers its own articles; an order with no partner yet (at the central location) uses the shared set,
-      // so whichever partner the admin picks later can make it (a piece an order already had stays valid)
-      if (!keptFromBefore) {
-        const owner = partnerId ?? null;
-        const typeOwner = type?.partner_id ?? null;
-        if (article.partner_id !== owner || (typeOwner !== null && typeOwner !== owner)) {
-          throw new BadRequestError(owner ? `"${article.name}" is not offered by this order's partner. Please choose again.` : `"${article.name}" is not in the standard set. Please choose again.`);
-        }
       }
       if (seenTypes.has(article.article_type_id)) throw new BadRequestError(`Choose only one ${type?.name || 'option'} per piece.`);
       seenTypes.add(article.article_type_id);
