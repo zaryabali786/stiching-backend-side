@@ -46,7 +46,7 @@ export const sendSupportMessage = async ({ customerId, profile, body, clientMsgI
   if (role === 'customer') {
     await notifyAdmins({ type: 'update', title: 'New message from a customer', body: `${profile.full_name || 'Customer'}: ${preview}`, link: `/admin/support?customer=${customerId}`, dedupe: true }).catch(() => {});
   } else {
-    await notifyUser(customerId, { type: 'update', title: 'New message from our team', body: preview, link: '/app/overview' }).catch(() => {});
+    await notifyUser(customerId, { type: 'update', title: 'New message from our team', body: preview, link: '/app/overview?support=1' }).catch(() => {});
   }
   return { message, duplicate: false };
 };

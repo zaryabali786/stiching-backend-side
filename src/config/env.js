@@ -63,7 +63,9 @@ export const config = {
     clientId: process.env.GOOGLE_CLIENT_ID || '',
     clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
     // optional: the iOS OAuth client of the phone app (native Google sign-in on iPhone); its id_tokens are accepted as well
-    iosClientId: process.env.GOOGLE_IOS_CLIENT_ID || '',
+    // one iOS OAuth client per iPhone app; comma-separated when the client app and the admin app each have their own
+    iosClientIds: (process.env.GOOGLE_IOS_CLIENT_ID || '').split(',').map((s) => s.trim()).filter(Boolean),
+    iosClientId: (process.env.GOOGLE_IOS_CLIENT_ID || '').split(',')[0].trim(),
   },
   // Forwarded brand emails: customers forward to  <local>+<token>@<domain>  built from this address.
   // Your inbound-mail provider posts each email to  POST /api/inbound/email  with INBOUND_EMAIL_SECRET.

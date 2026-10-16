@@ -49,17 +49,27 @@ export const pushToUser = async (userId, n) => {
     const tokens = (data || []).map((d) => d.token);
     if (!tokens.length) return;
 
+    const orderId = n.orderId || n.order_id || '';
+    const notificationId = n.id || '';
     const res = await fcm.sendEachForMulticast({
       tokens,
       notification: { title: n.title, ...(n.body ? { body: n.body } : {}) },
-      // everything in `data` must be a string; the apps open `link` when the notification is tapped
+      // everything in `data` must be a string; the apps open `link` when the notification is tapped, and only when
+      // `userId` is still the signed-in user (a device that switched accounts must not open somebody else's page)
       data: {
         link: n.link || '',
         type: n.type || 'update',
-        orderId: n.orderId || n.order_id || '',
-        notificationId: n.id || '',
+        orderId,
+        notificationId,
+        userId: String(userId),
       },
-      android: { priority: 'high', notification: { channelId: 'default' } },
+      // a retried send replaces the earlier tray entry instead of stacking a copy (tag = notification id)
+      android: { priority: 'high', notification: { channelId: 'default', ...(notificationId ? { tag: notificationId } : {}) } },
+      // iOS: delivered through APNs (the APNs key is uploaded in Firebase). Same collapse-id as above; thread-id groups one order
+      apns: {
+        headers: { 'apns-priority': '10', 'apns-push-type': 'alert', ...(notificationId ? { 'apns-collapse-id': notificationId.slice(0, 64) } : {}) },
+        payload: { aps: { sound: 'default', 'thread-id': orderId || n.type || 'update' } },
+      },
       webpush: { fcmOptions: n.link ? { link: n.link } : undefined },
     });
 

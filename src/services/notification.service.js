@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { emitTo, rooms } from '../realtime/io.js';
 import { loadPartner } from './access.service.js';
+import { adminModulesOf, isAdminModule } from '../config/admin-modules.js';
 import { pushToUser } from './push.service.js';
 
 /**
@@ -49,6 +50,18 @@ const toRow = (userId, n) => ({
   order_id: n.orderId || null,
 });
 
+/**
+ * A restricted admin (only some modules) is not told about a page of a module they cannot open, e.g. a new order for an
+ * admin without Orders. Full admins, and notifications whose link is not an admin module page, are never filtered.
+ */
+const mayOpenAdminPage = (profile, link) => {
+  if (profile.role !== 'admin') return true;
+  const modules = adminModulesOf(profile);
+  if (!modules) return true;
+  const segment = /^\/admin\/([a-z_-]+)/i.exec(String(link || ''))?.[1]?.replace(/-/g, '_');
+  return !segment || !isAdminModule(segment) || modules.includes(segment);
+};
+
 export const notifyUser = async (userId, notification) => {
   if (!userId) return;
   await insertMany([toRow(userId, notification)]);
@@ -63,7 +76,7 @@ export const notifyUser = async (userId, notification) => {
 export const notifyRoles = async (roles, notification, excludeUserId = null) => {
   const { data, error } = await supabaseAdmin
     .from('profiles')
-    .select('id, role')
+    .select('id, role, permissions')
     .in('role', roles)
     .eq('is_active', true);
   if (error) {
@@ -72,11 +85,9 @@ export const notifyRoles = async (roles, notification, excludeUserId = null) => 
   }
   const rows = (data || [])
     .filter((p) => p.id !== excludeUserId)
-    .map((p) => {
-      // Staff links differ per portal
-      const link = typeof notification.link === 'object' ? notification.link?.[p.role] : notification.link;
-      return toRow(p.id, { ...notification, link });
-    });
+    .map((p) => ({ p, link: typeof notification.link === 'object' ? notification.link?.[p.role] : notification.link })) // Staff links differ per portal
+    .filter(({ p, link }) => mayOpenAdminPage(p, link))
+    .map(({ p, link }) => toRow(p.id, { ...notification, link }));
   await insertMany(await skipRecent(rows, notification));
 };
 

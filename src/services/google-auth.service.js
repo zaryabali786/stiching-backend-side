@@ -76,7 +76,7 @@ const googleKeys = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2
 export const identityFromIdToken = async (idToken) => {
   if (!isGoogleEnabled()) throw new AppError('Google sign-in is not set up yet.', 503);
   if (!idToken || typeof idToken !== 'string' || idToken.length > 4096) throw new BadRequestError('Google did not return a sign-in token.');
-  const audience = [config.google.clientId, config.google.iosClientId].filter(Boolean);
+  const audience = [config.google.clientId, ...config.google.iosClientIds].filter(Boolean);
   let claims;
   try {
     ({ payload: claims } = await jwtVerify(idToken, googleKeys, { issuer: ['https://accounts.google.com', 'accounts.google.com'], audience }));
