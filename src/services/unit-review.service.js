@@ -147,7 +147,20 @@ export const decideArticle = async ({ order, unit, decision, note, media, return
     await logUnitEvent(unit.id, order.id, 'review_approved', { actorId: profile.id });
     await addEvent(order.id, order.status, `${unit.unit_title} approved by the customer`, profile.id);
     await syncReviewFlag(order.id);
-    await releaseArticles(order.id);
+    const released = await releaseArticles(order.id);
+    // approved articles that just got their production ticket: tell the order's own partner (only the people who see Production).
+    // An order that still waits for the customer's details is not released yet, so nobody is told too early.
+    // dedupe: "Approve all" releases article after article, the partner needs one alert for the order, not one per article
+    if (released > 0 && order.partner_id) {
+      await notifyPartner({
+        type: 'order',
+        title: `Approved by the customer: ${order.reference}`,
+        body: `${unit.unit_title}${released > 1 ? ` and ${released - 1} more` : ''} approved · ready for production.`,
+        link: `/partner/production?search=${order.reference}`,
+        orderId: order.id,
+        dedupe: true,
+      }, null, { module: 'production' }).catch(() => {});
+    }
     if (resolvesHold) await notifyStaffAboutReview(order, `Hold resolved: ${order.reference}`, `${unit.unit_title} was approved by the customer · ${order.reference}-RESOLVED`);
     emitUnitUpdate(order, unit, { state: 'approved', stateLabel: ARTICLE_STATE_LABELS.approved, ...(resolvesHold ? { group: 'resolved' } : {}) });
     return { state: 'approved', resolved: resolvesHold };
