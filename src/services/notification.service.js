@@ -68,6 +68,16 @@ export const notifyUser = async (userId, notification) => {
 };
 
 /**
+ * Notify an explicit list of people (already authorised by the caller). `notification.link` is one path, the same for all.
+ * Duplicates in the list and the person who caused the event (`excludeUserId`) are dropped.
+ */
+export const notifyUsers = async (userIds, notification, excludeUserId = null) => {
+  const ids = [...new Set((userIds || []).filter(Boolean))].filter((id) => id !== excludeUserId);
+  if (!ids.length) return;
+  await insertMany(await skipRecent(ids.map((id) => toRow(id, notification)), notification));
+};
+
+/**
  * Notify every active user with one of the given roles.
  * @param {string[]} roles e.g. ['admin'] or ['partner_staff', 'admin']
  * @param {object} notification
@@ -101,7 +111,7 @@ export const partnerRecipients = async (partnerId, module = null) => {
   if (!partner || partner.status !== 'active') return [];
   const { data, error } = await supabaseAdmin
     .from('profiles')
-    .select('id, role, partner_role, permissions')
+    .select('id, role, partner_role, permissions, staff_type')
     .eq('role', 'partner_staff')
     .eq('partner_id', partnerId)
     .eq('is_active', true);

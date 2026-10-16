@@ -16,7 +16,7 @@ const noop = async () => {};
 
 before(async () => {
   mock.module('../src/config/supabase.js', { namedExports: { supabaseAdmin: dbProxy, supabase: dbProxy } });
-  mock.module('../src/services/notification.service.js', { namedExports: { notifyAdmins: noop, notifyPartner: noop, notifyUser: noop, notifyStaff: noop, partnerRecipients: async () => [] } });
+  mock.module('../src/services/notification.service.js', { namedExports: { notifyAdmins: noop, notifyPartner: noop, notifyUser: noop, notifyUsers: noop, notifyStaff: noop, partnerRecipients: async () => [] } });
   orderSvc = await import('../src/services/order.service.js');
   ro = await import('../src/services/return-order.service.js');
   wh = await import('../src/services/dispatch-shipment.service.js');

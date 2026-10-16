@@ -6,6 +6,7 @@ import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
 import { unwrap, unwrapOne, round2 } from '../utils/db.js';
 import { STATUS_GROUPS, STATUS_LABELS, setOrderStatus, addEvent, notifyPartnerAboutOrder, syncOrderFromCards, logUnitEvent, buildUnitTimeline } from '../services/order.service.js';
 import { notifyStaff, notifyAdmins, notifyPartner, notifyUser } from '../services/notification.service.js';
+import { notifyArticleTeam } from '../services/article-notify.service.js';
 import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
 import { isCod } from '../services/email-order-match.service.js';
 import { fallbackPrices, priceKey } from '../services/article-price.service.js';
@@ -799,7 +800,22 @@ export const approveClientOrder = catchAsync(async (req, res) => {
     unwrap(await supabaseAdmin.from('job_cards').update({ approval_status: 'approved', approval_decided_at: now, updated_at: now }).eq('id', c.id));
     await cardActivity(c, req, 'Photos approved by the customer');
     await logUnitEvent(c.unit_id, order.id, 'approved', { actorId: req.userId });
-    await notifyPartner({ type: 'update', title: `Approved: ${order.reference} · ${c.unit_title}`, body: 'The customer approved the photos. You can pack once every article is ready.', link: `/partner/production/jobs/${c.id}`, orderId: order.id }, req.userId, { module: 'production' });
+    // the partner who really stitched / checked THIS article (even if it has moved on), the people who did it, and the admins
+    await notifyArticleTeam({
+      order,
+      unitId: c.unit_id,
+      stages: ['stitching', 'qc'],
+      module: 'production',
+      exclude: req.userId,
+      notification: {
+        type: 'update',
+        title: `Approved: ${order.reference} · ${c.unit_title}`,
+        body: 'The customer approved the photos. You can pack once every article is ready.',
+        link: { admin: `/admin/orders?ref=${order.reference}`, partner_staff: `/partner/production/jobs/${c.id}` },
+        orderId: order.id,
+        dedupe: true,
+      },
+    }).catch((err) => console.warn('[Notifications] approval notice failed:', err.message));
   }
   await addEvent(order.id, order.status, `Photos approved by the customer: ${cards.map((c) => c.unit_title).join(', ')}`, req.userId);
   await syncOrderFromCards(order.id, req.userId);
@@ -833,7 +849,25 @@ export const requestChanges = catchAsync(async (req, res) => {
   const titles = cards.map((c) => c.unit_title).join(', ');
   await addEvent(order.id, order.status, `Change requested by customer (${titles}): ${text}`, req.userId);
   await syncOrderFromCards(order.id, req.userId);
-  await notifyPartner({ type: 'update', title: `Change request: ${order.reference} · ${titles}`, body: note || 'The customer left a voice note.', link: cards.length === 1 ? `/partner/production/jobs/${cards[0].id}` : `/partner/production?search=${order.reference}`, orderId: order.id }, req.userId, { module: 'production' });
+  // each article goes back to the partner who stitched it (and its tailor), not to whoever the order is assigned to today
+  for (const c of cards) {
+    await notifyArticleTeam({
+      order,
+      unitId: c.unit_id,
+      stages: ['stitching'],
+      module: 'production',
+      admins: false, // the admins get one combined notice below
+      exclude: req.userId,
+      notification: {
+        type: 'update',
+        title: `Change request: ${order.reference} · ${c.unit_title}`,
+        body: note || 'The customer left a voice note.',
+        link: { partner_staff: `/partner/production/jobs/${c.id}` },
+        orderId: order.id,
+        dedupe: true,
+      },
+    }).catch((err) => console.warn('[Notifications] change request notice failed:', err.message));
+  }
   await notifyAdmins({ type: 'alert', title: `Change request: ${order.reference}`, body: `${titles}: ${note || 'voice note'}`, link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
   return ApiResponse.success(res, { changed: cards.length }, 'Your change request was sent to the tailor.');
 });

@@ -10,7 +10,8 @@ import { emitUnitUpdate } from '../services/unit-review.service.js';
 import { buildMasterTracking } from '../services/master-tracking.service.js';
 import { suggestAssignees } from '../services/team.service.js';
 import { uploadDataUrls } from '../services/storage.service.js';
-import { notifyUser } from '../services/notification.service.js';
+import { notifyUser, notifyPartner } from '../services/notification.service.js';
+import { notifyArticleTeam, notifyAssignedMember } from '../services/article-notify.service.js';
 import { withSizeSnapshot } from '../utils/measurements.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
 import { logUnitEvent } from '../services/order.service.js';
@@ -43,6 +44,24 @@ const shapeCard = (c) => {
     days_late: delayed ? Math.round((new Date(today) - new Date(c.due_date)) / 86_400_000) : 0,
     status: delayed ? 'delayed' : c.priority === 'rush' ? 'rush' : 'on_time',
   };
+};
+
+/** A master / tailor was given an article: tell that person (their own login), nobody else. */
+const notifyCardAssignee = async (card, memberId, stageLabel, actorId) => {
+  const order = await getOrderOr404(card.order_id, 'id, reference');
+  await notifyAssignedMember({
+    memberId,
+    partnerId: card.partner_id,
+    exclude: actorId,
+    notification: {
+      type: 'order',
+      title: `New article for you: ${order.reference} · ${card.unit_title}`,
+      body: `${stageLabel} · assigned to you.`,
+      link: `/partner/production/jobs/${card.id}`,
+      orderId: order.id,
+      dedupe: true,
+    },
+  }).catch((err) => console.warn('[Notifications] assignment notice failed:', err.message));
 };
 
 const encodeCursor = (card) => `${card.position}|${card.id}`;
@@ -323,6 +342,9 @@ export const updateCard = catchAsync(async (req, res) => {
 
   unwrap(await supabaseAdmin.from('job_cards').update(patch).eq('id', card.id));
   for (const n of notes) await logActivity(card.id, req, n);
+  // a newly chosen master / tailor is told; the one who was replaced is not
+  if (patch.master_id) await notifyCardAssignee(card, patch.master_id, 'Cutting', req.userId);
+  if (patch.tailor_id) await notifyCardAssignee(card, patch.tailor_id, 'Stitching', req.userId);
   return ApiResponse.success(res, await getCard(card.id), notes.join(' · ') || 'No changes.');
 });
 
@@ -352,6 +374,7 @@ export const assignCard = catchAsync(async (req, res) => {
   await clearStageDone(card.id);
   await logActivity(card.id, req, `Assigned to Master ${master.name} · moved to Cutting`);
   await logUnitEvent(card.unit_id, card.order_id, 'cutting', { actorId: req.userId });
+  await notifyCardAssignee(card, master.id, 'Cutting', req.userId);
   const order = await syncOrderFromCards(card.order_id, req.userId);
   return ApiResponse.success(res, { card: await getCard(card.id), orderStatus: order.status }, `Assigned to ${master.name}.`);
 });
@@ -563,6 +586,19 @@ export const scanComplete = catchAsync(async (req, res) => {
   await logActivity(card.id, req, `${STAGE_LABELS[card.stage]} completed by ${userName} (scan)`);
   const [progress] = await receivingProgress({ orderIds: [card.order_id], stage: card.stage, userId: req.userId, member, role: role.role });
   const next = NEXT_STAGE[card.stage];
+  // the next stage's people (of this partner) can pick the article up now: only they are told
+  if (next) {
+    const order = await getOrderOr404(card.order_id, 'id, reference');
+    await notifyPartner({
+      type: 'order',
+      title: `Ready for ${STAGE_LABELS[next]}: ${order.reference} · ${unit.unit_title}`,
+      body: `${STAGE_LABELS[card.stage]} was completed by ${userName}.`,
+      link: `/partner/production/jobs/${card.id}`,
+      orderId: order.id,
+      partnerId: card.partner_id,
+      dedupe: true,
+    }, req.userId, { module: next === 'qc' ? 'quality' : 'production' }).catch((err) => console.warn('[Notifications] stage notice failed:', err.message));
+  }
   return ApiResponse.success(
     res,
     { kind: 'complete', card: await getCard(card.id), stage: card.stage, done: mark, progress },
@@ -731,7 +767,24 @@ export const passQc = catchAsync(async (req, res) => {
   unwrap(await supabaseAdmin.from('job_cards').update({ qc_passed: true, qc_notes: notes, updated_at: new Date().toISOString() }).eq('id', card.id));
   await logActivity(card.id, req, `QC passed${notes ? `: ${notes}` : ''}`);
   await logUnitEvent(card.unit_id, card.order_id, 'qc_passed', { actorId: req.userId });
+  const ref = { id: card.order_id, reference: card.order_reference };
   const order = await syncOrderFromCards(card.order_id, req.userId);
+  // good news for the people who made it, the QC team of that partner (they send the photos next) and the admins
+  await notifyArticleTeam({
+    order: ref,
+    unitId: card.unit_id,
+    stages: ['stitching'],
+    module: 'quality',
+    exclude: req.userId,
+    notification: {
+      type: 'update',
+      title: `QC passed: ${ref.reference} · ${card.unit_title}`,
+      body: notes || 'Quality check passed. Photos can go to the customer.',
+      link: { admin: `/admin/orders?ref=${ref.reference}`, partner_staff: `/partner/production/jobs/${card.id}` },
+      orderId: ref.id,
+      dedupe: true,
+    },
+  }).catch((err) => console.warn('[Notifications] QC notice failed:', err.message));
   return ApiResponse.success(res, { card: await getCard(card.id), orderStatus: order.status }, 'QC passed.');
 });
 
@@ -747,7 +800,24 @@ export const failQc = catchAsync(async (req, res) => {
   }).eq('id', card.id));
   await logActivity(card.id, req, `Sent back to stitching: ${notes || 'voice note'}`, 'activity', audio ?? null);
   await logUnitEvent(card.unit_id, card.order_id, 'qc_failed', { actorId: req.userId }); // the QC note stays internal
+  const ref = { id: card.order_id, reference: card.order_reference };
   const order = await syncOrderFromCards(card.order_id, req.userId);
+  // back to the tailor who stitched it (and that partner's production people) and the admins; the customer is not told
+  await notifyArticleTeam({
+    order: ref,
+    unitId: card.unit_id,
+    stages: ['stitching'],
+    module: 'production',
+    exclude: req.userId,
+    notification: {
+      type: 'alert',
+      title: `QC failed: ${ref.reference} · ${card.unit_title}`,
+      body: notes || 'The QC team left a voice note. Please fix and send it back to quality check.',
+      link: { admin: `/admin/orders?ref=${ref.reference}`, partner_staff: `/partner/production/jobs/${card.id}` },
+      orderId: ref.id,
+      dedupe: true,
+    },
+  }).catch((err) => console.warn('[Notifications] QC notice failed:', err.message));
   return ApiResponse.success(res, { orderStatus: order.status }, 'Sent back to the tailor.');
 });
 
