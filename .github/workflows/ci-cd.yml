@@ -1,0 +1,72 @@
+name: CI/CD
+
+# Every push and pull request runs the tests. A push to main that passes is also deployed to the Contabo server.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Unit tests
+        run: npm run test:unit
+
+  deploy:
+    name: Deploy to Contabo
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT }}
+    steps:
+      - name: Check the server secrets
+        id: cfg
+        run: |
+          if [ -z "$SERVER_HOST" ] || [ -z "$SERVER_USER" ] || [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Deploy skipped: add the SERVER_HOST, SERVER_USER and SSH_PRIVATE_KEY secrets (see DEPLOY.md)."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.ready == 'true'
+
+      - name: Set up SSH
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          PORT="${SERVER_PORT:-22}"
+          ssh-keyscan -p "$PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host target\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/deploy_key\n  StrictHostKeyChecking yes\n' "$SERVER_HOST" "$SERVER_USER" "$PORT" > ~/.ssh/config
+
+      - name: Upload the code
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          # .env and node_modules stay on the server
+          rsync -az --delete \
+            --exclude '.git' --exclude '.github' --exclude 'node_modules' --exclude '.env' --exclude '.env.*' \
+            --exclude 'test' --exclude '*.sql' \
+            ./ target:/var/www/backend/
+
+      - name: Install, restart and check
+        if: steps.cfg.outputs.ready == 'true'
+        run: ssh target 'bash /var/www/backend/deploy/deploy.sh'

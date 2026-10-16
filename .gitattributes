@@ -1,0 +1,4 @@
+# Shell scripts must keep Unix line endings or they break on the Linux server
+*.sh text eol=lf
+*.cjs text eol=lf
+*.yml text eol=lf

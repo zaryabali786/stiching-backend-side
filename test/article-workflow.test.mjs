@@ -124,7 +124,7 @@ const CUSTOMER = { id: 'cust-1', full_name: 'Test Customer', role: 'customer' };
 /** An order of the given source with three received articles. */
 const seed = (over = {}, unitOver = {}) => {
   db = createFakeDb({
-    orders: [{ id: ORDER, reference: 'SA-2001', status: 'draft', order_source: 'email', details_completed_at: null, customer_id: CUSTOMER.id, partner_id: null, parcel_review: 'none', has_issue: false, priority: 'normal', due_date: null, customer_code: 'STX-1', ...over }],
+    orders: [{ id: ORDER, reference: 'SA-2001', status: 'draft', order_source: 'email', details_completed_at: null, customer_id: CUSTOMER.id, partner_id: null, parcel_review: 'none', has_issue: false, priority: 'normal', due_date: null, customer_code: 'STX-1', parcel_received_at: new Date().toISOString(), ...over }],
     order_units: [1, 2, 3].map((n) => ({ id: `unit-${n}`, order_id: ORDER, line_no: n, code: `SA-2001-${n}`, unit_title: `Article ${n}`, status: 'received', review_status: 'none', return_status: 'none', resubmit_count: 0, ...unitOver })),
   });
 };
