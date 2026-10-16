@@ -77,8 +77,9 @@ export const config = {
     stream: process.env.POSTMARK_MESSAGE_STREAM || 'outbound',
   },
   urls: {
-    clientApp: process.env.CLIENT_APP_URL || 'http://localhost:4201',
-    adminApp: process.env.ADMIN_APP_URL || 'http://localhost:4200',
+    // Production defaults match the live sites, so Google sign-in works even when the server .env does not set these
+    clientApp: process.env.CLIENT_APP_URL || (process.env.NODE_ENV === 'production' ? 'https://client.stitchnship.com' : 'http://localhost:4201'),
+    adminApp: process.env.ADMIN_APP_URL || (process.env.NODE_ENV === 'production' ? 'https://admin.stitchnship.com' : 'http://localhost:4200'),
   },
 };
 
