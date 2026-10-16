@@ -8,6 +8,7 @@ import { authenticate, requireRole } from '../middlewares/auth.middleware.js';
 import { adminModuleGate, partnerPortalGateForAdmins } from '../middlewares/admin-modules.middleware.js';
 import { getPublicConfig } from '../controllers/auth.controller.js';
 import { getRedisStatus } from '../config/redis.js';
+import { pushEnabled } from '../services/push.service.js';
 import { inboundEmailWebhook } from '../controllers/order-import.controller.js';
 import { courierTrackingWebhook } from '../controllers/courier-webhook.controller.js';
 
@@ -18,7 +19,7 @@ apiRouter.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    services: { redis: getRedisStatus() },
+    services: { redis: getRedisStatus(), push: { enabled: pushEnabled() } },
   });
 });
 

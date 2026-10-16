@@ -74,9 +74,15 @@ export const pushToUser = async (userId, n) => {
     });
 
     const dead = [];
+    const problems = new Map(); // error code -> how many devices (anything that is not just a stale token: wrong project, API off, ...)
     res.responses.forEach((r, i) => {
-      if (!r.success && DEAD_TOKEN_CODES.has(r.error?.code)) dead.push(tokens[i]);
+      if (r.success) return;
+      if (DEAD_TOKEN_CODES.has(r.error?.code)) dead.push(tokens[i]);
+      else problems.set(r.error?.code || 'unknown', (problems.get(r.error?.code || 'unknown') || 0) + 1);
     });
+    // visible in `pm2 logs`: a push that silently never arrives is the hardest thing to debug
+    if (problems.size) console.warn(`[Push] FCM rejected ${[...problems].map(([c, n]) => `${c} x${n}`).join(', ')} (user ${userId})`);
+    else if (process.env.PUSH_LOG === 'true') console.log(`[Push] sent to ${tokens.length - dead.length}/${tokens.length} device(s) of user ${userId}: ${n.title}`);
     if (dead.length) await supabaseAdmin.from('push_devices').delete().in('token', dead);
   } catch (err) {
     console.warn('[Push] send failed:', err.message);
