@@ -3,6 +3,7 @@ import {
   register,
   login,
   googleLogin,
+  appleLogin,
   getMe,
   updateMe,
   logout,
@@ -18,6 +19,7 @@ const router = Router();
 router.post('/register', validateRegister, register);
 router.post('/login', validateLogin, login);
 router.post('/google', googleLogin);
+router.post('/apple', appleLogin);
 router.post('/refresh', refreshSession);
 router.post('/forgot-password', forgotPassword);
 

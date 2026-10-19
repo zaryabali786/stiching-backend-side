@@ -67,6 +67,10 @@ export const config = {
     iosClientIds: (process.env.GOOGLE_IOS_CLIENT_ID || '').split(',').map((s) => s.trim()).filter(Boolean),
     iosClientId: (process.env.GOOGLE_IOS_CLIENT_ID || '').split(',')[0].trim(),
   },
+  // Sign in with Apple (native, iPhone apps): the bundle id of each app is the audience of Apple's identity token
+  apple: {
+    clientIds: (process.env.APPLE_CLIENT_IDS || 'com.stitchnship.app,com.stitchnship.admin').split(',').map((s) => s.trim()).filter(Boolean),
+  },
   // Forwarded brand emails: customers forward to  <local>+<token>@<domain>  built from this address.
   // Your inbound-mail provider posts each email to  POST /api/inbound/email  with INBOUND_EMAIL_SECRET.
   // With INBOUND_EMAIL_DOMAIN (your own mail subdomain, MX pointed at the provider) each customer gets <token>@<domain>.

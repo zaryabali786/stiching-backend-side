@@ -8,6 +8,7 @@ import { loadClientTheme } from './theme.controller.js';
 import { loadPortalTheme } from './portal-theme.controller.js';
 import { catchAsync, BadRequestError, UnauthorizedError, ForbiddenError, ApiResponse } from '../utils/error.helper.js';
 import { identityFromCode, identityFromIdToken, isGoogleEnabled } from '../services/google-auth.service.js';
+import { identityFromAppleToken } from '../services/apple-auth.service.js';
 import { resolveAccess, accessPayload } from '../services/access.service.js';
 import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { randomBytes } from 'node:crypto';
@@ -65,7 +66,7 @@ const makeGooglePartner = async (profile, who) => {
     throw error;
   }
   invalidateProfile(profile.id);
-  await notifyAdmins({ type: 'alert', title: `New partner signed up: ${partner.name}`, body: `${who.email} signed in with Google and was created as a partner with no modules. Enable what they may use, or make them an admin.`, link: '/admin/partners' });
+  await notifyAdmins({ type: 'alert', title: `New partner signed up: ${partner.name}`, body: `${who.email} signed in with ${who.provider || 'Google'} and was created as a partner with no modules. Enable what they may use, or make them an admin.`, link: '/admin/partners' });
   return data;
 };
 
@@ -147,6 +148,22 @@ export const googleLogin = catchAsync(async (req, res) => {
     ? await identityFromIdToken(req.body.idToken)
     : await identityFromCode({ code: req.body?.code, redirectUri: req.body?.redirectUri });
 
+  return signInWithIdentity(res, who, portal);
+});
+
+/**
+ * POST /api/auth/apple  body: { idToken, name?, portal }  (phone app, native Sign in with Apple)
+ * Same answer as /login and /google. A first-time Apple user becomes a customer (or a partner from the admin login).
+ */
+export const appleLogin = catchAsync(async (req, res) => {
+  const portal = req.body?.portal === 'staff' ? 'staff' : 'customer';
+  const who = await identityFromAppleToken(req.body?.idToken, req.body?.name);
+  return signInWithIdentity(res, who, portal);
+});
+
+/** The part Google and Apple share: the provider has proven the email, so find or create the person and answer like a login. */
+const signInWithIdentity = async (res, who, portal) => {
+  const provider = who.provider || 'Google';
   let profile = await UserModel.findProfileByEmail(who.email);
   let created = false;
   if (!profile) {
@@ -167,9 +184,9 @@ export const googleLogin = catchAsync(async (req, res) => {
 
   // the session (two calls to Supabase) and the reply's profile do not depend on each other: run them together
   const [{ session }, user] = await Promise.all([UserModel.signInVerifiedEmail(who.email), publicProfile(profile, access)]);
-  if (!session) throw new UnauthorizedError('Google sign-in could not be completed. Please try again.');
+  if (!session) throw new UnauthorizedError(`${provider} sign-in could not be completed. Please try again.`);
   return ApiResponse.success(res, { user, tokens: toTokens(session), created }, 'Login successful.');
-});
+};
 
 export const getMe = catchAsync(async (req, res) => {
   const profile = await UserModel.getProfile(req.userId);
