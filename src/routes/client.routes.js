@@ -47,6 +47,8 @@ import { createPaymentIntent, confirmPayment } from '../controllers/payment.cont
 
 import { getClientHomeLayout } from '../controllers/home-layout.controller.js';
 import { getActiveBanners } from '../controllers/banner.controller.js';
+import { setClientPaymentType, startCodCheckout, confirmClientCodPayment } from '../controllers/cod-payment.controller.js';
+import { confirmShopifyAddress } from '../controllers/shopify.controller.js';
 
 const router = Router();
 
@@ -71,6 +73,10 @@ router.post('/orders/:id/reject-parcel', rejectWholeParcel);
 router.post('/orders/:id/units/:unitId/return', returnArticle);
 router.post('/orders/:id/cancel', cancelClientOrder);
 router.post('/orders/:id/payment-method', confirmPaymentMethod);
+router.post('/orders/:id/payment-type', setClientPaymentType);
+router.post('/orders/:id/cod/checkout', startCodCheckout);
+router.post('/orders/:id/cod/confirm', confirmClientCodPayment);
+router.post('/orders/:id/shopify/confirm-address', confirmShopifyAddress);
 router.delete('/orders/:id', deleteClientDraft);
 router.get('/approvals', listPendingApprovals);
 router.post('/orders/:id/approve', approveClientOrder);

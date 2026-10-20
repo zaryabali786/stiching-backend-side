@@ -9,6 +9,7 @@ import { notifyStaff, notifyAdmins, notifyPartner, notifyUser } from '../service
 import { notifyArticleTeam } from '../services/article-notify.service.js';
 import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
 import { isCod } from '../services/email-order-match.service.js';
+import { assertCodEditable, codView, isCodLocked, retireCodCheckout } from '../services/cod-payment.service.js';
 import { fallbackPrices, priceKey } from '../services/article-price.service.js';
 import { resolveOrderRefs, internationalFromCountry, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
 import { createMessage } from '../services/chat.service.js';
@@ -108,8 +109,17 @@ const shapeOrderDetail = (order) => {
     : null;
   return {
     ...order,
-    // a draft whose email says cash on delivery cannot be created
-    payment_cod: isCod(order.brand_payment_method),
+    // cash on delivery: the type, the verified total and the payment status (editing is blocked until it is PAID)
+    cod: codView(order),
+    payment_cod: isCodLocked(order),
+    // Stripe references and internal ids stay on the server
+    cod_stripe_session_id: undefined,
+    cod_stripe_payment_intent: undefined,
+    cod_paid_minor: undefined,
+    cod_email_ref: undefined,
+    shopify_store_id: undefined,
+    shopify_order_id: undefined,
+    payment_type_set_by: undefined,
     return_summary: returns,
     // website / email orders finish their articles, sizes and notes after the parcel is approved
     details_pending: needsDetails(order) && !order.details_completed_at && order.parcel_review !== 'none',
@@ -140,7 +150,13 @@ const orderDetailResponse = async (order) => {
   const picked = (shaped.units || []).flatMap((u) => u.selected_articles || []);
   const filled = await fallbackPrices(picked.map((p) => ({ name: p.name, type_name: p.type_name, customer_price: p.customer_price }))).catch(() => new Map());
   for (const p of picked) if (p.customer_price == null && filled.has(priceKey(p.type_name, p.name))) p.customer_price = filled.get(priceKey(p.type_name, p.name));
-  return signNoteAudio({ ...shaped, return_unit: returnUnit, brand_invoice: await withSignedUrl(order.brand_invoice) });
+  // an order from a brand's Shopify store: is its shipment waiting for the customer to confirm the atelier address?
+  let shopify = null;
+  if (order.external_source === 'shopify') {
+    const { data: sr } = await supabaseAdmin.from('shopify_orders').select('address_state, hold_state').eq('order_id', order.id).maybeSingle();
+    shopify = { address_mismatch: sr?.address_state === 'address_mismatch' && sr?.hold_state === 'held' };
+  }
+  return signNoteAudio({ ...shaped, shopify, return_unit: returnUnit, brand_invoice: await withSignedUrl(order.brand_invoice) });
 };
 
 // ─────────────────────────────── Overview ───────────────────────────────
@@ -476,8 +492,8 @@ export const updateClientOrder = catchAsync(async (req, res) => {
   const emailOrder = order.order_source === 'email' || order.import_source === 'email';
   // for both, the articles are the ones from the email / that arrived: they cannot be added or removed, and a received one is edited only after the customer approved it
   const fixedArticles = emailOrder || websiteCompletion;
-  // cash on delivery is not accepted: the draft stays for review or cancelling, but it cannot become an order
-  if (isDraft && isCod(order.brand_payment_method)) throw new BadRequestError(COD_MESSAGE);
+  // cash on delivery: no editing (or submitting a draft) until the payment is confirmed. An email that merely mentions COD no longer blocks by itself.
+  assertCodEditable(order);
   const body = req.body || {};
   // a customer's own parcel names its brand per article: the order takes the first article's brand (as when it was created)
   if (order.order_source === 'customer' && !body.brand_id && Array.isArray(body.units)) {
@@ -700,6 +716,9 @@ export const confirmPaymentMethod = catchAsync(async (req, res) => {
 export const deleteClientDraft = catchAsync(async (req, res) => {
   const order = await loadOwnOrder(req);
   if (order.status !== 'draft') throw new ForbiddenError('Only a draft can be discarded. Cancel a submitted order instead.');
+  // a COD draft that was already paid cannot just disappear (the money would have no order); an open payment page is closed
+  if (order.cod_payment_status === 'PAID') throw new ForbiddenError('You have already paid for this order. Please contact support if you want to cancel it.');
+  await retireCodCheckout(order);
   await supabaseAdmin.from('order_imports').update({ status: 'ready', order_id: null, updated_at: new Date().toISOString() }).eq('order_id', order.id);
   unwrap(await supabaseAdmin.from('orders').delete().eq('id', order.id).eq('status', 'draft'), 'Could not discard the draft');
   return ApiResponse.success(res, null, 'Draft discarded.');
@@ -709,6 +728,11 @@ export const cancelClientOrder = catchAsync(async (req, res) => {
   const order = await loadOwnOrder(req);
   if (order.status !== 'submitted') throw new ForbiddenError('Only orders whose parcel has not arrived can be cancelled.');
   await setOrderStatus(order.id, 'cancelled', { note: 'Cancelled by customer', actorId: req.userId });
+  // a cash on delivery order that was already paid needs a person to decide about the money; an open payment page is closed
+  if (order.payment_type === 'COD') {
+    await retireCodCheckout(order);
+    if (order.cod_payment_status === 'PAID') await notifyAdmins({ type: 'alert', title: `Paid COD order cancelled: ${order.reference}`, body: `${order.customer_name || 'The customer'} cancelled an order they had already paid (${order.cod_currency} ${order.cod_amount}). Check whether a refund is due.`, link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
+  }
   await notifyStaff({ type: 'alert', title: `Order ${order.reference} cancelled`, body: 'The customer cancelled before the parcel arrived.', orderId: order.id }, req.userId, { module: 'receiving' });
   return ApiResponse.success(res, null, 'Order cancelled.');
 });

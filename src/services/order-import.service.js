@@ -380,11 +380,11 @@ export const receiveForwardedEmail = async (payload) => {
 // ───────────────────────── automatic draft order ─────────────────────────
 
 /** The active default partner (Partners > Make default), or null when there is none. */
-const defaultPartnerId = async () =>
+export const defaultPartnerId = async () =>
   (await supabaseAdmin.from('partners').select('id').eq('is_default', true).eq('status', 'active').limit(1).maybeSingle()).data?.id ?? null;
 
 
-const cleanBrandName = (v) =>
+export const cleanBrandName = (v) =>
   String(v || '')
     .replace(/[\u0000-\u001f]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -395,7 +395,7 @@ const cleanBrandName = (v) =>
 const likeEscape = (v) => v.replace(/[\\%_]/g, (c) => '\\' + c);
 
 /** The catalogue brand with this name; created (as an ordinary active brand) when the customer's email names a new one. */
-const ensureBrand = async (name, userId) => {
+export const ensureBrand = async (name, userId) => {
   const clean = cleanBrandName(name);
   if (clean.length < 2) return null;
   const find = async () =>

@@ -1,3 +1,4 @@
+import { attachCodSummary } from '../services/cod-payment.service.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
@@ -176,6 +177,8 @@ export const getAdminOrders = catchAsync(async (req, res) => {
   ]);
 
   const rows = await adjustUnitCounts(unwrap(result).map((o) => ({ ...o, units_count: o.units?.[0]?.count ?? 0, units: undefined, status_label: STATUS_LABELS[o.status] })));
+  // COD orders: type and payment status on every row
+  await attachCodSummary(rows);
   const countMap = { all: counts[0].count || 0, draft: counts[counts.length - 3].count || 0, issues: counts[counts.length - 2].count || 0, cancelled: counts[counts.length - 1].count || 0 };
   groups.forEach((g, i) => (countMap[g] = counts[i + 1].count || 0));
   return sendPage(res, rows, q, result.count, { counts: countMap });

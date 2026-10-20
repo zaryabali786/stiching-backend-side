@@ -13,7 +13,7 @@ const MODULE_OF = {
   partners: 'partners', permissions: 'partners',
   'price-items': 'price_list', 'shipping-rates': 'shipping', reports: 'reports', support: 'support',
   banners: 'app_builder', 'home-layout': 'app_builder',
-  settings: 'settings',
+  settings: 'settings', shopify: 'settings',
   badges: null,
   users: '*full*', 'admin-modules': '*full*', roles: '*full*',
 };

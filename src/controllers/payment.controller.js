@@ -4,6 +4,7 @@ import { catchAsync, ApiResponse, BadRequestError, NotFoundError } from '../util
 import { unwrap } from '../utils/db.js';
 import { constructWebhookEvent, createOrReusePaymentIntent, isStripeEnabled, retrievePaymentIntent } from '../services/stripe.service.js';
 import { recordFailedIntent, settleSucceededIntent } from '../services/payment.service.js';
+import { releaseCodSession, settleCodSession } from '../services/cod-payment.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
 
@@ -93,6 +94,9 @@ export const stripeWebhook = async (req, res) => {
   try {
     if (event.type === 'payment_intent.succeeded') await settleSucceededIntent(event.data.object);
     else if (event.type === 'payment_intent.payment_failed') await recordFailedIntent(event.data.object);
+    // cash on delivery orders pay through Stripe Checkout: only a paid session marks the order paid
+    else if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') await settleCodSession(event.data.object);
+    else if (event.type === 'checkout.session.expired' || event.type === 'checkout.session.async_payment_failed') await releaseCodSession(event.data.object);
     // other event types are acknowledged and ignored
   } catch (err) {
     console.error('[Stripe webhook] handler failed:', event.type, err.message);

@@ -30,8 +30,20 @@ export const createFakeDb = (seed = {}, { uniques = {} } = {}) => {
       is(c, v) { state.filters.push((r) => (r[c] ?? null) === v); return api; },
       not(c, op, v) { if (op === 'is') state.filters.push((r) => (r[c] ?? null) !== v); return api; },
       ilike(c, v) { const re = new RegExp(`^${String(v).replace(/\\([\\%_])/g, '$1').replace(/[.*+?^${}()|[\]]/g, '\\$&')}$`, 'i'); state.filters.push((r) => re.test(String(r[c] ?? ''))); return api; },
-      gte() { return api; },
-      or() { return api; },
+      gte(c, v) { state.filters.push((r) => r[c] !== undefined && r[c] !== null && String(r[c]) >= String(v)); return api; },
+      lt(c, v) { state.filters.push((r) => r[c] !== undefined && r[c] !== null && String(r[c]) < String(v)); return api; },
+      // simple "col.is.null,col.neq.X" lists are applied; anything with and(...) / not(...) stays a no-op as before
+      or(expr) {
+        const terms = String(expr || '').split(',');
+        if (terms.length && terms.every((t) => /^[a-z_]+\.(is|eq|neq)\.[^.(),]+$/i.test(t))) {
+          const fns = terms.map((t) => {
+            const [c, op, v] = t.split('.');
+            return (r) => (op === 'is' ? (r[c] ?? null) === (v === 'null' ? null : v) : op === 'neq' ? r[c] !== v : r[c] === v);
+          });
+          state.filters.push((r) => fns.some((f) => f(r)));
+        }
+        return api;
+      },
       order() { return api; },
       range() { return api; },
       filter(c, op, v) { state.filters.push((r) => (op === 'is' ? (r[c] ?? null) === v : r[c] === v)); return api; },

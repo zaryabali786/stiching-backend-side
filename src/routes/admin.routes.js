@@ -1,3 +1,5 @@
+import { addShopifyStore, getShopifyQueue, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
+import { getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
 import { getAdminModules, createAdminUser, setAdminUserAccess, resetAdminUserPassword, listAdminRoles, createAdminRole, updateAdminRole, deleteAdminRole } from '../controllers/admin-users.controller.js';
@@ -91,6 +93,18 @@ router.get('/badges', getAdminBadges);
 router.get('/orders', getAdminOrders);
 router.get('/orders/by-ref/:reference', getAdminOrderByRef);
 router.get('/orders/:id', getAdminOrder);
+
+// Shopify brand stores (Settings module)
+router.get('/shopify/stores', listShopifyStores);
+router.post('/shopify/stores', addShopifyStore);
+router.patch('/shopify/stores/:id', updateShopifyStore);
+router.get('/shopify/queue', getShopifyQueue);
+router.post('/shopify/orders/:id/retry', retryShopifyOrderRequest);
+router.post('/shopify/orders/:id/resend', resendShopifyEmailRequest);
+router.post('/shopify/events/:id/retry', retryShopifyEvent);
+router.get('/orders/:id/cod', getOrderCod);
+router.put('/orders/:id/payment-type', inActivePartnerOrder(), setStaffPaymentType);
+router.put('/orders/:id/cod-amount', inActivePartnerOrder(), setStaffCodAmount);
 router.patch('/orders/:id', inActivePartnerOrder(), updateAdminOrder);
 router.post('/orders/:id/units/:unitId/resolve', inActivePartnerOrder(), resolveUnitIssue);
 

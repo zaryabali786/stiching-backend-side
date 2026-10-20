@@ -3,6 +3,7 @@ import { config } from './config/env.js';
 import { initSocket } from './realtime/socket.js';
 import { loadPostexSettings, applyPostexSettings, onPostexSettingsChange } from './services/postex.service.js';
 import { startPostexPolling } from './services/postex-tracking.service.js';
+import { startShopifyRetry } from './services/shopify-events.service.js';
 
 const server = app.listen(config.port, () => {
   console.log(`=========================================`);
@@ -19,6 +20,9 @@ const server = app.listen(config.port, () => {
 // PostEx: API booking and tracking are on only when POSTEX_API_TOKEN is set
 onPostexSettingsChange(startPostexPolling);
 loadPostexSettings().catch(() => ({})).finally(applyPostexSettings);
+
+// Shopify deliveries that failed are tried again every few minutes
+startShopifyRetry();
 
 // Real-time order conversations share the HTTP server (same port, path /socket.io)
 initSocket(server);

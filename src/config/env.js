@@ -84,6 +84,31 @@ export const config = {
     postmarkToken: (process.env.POSTMARK_SERVER_TOKEN || process.env.POSTMARK_API_KEY || '').trim(),
     stream: process.env.POSTMARK_MESSAGE_STREAM || 'outbound',
   },
+  // Shopify brand stores ("Customise stitching with Stitch&Ship"). The app is created in the Shopify Partner dashboard with custom
+  // distribution; each brand installs it through /api/shopify/auth?shop=<store>.myshopify.com. SECRETS: keep them in the server .env.
+  shopify: {
+    apiKey: (process.env.SHOPIFY_APP_API_KEY || '').trim(),
+    apiSecret: (process.env.SHOPIFY_APP_API_SECRET || '').trim(),
+    apiVersion: (process.env.SHOPIFY_API_VERSION || '2025-07').trim(),
+    // the public address of THIS server (Shopify redirects the brand back to <appUrl>/api/shopify/auth/callback)
+    appUrl: (process.env.SHOPIFY_APP_URL || '').trim().replace(/\/$/, ''),
+    scopes: (process.env.SHOPIFY_SCOPES || 'read_orders,write_orders,read_products,read_customers,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders').trim(),
+    // 32 bytes as base64 or 64 hex characters: encrypts the stores' access tokens in the database
+    tokenKey: (process.env.SHOPIFY_TOKEN_KEY || '').trim(),
+  },
+  // Text messages (optional): Twilio's REST API. Off until the account details are set; each Shopify store also has its own switch.
+  sms: {
+    accountSid: (process.env.SMS_TWILIO_ACCOUNT_SID || '').trim(),
+    authToken: (process.env.SMS_TWILIO_AUTH_TOKEN || '').trim(),
+    from: (process.env.SMS_FROM || '').trim(),
+    messagingServiceSid: (process.env.SMS_MESSAGING_SERVICE_SID || '').trim(),
+    // the country used to read a number written without "+" (only Pakistan is understood: 03xx xxxxxxx)
+    defaultCountry: (process.env.SMS_DEFAULT_COUNTRY || 'PK').trim().toUpperCase(),
+  },
+  // Emails the platform sends by itself (sign-in codes, "add your sizes"). Uses the same Postmark server as the Inbox.
+  transactionalEmail: {
+    from: (process.env.TRANSACTIONAL_EMAIL_FROM || '').trim(),
+  },
   // Push notifications (Firebase Cloud Messaging). The service account is a SECRET: keep it in the server .env only.
   // Give it as FIREBASE_SERVICE_ACCOUNT_JSON (the JSON, one line), _BASE64, or _PATH (a file outside the repo).
   firebase: {

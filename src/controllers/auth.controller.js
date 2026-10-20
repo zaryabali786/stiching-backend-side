@@ -14,6 +14,9 @@ import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { randomBytes } from 'node:crypto';
 import { notifyAdmins } from '../services/notification.service.js';
 import { addressForToken, getForwardAddress, tokenForCode } from '../services/order-import.service.js';
+import { deleteCustomerAccount } from '../services/account-deletion.service.js';
+import { issueLoginCode, normaliseEmail, redeemLoginCode } from '../services/login-code.service.js';
+import { renderEmail, sendTransactionalEmail } from '../services/transactional-email.service.js';
 
 const toTokens = (session) => ({
   tokenType: 'Bearer',
@@ -249,6 +252,75 @@ export const changePassword = catchAsync(async (req, res) => {
   await supabaseAdmin.from('profiles').update({ must_change_password: false, updated_at: new Date().toISOString() }).eq('id', req.userId);
   invalidateProfile(req.userId);
   return ApiResponse.success(res, null, 'Password changed successfully.');
+});
+
+/**
+ * POST /api/auth/delete-account  body: { confirm: 'DELETE', password } or { confirm: 'DELETE', idToken, provider: 'apple'|'google', name? }
+ * A customer deletes their own account: the login and personal details are removed, finished orders and their invoices
+ * stay without personal details (see services/account-deletion.service.js). Refused while an order is still in progress.
+ */
+export const deleteMyAccount = catchAsync(async (req, res) => {
+  const { confirm, password, idToken, provider, name } = req.body || {};
+  const profile = await UserModel.getProfile(req.userId);
+  if (!profile) throw new UnauthorizedError('Account not found.');
+  await deleteCustomerAccount({ profile, confirm, password, idToken, provider, name });
+  return ApiResponse.success(res, { deleted: true }, 'Your account has been deleted.');
+});
+
+// ───────── sign in with a one-time code sent to the customer's email ─────────
+
+const codeHits = new Map();
+/** A small in-memory limit per address (the per-email limit is in the database). */
+const tooMany = (key, max, windowMs = 3600_000) => {
+  const now = Date.now();
+  const recent = (codeHits.get(key) || []).filter((t) => now - t < windowMs);
+  if (recent.length >= max) {
+    codeHits.set(key, recent);
+    return true;
+  }
+  recent.push(now);
+  codeHits.set(key, recent);
+  return false;
+};
+
+const isLoginCustomer = (p) => !!p && p.role === 'customer' && !p.requested_role && p.is_active !== false;
+
+/**
+ * POST /api/auth/code/request  body: { email }
+ * Sends a 6-digit code to the email if it belongs to a customer account. The answer is always the same, so it cannot be used to
+ * find out which emails have an account.
+ */
+export const requestLoginCode = catchAsync(async (req, res) => {
+  const email = normaliseEmail(req.body?.email);
+  if (!email) throw new BadRequestError('Enter a valid email address.');
+  if (tooMany(`req:${req.ip}`, 10)) throw new BadRequestError('Too many requests. Please try again in a while.');
+  const profile = await UserModel.findProfileByEmail(email);
+  if (isLoginCustomer(profile)) {
+    try {
+      const code = await issueLoginCode(email);
+      const mail = renderEmail({ heading: 'Your Stitch&Ship sign-in code', paragraphs: [`Your code is ${code}.`, 'It works for 10 minutes. If you did not ask for it, you can ignore this email.'] });
+      await sendTransactionalEmail({ to: email, subject: 'Your Stitch&Ship sign-in code', ...mail });
+    } catch (err) {
+      console.warn('[Auth] sign-in code not sent:', err.message);
+    }
+  }
+  return ApiResponse.success(res, null, 'If this email has a Stitch&Ship account, we sent a 6-digit code to it.');
+});
+
+/**
+ * POST /api/auth/code/verify  body: { email, code } or { email, token }  (token = the button in the email)
+ * Same answer as /login. Customers only: staff accounts never sign in this way.
+ */
+export const verifyLoginCode = catchAsync(async (req, res) => {
+  const email = normaliseEmail(req.body?.email);
+  if (!email) throw new BadRequestError('Enter a valid email address.');
+  if (tooMany(`ver:${req.ip}`, 30)) throw new BadRequestError('Too many attempts. Please try again in a while.');
+  const ok = await redeemLoginCode({ email, code: req.body?.code, token: req.body?.token });
+  const profile = ok ? await UserModel.findProfileByEmail(email) : null;
+  if (!ok || !isLoginCustomer(profile)) throw new UnauthorizedError('That code is not right or has expired. Please ask for a new one.');
+  const { session } = await UserModel.signInVerifiedEmail(email);
+  if (!session) throw new UnauthorizedError('Sign-in could not be completed. Please try again.');
+  return ApiResponse.success(res, { user: await publicProfile(profile), tokens: toTokens(session) }, 'Login successful.');
 });
 
 /**

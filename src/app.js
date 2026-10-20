@@ -4,6 +4,7 @@ import morgan from 'morgan';
 import apiRouter from './routes/index.js';
 import { notFoundHandler, errorHandler } from './middlewares/error.middleware.js';
 import { stripeWebhook } from './controllers/payment.controller.js';
+import { shopifyWebhook } from './controllers/shopify.controller.js';
 
 const app = express();
 
@@ -17,6 +18,8 @@ app.use(cors({
 app.use(morgan('dev'));
 // Stripe signs the exact bytes it sends: this route needs the RAW body, so it is registered before any JSON parser
 app.post('/api/webhooks/stripe', express.raw({ type: 'application/json', limit: '1mb' }), stripeWebhook);
+// Shopify signs the exact bytes too: raw body, before any JSON parser
+app.post('/api/webhooks/shopify', express.raw({ type: 'application/json', limit: '5mb' }), shopifyWebhook);
 
 // Postmark inbound emails can be up to ~35 MB with attachments; parsed here so the global limit below stays small
 app.use('/api/inbound/email', express.json({ limit: '45mb' }));

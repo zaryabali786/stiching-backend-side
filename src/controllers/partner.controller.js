@@ -1,3 +1,4 @@
+import { attachCodSummary } from '../services/cod-payment.service.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError } from '../utils/error.helper.js';
 import { createUser, updateUser, setMemberUser } from '../services/partner-users.service.js';
@@ -229,6 +230,8 @@ export const getReceiving = catchAsync(async (req, res) => {
   const returnOrders = await returnOrdersForUnits(rows.flatMap((o) => o.units.filter((u) => u.return_status && u.return_status !== 'none').map((u) => u.id))).catch(() => new Map());
   for (const o of rows) for (const u of o.units) u.return_order = returnOrders.get(u.id) ?? null;
   const suggestion = tab === 'expected' && rows.length ? await suggestAssignees(null, scopeOf(req.access)) : null;
+  // COD orders: whether the customer has paid, so the person receiving the parcel sees it on the card
+  await attachCodSummary(rows);
 
   return sendPage(res, rows, q, result.count, {
     counts: { expected: expected.count || 0, issues: issues.count || 0, hold: hold.count || 0, recent: recent.count || 0, ...Object.fromEntries(RETURN_TABS.map((t, i) => [t, returnCounts[i].count || 0])) },
@@ -846,6 +849,47 @@ export const updateDispatchTracking = catchAsync(async (req, res) => {
   const shipment = await shipmentWithAccess(req, req.params.shipmentId);
   const result = await recordDispatchTracking({ shipment, status: req.body?.status, note: req.body?.note, reason: req.body?.reason, source: 'manual', profile: req.profile });
   return ApiResponse.success(res, result.shipment, result.duplicate ? 'Already recorded.' : 'Tracking updated.');
+});
+
+/**
+ * GET /api/partner/warehouse/scan-lookup?code=SA-1108-1 (an article's QR code) or SA-1108 (the parcel's order reference).
+ * Resolves what a physical scan points to: the article, its order and its dispatch shipment, and whether the parcel can go on a
+ * loadsheet (booked, CN saved, loadsheet not downloaded yet) and whether its CN can be printed (booked or loadsheet downloaded).
+ * Nothing is changed here; the loadsheet and the CN use the existing endpoints with the shipment ids this returns.
+ */
+export const scanLookupDispatch = catchAsync(async (req, res) => {
+  const code = String(req.query.code || '').trim().slice(0, 80);
+  if (!code) throw new BadRequestError('Scan an article QR code or type its code.');
+  const exact = code.replace(/[%_]/g, '\\$&');
+  let unit = (await supabaseAdmin.from('order_units').select('id, code, unit_title, order_id, line_no').ilike('code', exact).limit(1).maybeSingle()).data;
+  let order = null;
+  if (unit) order = (await supabaseAdmin.from('orders').select('id, reference, partner_id, status, customer_name, customer_code, destination_city, destination_country, weight_kg').eq('id', unit.order_id).maybeSingle()).data;
+  else order = (await supabaseAdmin.from('orders').select('id, reference, partner_id, status, customer_name, customer_code, destination_city, destination_country, weight_kg').ilike('reference', exact).limit(1).maybeSingle()).data;
+  if (!order) throw new BadRequestError(`No article or parcel has the code ${code}.`);
+  const scope = scopeOf(req.access);
+  if (scope !== undefined && order.partner_id !== scope) throw new ForbiddenError('This article belongs to another partner.');
+
+  const shipment = (await supabaseAdmin.from('shipments').select('id, status, courier, courier_id, tracking_number, loadsheet_id, shipped_from').eq('order_id', order.id).order('created_at', { ascending: false }).limit(1).maybeSingle()).data;
+  let loadsheet = false;
+  let cn = false;
+  let reason = null;
+  if (!shipment || shipment.status === 'needs_label') reason = 'No courier is booked for this parcel yet. Book it in the Paid tab first.';
+  else if (!['booked', 'labelled'].includes(shipment.status)) reason = `This parcel is already ${shipment.status === 'handed_to_courier' ? 'dispatched' : String(shipment.status).replace(/_/g, ' ')}.`;
+  else if (!String(shipment.tracking_number || '').trim()) reason = 'This parcel has no CN yet. Add its CN number first.';
+  else {
+    cn = true;
+    if (shipment.status === 'labelled') reason = 'Its loadsheet was already downloaded. Confirm the handover in the list instead.';
+    else loadsheet = true;
+  }
+  return ApiResponse.success(res, {
+    code,
+    article: unit ? { id: unit.id, code: unit.code, title: unit.unit_title, line_no: unit.line_no } : null,
+    order: { id: order.id, reference: order.reference, customer_name: order.customer_name, customer_code: order.customer_code, destination_city: order.destination_city, destination_country: order.destination_country, weight_kg: order.weight_kg },
+    shipment: shipment ? { id: shipment.id, status: shipment.status, courier: shipment.courier, courier_id: shipment.courier_id, tracking_number: shipment.tracking_number, loadsheet_id: shipment.loadsheet_id } : null,
+    can_loadsheet: loadsheet,
+    can_print_cn: cn,
+    reason,
+  });
 });
 
 /**

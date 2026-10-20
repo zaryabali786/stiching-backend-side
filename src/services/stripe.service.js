@@ -110,3 +110,50 @@ export const constructWebhookEvent = (rawBody, signature) => {
   if (!config.stripe.webhookSecret) throw new AppError('Stripe webhook is not configured (STRIPE_WEBHOOK_SECRET).', 503);
   return stripe().webhooks.constructEvent(rawBody, signature, config.stripe.webhookSecret);
 };
+
+// ───────────── Stripe Checkout Sessions (cash-on-delivery orders: the customer pays the order total) ─────────────
+
+export const retrieveCheckoutSession = (id) => stripe().checkout.sessions.retrieve(id);
+
+/** Stop a session that is no longer wanted (the amount changed, or the customer was switched to Non-COD). Never throws. */
+export const expireCheckoutSession = async (id) => {
+  try {
+    await stripe().checkout.sessions.expire(id);
+  } catch {
+    /* already expired or completed: nothing to stop */
+  }
+};
+
+/**
+ * A hosted Stripe Checkout page for one COD order. `idempotencyKey` makes two clicks at the same moment return the same session.
+ * The amount comes from the verified order total in the database, never from the app.
+ */
+export const createCheckoutSession = async ({ order, customer, amount, currency, successUrl, cancelUrl, idempotencyKey }) => {
+  const minor = toMinorUnits(amount, currency);
+  if (!(minor > 0)) throw new BadRequestError('This order has no amount to pay.');
+  const metadata = { kind: 'cod', order_id: order.id, order_reference: order.reference || '', customer_id: order.customer_id };
+  try {
+    const session = await stripe().checkout.sessions.create(
+      {
+        mode: 'payment',
+        client_reference_id: order.id,
+        customer_email: customer?.email || undefined,
+        line_items: [
+          {
+            quantity: 1,
+            price_data: { currency: String(currency).toLowerCase(), unit_amount: minor, product_data: { name: `Order ${order.reference || ''} · total payable`.trim() } },
+          },
+        ],
+        payment_intent_data: { description: `Cash on delivery order ${order.reference || ''}`.trim(), metadata },
+        metadata,
+        success_url: successUrl,
+        cancel_url: cancelUrl,
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+    return { session, minor };
+  } catch (err) {
+    // e.g. a currency Stripe cannot charge, or an amount below Stripe's minimum
+    throw new BadRequestError(err?.raw?.message || err.message || 'The payment could not be started.');
+  }
+};

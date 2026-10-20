@@ -1,3 +1,4 @@
+import { getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { Router } from 'express';
 import {
   getPartnerOverview,
@@ -42,6 +43,7 @@ import {
   confirmDispatchReturnReceived,
   getApiCouriers,
   printDispatchCn,
+  scanLookupDispatch,
   refreshDispatchTracking,
   getTransfers,
   dispatchTransfer,
@@ -110,6 +112,9 @@ router.post('/receiving/units/:unitId/receive', need('receiving.receive'), ownsU
 router.post('/receiving/units/:unitId/receive-corrected', need('receiving.returns'), ownsUnit('unitId'), receiveCorrectedArticle);
 router.post('/receiving/units/:unitId/issue', need('receiving.issue'), ownsUnit('unitId'), reportUnitIssue);
 router.post('/receiving/orders/:orderId/receive-all', need('receiving.receive'), ownsOrder('orderId'), receiveAllUnits);
+router.get('/receiving/orders/:orderId/cod', need('receiving.view'), ownsOrder('orderId'), getOrderCod);
+router.put('/receiving/orders/:orderId/payment-type', need('receiving.receive'), ownsOrder('orderId'), setStaffPaymentType);
+router.put('/receiving/orders/:orderId/cod-amount', need('receiving.receive'), ownsOrder('orderId'), setStaffCodAmount);
 router.post('/receiving/orders/:orderId/parcel-media', need('receiving.receive'), ownsOrder('orderId'), addParcelMedia);
 router.get('/receiving/unmatched', need('receiving.view'), getUnmatchedParcels);
 router.get('/receiving/elsewhere', need('receiving.view'), findParcelElsewhere);
@@ -181,6 +186,7 @@ router.post('/warehouse/dispatch/loadsheets/:id/downloaded', need('warehouse.loa
 router.post('/warehouse/dispatch/loadsheets/:id/handed-over', need('warehouse.loadsheet'), confirmDispatchSheetHandover);
 router.post('/warehouse/shipments/:shipmentId/tracking', need('warehouse.tracking'), updateDispatchTracking);
 router.get('/warehouse/cn/print', need('warehouse.view'), printDispatchCn);
+router.get('/warehouse/scan-lookup', need('warehouse.view'), scanLookupDispatch);
 router.get('/warehouse/couriers/api', need('warehouse.view'), getApiCouriers);
 router.post('/warehouse/shipments/:shipmentId/refresh-tracking', need('warehouse.tracking'), refreshDispatchTracking);
 router.post('/warehouse/shipments/:shipmentId/received-back', need('warehouse.tracking'), confirmDispatchReturnReceived);

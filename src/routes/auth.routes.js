@@ -10,6 +10,9 @@ import {
   refreshSession,
   forgotPassword,
   changePassword,
+  deleteMyAccount,
+  requestLoginCode,
+  verifyLoginCode,
 } from '../controllers/auth.controller.js';
 import { authenticate } from '../middlewares/auth.middleware.js';
 import { validateRegister, validateLogin } from '../middlewares/validate.middleware.js';
@@ -26,6 +29,9 @@ router.post('/forgot-password', forgotPassword);
 router.get('/me', authenticate, getMe);
 router.patch('/me', authenticate, updateMe);
 router.post('/change-password', authenticate, changePassword);
+router.post('/code/request', requestLoginCode);
+router.post('/code/verify', verifyLoginCode);
+router.post('/delete-account', authenticate, deleteMyAccount);
 router.post('/logout', authenticate, logout);
 
 export default router;
