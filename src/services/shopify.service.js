@@ -114,7 +114,50 @@ export const completeInstall = async ({ shop, code }) => {
   };
   const { data: store, error } = await supabaseAdmin.from('shopify_stores').upsert(row, { onConflict: 'shop_domain' }).select('*').single();
   if (error) throw error;
+  await connectWebhooks(store);
   return store;
+};
+
+// ───────────── webhooks of one store ─────────────
+
+/** The notifications we want from every store. With the classic install flow they are registered per store, through the API. */
+export const WEBHOOK_TOPICS = ['ORDERS_CREATE', 'ORDERS_UPDATED', 'ORDERS_CANCELLED', 'APP_UNINSTALLED'];
+
+const WEBHOOK_CREATE = `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) { webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) { webhookSubscription { id } userErrors { field message } } }`;
+
+/**
+ * Subscribe a store to the notifications. A subscription that already exists (the install ran twice) counts as done.
+ * @returns {Promise<{ ok: boolean, failed: string[] }>}
+ */
+export const registerWebhooks = async (store, callbackUrl = `${config.shopify.appUrl}/api/webhooks/shopify`) => {
+  const failed = [];
+  for (const topic of WEBHOOK_TOPICS) {
+    try {
+      const res = await shopifyGraphql(store, WEBHOOK_CREATE, { topic, sub: { callbackUrl, format: 'JSON' } });
+      const errs = res?.webhookSubscriptionCreate?.userErrors || [];
+      const onlyTaken = errs.length > 0 && errs.every((e) => /already been taken|already exists/i.test(e.message || ''));
+      if (errs.length && !onlyTaken) failed.push(`${topic}: ${errs.map((e) => e.message).join('; ')}`);
+    } catch (err) {
+      failed.push(`${topic}: ${err.message}`);
+    }
+  }
+  return { ok: failed.length === 0, failed };
+};
+
+/** Registers the webhooks and writes the result on the store (settings.webhooks), so the admin page can show it. Never throws. */
+export const connectWebhooks = async (store) => {
+  let result;
+  try {
+    result = await registerWebhooks(store);
+  } catch (err) {
+    result = { ok: false, failed: [err.message] };
+  }
+  const status = { ok: result.ok, at: new Date().toISOString(), failed: result.failed.slice(0, 4) };
+  const settings = { ...(store.settings || {}), webhooks: status };
+  await supabaseAdmin.from('shopify_stores').update({ settings, updated_at: new Date().toISOString() }).eq('id', store.id);
+  store.settings = settings;
+  if (!result.ok) console.warn(`[Shopify] webhooks of ${store.shop_domain} could not all be registered:`, result.failed.join(' | '));
+  return status;
 };
 
 export const getActiveStore = async (shopDomain) => {

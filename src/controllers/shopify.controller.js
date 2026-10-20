@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
-import { buildInstallUrl, completeInstall, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
+import { buildInstallUrl, completeInstall, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
 import { confirmAtelierAddress, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
 import { processWebhookEvent, recordWebhookEvent } from '../services/shopify-events.service.js';
 import { loadShipTo } from '../services/ship-to.service.js';
@@ -124,6 +124,15 @@ export const updateShopifyStore = catchAsync(async (req, res) => {
   if (error) throw error;
   if (!data) throw new NotFoundError('Store not found');
   return ApiResponse.success(res, publicStore(data), 'Store saved.');
+});
+
+/** POST /api/admin/shopify/stores/:id/webhooks — subscribe the store to the order notifications again (after a failed install step). */
+export const reconnectShopifyWebhooks = catchAsync(async (req, res) => {
+  const { data: store } = await supabaseAdmin.from('shopify_stores').select('*').eq('id', req.params.id).maybeSingle();
+  if (!store) throw new NotFoundError('Store not found');
+  if (store.status !== 'active' || !store.access_token_enc) throw new ConflictError('The store has not installed the app yet.');
+  const status = await connectWebhooks(store);
+  return ApiResponse.success(res, status, status.ok ? 'Webhooks connected.' : 'Some webhooks could not be connected.');
 });
 
 /** GET /api/admin/shopify/queue — failed orders, held addresses, customers who were not emailed. */

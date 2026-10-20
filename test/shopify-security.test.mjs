@@ -124,3 +124,59 @@ test('emails are normalised and checked', () => {
   assert.equal(codes.normaliseEmail('not an email'), null);
   assert.equal(codes.normaliseEmail('a@b'), null);
 });
+
+// ───────────── install and the store's webhooks ─────────────
+
+const withFetch = async (fake, fn) => {
+  const real = globalThis.fetch;
+  globalThis.fetch = fake;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = real;
+  }
+};
+
+test('the install keeps the token encrypted, registers the four order webhooks and records the result', async () => {
+  db = createFakeDb({ shopify_stores: [{ shop_domain: 'my-brand.myshopify.com', status: 'pending' }] });
+  const seen = [];
+  const store = await withFetch(async (url, init) => {
+    if (String(url).endsWith('/admin/oauth/access_token')) return { ok: true, json: async () => ({ access_token: 'shpat_live_token', scope: 'read_orders' }) };
+    const body = JSON.parse(init.body);
+    seen.push({ url: String(url), token: init.headers['X-Shopify-Access-Token'], topic: body.variables.topic, callback: body.variables.sub.callbackUrl, format: body.variables.sub.format });
+    return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ data: { webhookSubscriptionCreate: { webhookSubscription: { id: 'gid://x' }, userErrors: [] } } }) };
+  }, () => sh.completeInstall({ shop: 'my-brand.myshopify.com', code: 'abc' }));
+
+  assert.equal(store.status, 'active');
+  assert.equal(store.access_token_enc.includes('shpat_live_token'), false, 'the token is stored encrypted');
+  assert.equal(sh.decryptToken(store.access_token_enc), 'shpat_live_token');
+  assert.deepEqual(seen.map((s) => s.topic), ['ORDERS_CREATE', 'ORDERS_UPDATED', 'ORDERS_CANCELLED', 'APP_UNINSTALLED']);
+  assert.ok(seen.every((s) => s.callback === 'https://api.example.test/api/webhooks/shopify' && s.format === 'JSON' && s.token === 'shpat_live_token'));
+  assert.ok(seen.every((s) => s.url.startsWith('https://my-brand.myshopify.com/admin/api/')));
+  const saved = db.table('shopify_stores')[0];
+  assert.equal(saved.settings.webhooks.ok, true);
+  assert.equal(db.table('shopify_stores').length, 1, 'an install of a store that is already registered updates it');
+});
+
+test('a webhook that already exists is fine; a real failure is recorded for the admin and does not stop the install', async () => {
+  db = createFakeDb({ shopify_stores: [{ shop_domain: 'my-brand.myshopify.com', status: 'pending' }] });
+  const store = await withFetch(async (url, init) => {
+    if (String(url).endsWith('/admin/oauth/access_token')) return { ok: true, json: async () => ({ access_token: 'tok', scope: '' }) };
+    const topic = JSON.parse(init.body).variables.topic;
+    const userErrors = topic === 'ORDERS_CREATE' ? [{ message: 'Address for this topic has already been taken' }] : topic === 'ORDERS_UPDATED' ? [{ message: 'Missing scope read_orders' }] : [];
+    return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ data: { webhookSubscriptionCreate: { userErrors } } }) };
+  }, () => sh.completeInstall({ shop: 'my-brand.myshopify.com', code: 'abc' }));
+  assert.equal(store.status, 'active', 'the install still succeeded');
+  const saved = db.table('shopify_stores')[0];
+  assert.equal(saved.settings.webhooks.ok, false);
+  assert.equal(saved.settings.webhooks.failed.length, 1);
+  assert.match(saved.settings.webhooks.failed[0], /ORDERS_UPDATED: Missing scope/);
+});
+
+test('Shopify refusing the code stops the install and stores nothing', async () => {
+  db = createFakeDb({ shopify_stores: [] });
+  await withFetch(async () => ({ ok: false, json: async () => ({}) }), async () => {
+    await assert.rejects(() => sh.completeInstall({ shop: 'my-brand.myshopify.com', code: 'bad' }), /did not give the app its access/);
+  });
+  assert.equal(db.table('shopify_stores').length, 0);
+});

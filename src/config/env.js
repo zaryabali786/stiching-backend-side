@@ -89,7 +89,7 @@ export const config = {
   shopify: {
     apiKey: (process.env.SHOPIFY_APP_API_KEY || '').trim(),
     apiSecret: (process.env.SHOPIFY_APP_API_SECRET || '').trim(),
-    apiVersion: (process.env.SHOPIFY_API_VERSION || '2025-07').trim(),
+    apiVersion: (process.env.SHOPIFY_API_VERSION || '2026-07').trim(),
     // the public address of THIS server (Shopify redirects the brand back to <appUrl>/api/shopify/auth/callback)
     appUrl: (process.env.SHOPIFY_APP_URL || '').trim().replace(/\/$/, ''),
     scopes: (process.env.SHOPIFY_SCOPES || 'read_orders,write_orders,read_products,read_customers,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders').trim(),

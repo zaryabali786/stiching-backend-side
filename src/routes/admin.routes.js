@@ -1,4 +1,4 @@
-import { addShopifyStore, getShopifyQueue, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
+import { addShopifyStore, getShopifyQueue, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, reconnectShopifyWebhooks, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
 import { getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
@@ -98,6 +98,7 @@ router.get('/orders/:id', getAdminOrder);
 router.get('/shopify/stores', listShopifyStores);
 router.post('/shopify/stores', addShopifyStore);
 router.patch('/shopify/stores/:id', updateShopifyStore);
+router.post('/shopify/stores/:id/webhooks', reconnectShopifyWebhooks);
 router.get('/shopify/queue', getShopifyQueue);
 router.post('/shopify/orders/:id/retry', retryShopifyOrderRequest);
 router.post('/shopify/orders/:id/resend', resendShopifyEmailRequest);
