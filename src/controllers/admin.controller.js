@@ -151,7 +151,7 @@ export const getAdminOrders = catchAsync(async (req, res) => {
   let query = scope(
     supabaseAdmin
       .from('orders')
-      .select('id, reference, brand, status, order_kind, return_unit_id, has_issue, priority, customer_name, customer_code, destination_city, destination_country, due_date, created_at, partner_id, partner:partners!orders_partner_id_fkey(id, name), units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
+      .select('id, reference, brand, status, order_kind, external_source, return_unit_id, has_issue, priority, customer_name, customer_code, destination_city, destination_country, due_date, created_at, partner_id, partner:partners!orders_partner_id_fkey(id, name), units:order_units!order_units_order_id_fkey(count)', { count: 'exact' })
   )
     .order(q.sort, { ascending: q.ascending, nullsFirst: false })
     .range(q.from, q.to);

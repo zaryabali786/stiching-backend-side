@@ -84,6 +84,16 @@ export const config = {
     postmarkToken: (process.env.POSTMARK_SERVER_TOKEN || process.env.POSTMARK_API_KEY || '').trim(),
     stream: process.env.POSTMARK_MESSAGE_STREAM || 'outbound',
   },
+  // Backup for the platform's own emails (sign-in codes, "add your sizes"): plain SMTP, e.g. Gmail with an app password.
+  // Used when Postmark is not set up or rejects the message.
+  smtp: {
+    host: (process.env.SMTP_HOST || '').trim(),
+    port: Number(process.env.SMTP_PORT) || 465,
+    secure: String(process.env.SMTP_SECURE ?? 'true').toLowerCase() !== 'false',
+    user: (process.env.SMTP_USER || '').trim(),
+    pass: (process.env.SMTP_PASS || '').replace(/\s/g, ''),
+    from: (process.env.SMTP_FROM || '').trim(),
+  },
   // Shopify brand stores ("Customise stitching with Stitch&Ship"). The app is created in the Shopify Partner dashboard with custom
   // distribution; each brand installs it through /api/shopify/auth?shop=<store>.myshopify.com. SECRETS: keep them in the server .env.
   shopify: {

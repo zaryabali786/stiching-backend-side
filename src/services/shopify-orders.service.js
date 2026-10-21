@@ -218,7 +218,7 @@ export const sendCustomerEmail = async ({ row, order, email, mismatch, store = n
       });
   const result = await sendTransactionalEmail({ to: email, subject, ...content });
   if (result.sent) await patchRow(row, { notified_at: new Date().toISOString(), last_error: null });
-  else await patchRow(row, { last_error: 'The customer email could not be sent.' });
+  else await patchRow(row, { last_error: result.detail ? `The customer email could not be sent: ${result.detail}`.slice(0, 500) : 'The customer email could not be sent.' });
 
   // the text: only when this store allows it, the account is set up, and the customer's own number is known
   const storeRow = store || (await supabaseAdmin.from('shopify_stores').select('settings').eq('id', row.store_id).maybeSingle()).data;
@@ -420,7 +420,7 @@ export const resendCustomerEmail = async (rowId) => {
   if (!row?.order_id) throw new ConflictError('This Shopify order has no Stitch&Ship order yet.');
   const { data: order } = await supabaseAdmin.from('orders').select('*').eq('id', row.order_id).maybeSingle();
   const result = await sendCustomerEmail({ row, order, email: row.customer_email, mismatch: row.address_state === 'address_mismatch' });
-  if (!result.sent) throw new ConflictError('The email could not be sent. Check the email settings on the server.');
+  if (!result.sent) throw new ConflictError(result.detail ? `The email could not be sent: ${result.detail}` : 'The email could not be sent. Check the email settings on the server.');
   return result;
 };
 
