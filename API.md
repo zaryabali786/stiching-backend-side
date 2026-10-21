@@ -515,7 +515,7 @@ Stages: `to_assign, cutting, stitching, qc, packed`.
 | PATCH | `/production/cards/:id` | `{ master_id?, tailor_id?, due_date?, priority? }` → Card |
 | POST | `/production/cards/:id/assign` | `{ master_id? }` (suggested if omitted) → moves to cutting |
 | POST | `/production/cards/:id/comments` | `{ body }` |
-| PATCH | `/production/cards/:id/qc-checklist` | `{ checklist: { measurements, seams, threads, pressed, notes } }` |
+| PATCH | `/production/cards/:id/qc-checklist` | `{ checklist: { measurements, seams, threads, notes } }` |
 | POST | `/production/cards/:id/ask-customer` | `{ message }` → customer notification + timeline |
 | GET | `/production/suggestions?masterId` | `{ master: {id,name,assigned,load_pct}|null, tailor: …|null }` |
 | GET | `/production/scan?code=SA-1001` | Card[] matching order reference or customer code |

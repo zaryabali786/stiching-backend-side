@@ -960,7 +960,6 @@ export const QC_CHECKLIST = [
   { key: 'measurements', label: 'Measurements match the chart' },
   { key: 'seams', label: 'Seams and finishing' },
   { key: 'threads', label: 'Loose threads removed' },
-  { key: 'pressed', label: 'Pressed and folded' },
   { key: 'notes', label: 'Matches customer notes' },
 ];
 
