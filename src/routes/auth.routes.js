@@ -9,6 +9,7 @@ import {
   logout,
   refreshSession,
   forgotPassword,
+  resetPassword,
   changePassword,
   deleteMyAccount,
   requestLoginCode,
@@ -25,6 +26,7 @@ router.post('/google', googleLogin);
 router.post('/apple', appleLogin);
 router.post('/refresh', refreshSession);
 router.post('/forgot-password', forgotPassword);
+router.post('/reset-password', resetPassword);
 
 router.get('/me', authenticate, getMe);
 router.patch('/me', authenticate, updateMe);

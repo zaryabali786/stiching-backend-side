@@ -225,14 +225,53 @@ export const refreshSession = catchAsync(async (req, res) => {
 
 /**
  * POST /api/auth/forgot-password  body: { email, portal }
+ * Sends the reset email ourselves with a link to the app's own /reset-password page (so it never depends on Supabase's Site URL
+ * or redirect list). The link carries a one-time token that only POST /auth/reset-password can use.
  */
 export const forgotPassword = catchAsync(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   if (!email) throw new BadRequestError('Email is required.');
-  const base = req.body.portal === 'staff' ? config.urls.adminApp : config.urls.clientApp;
+  const base = String(req.body.portal === 'staff' ? config.urls.adminApp : config.urls.clientApp).replace(/\/$/, '');
   // Always answer the same way so the endpoint can't be used to discover accounts
-  await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${base}/login` }).catch(() => {});
-  return ApiResponse.success(res, null, 'If an account exists for this email, a reset link has been sent.');
+  const done = () => ApiResponse.success(res, null, 'If an account exists for this email, a reset link has been sent.');
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.generateLink({ type: 'recovery', email });
+    const token = data?.properties?.hashed_token;
+    if (error || !token) return done();
+    const url = `${base}/reset-password?token=${encodeURIComponent(token)}`;
+    const content = renderEmail({
+      heading: 'Reset your password',
+      paragraphs: ['We received a request to reset the password of your Stitch&Ship account.', 'Open the link below to choose a new password. It works once and expires soon. If you did not ask for this, you can ignore this email.'],
+      button: { label: 'Choose a new password', url },
+      footer: `Account: ${email}`,
+    });
+    const sent = await sendTransactionalEmail({ to: email, subject: 'Reset your Stitch&Ship password', ...content });
+    if (!sent.sent) console.warn('[Auth] reset email not sent:', sent.detail || sent.reason);
+  } catch (err) {
+    console.warn('[Auth] forgot-password failed:', err.message);
+  }
+  return done();
+});
+
+/**
+ * POST /api/auth/reset-password  body: { token, password }
+ * The token from the reset email (single use). Sets the new password and signs every old session out.
+ */
+export const resetPassword = catchAsync(async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  const password = String(req.body?.password || '');
+  if (!token) throw new BadRequestError('This reset link is not valid. Ask for a new one.');
+  if (password.length < 8) throw new BadRequestError('Password must be at least 8 characters long.');
+  const { data, error } = await supabase.auth.verifyOtp({ token_hash: token, type: 'recovery' });
+  const user = data?.user;
+  if (error || !user) throw new BadRequestError('This reset link has expired or was already used. Ask for a new one.');
+  await UserModel.updatePassword(user.id, password);
+  // a login that was created with a temporary password is now properly set up
+  await supabaseAdmin.from('profiles').update({ must_change_password: false, updated_at: new Date().toISOString() }).eq('id', user.id);
+  invalidateProfile(user.id);
+  // sign out any other device: the old password may have been the reason for the reset
+  await supabaseAdmin.auth.admin.signOut(data.session?.access_token, 'others').catch(() => {});
+  return ApiResponse.success(res, null, 'Password changed. You can sign in with the new password.');
 });
 
 /**
