@@ -9,7 +9,7 @@ import { notifyStaff, notifyAdmins, notifyPartner, notifyUser } from '../service
 import { notifyArticleTeam } from '../services/article-notify.service.js';
 import { uploadDataUrls, withSignedUrl } from '../services/storage.service.js';
 import { isCod } from '../services/email-order-match.service.js';
-import { assertCodEditable, codView, isCodLocked, retireCodCheckout } from '../services/cod-payment.service.js';
+import { assertCodEditable, assertReceivable, codView, isCodLocked, retireCodCheckout } from '../services/cod-payment.service.js';
 import { fallbackPrices, priceKey } from '../services/article-price.service.js';
 import { resolveOrderRefs, internationalFromCountry, resolveUnitArticles, saveUnitArticles } from '../services/order-input.service.js';
 import { createMessage } from '../services/chat.service.js';
@@ -657,6 +657,7 @@ export const previewProduct = catchAsync(async (req, res) => {
  */
 export const approveParcel = catchAsync(async (req, res) => {
   const order = await loadOwnOrder(req);
+  assertReceivable(order); // an unpaid COD order is not approved (or produced) before its payment is confirmed
   const result = await approveAllArticles({ order, profile: req.profile });
   const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
   return ApiResponse.success(res, await orderDetailResponse(full), result.approved === 1 ? 'Article approved.' : `${result.approved} articles approved.`);
@@ -668,6 +669,7 @@ export const approveParcel = catchAsync(async (req, res) => {
  */
 export const reviewArticle = catchAsync(async (req, res) => {
   const order = await loadOwnOrder(req);
+  if (req.body?.decision === 'approve') assertReceivable(order);
   const unit = await assertOwnUnit(order, req.params.unitId);
   const result = await decideArticle({ order, unit, decision: req.body?.decision, note: req.body?.note, media: req.body?.media, returnTo: req.body?.return_to, action: req.body?.action === 'hold' ? 'hold' : 'return', shipping: req.body?.shipping, profile: req.profile });
   const full = unwrap(await supabaseAdmin.from('orders').select(ORDER_DETAIL_SELECT).eq('id', order.id).single());
@@ -815,6 +817,7 @@ const cardActivity = (card, req, body) =>
  */
 export const approveClientOrder = catchAsync(async (req, res) => {
   const order = await loadOwnOrder(req);
+  assertReceivable(order);
   const unitId = req.body?.unit_id || null;
   const cards = await pendingCards(order, unitId);
   if (!cards.length) throw new BadRequestError(unitId ? 'This article is not waiting for your approval.' : 'Nothing is waiting for your approval.');

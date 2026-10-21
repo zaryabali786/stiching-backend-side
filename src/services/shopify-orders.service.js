@@ -2,13 +2,15 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { ConflictError } from '../utils/error.helper.js';
 import { loadShipTo } from './ship-to.service.js';
-import { addOrderTag, fetchLineItemDetails, getActiveStore, holdFulfillment, releaseFulfillment, updateShippingAddress } from './shopify.service.js';
+import { addOrderTag, fetchLineItemDetails, fetchOrderFinancials, getActiveStore, holdFulfillment, productsInCollection, releaseFulfillment, resolveCollectionGid, updateShippingAddress } from './shopify.service.js';
+import { allocateOrder, allocatePayment, loadSplit, loadSplits, markSplitCancelled, readFinancials, saveSplit } from './shopify-split.service.js';
 import { findOrCreateCustomerByEmail } from './customer-accounts.service.js';
 import { issueLoginCode, normaliseEmail } from './login-code.service.js';
 import { renderEmail, sendTransactionalEmail } from './transactional-email.service.js';
 import { cleanBrandName, defaultPartnerId, ensureBrand, expandItemsToUnits } from './order-import.service.js';
 import { addEvent } from './order.service.js';
 import { isCod } from './email-order-match.service.js';
+import { markPaidAtShopify } from './cod-payment.service.js';
 import { notifyAdmins, notifyUser } from './notification.service.js';
 import { sendSms, smsEnabled, toE164 } from './sms.service.js';
 
@@ -25,6 +27,8 @@ import { sendSms, smsEnabled, toE164 } from './sms.service.js';
  */
 
 export const STITCH_TAG = 'stitchship';
+/** A Shopify order that holds stitching lines AND normal lines: it is not "a Stitch&Ship order", so it does not get the plain tag. */
+export const STITCH_MIXED_TAG = 'stitchship-mixed';
 
 const prop = (line, name) => (line.properties || []).find((p) => String(p?.name ?? '').toLowerCase() === name)?.value;
 const attr = (payload, name) => (payload.note_attributes || []).find((a) => String(a?.name ?? '').toLowerCase() === name)?.value;
@@ -76,13 +80,110 @@ export const pickCustomerPhone = (payload, atelier) => {
   return null;
 };
 
-const paymentFields = (store, payload) => {
+/**
+ * The marked lines whose product really is in the clothing collection configured for this store (Shopify answers, never the page).
+ * Nothing configured: every marked line counts, as before. A configured collection that does not exist any more cannot be checked: the
+ * marked lines count and an administrator is told (a paid stitching order is never silently turned into a normal one).
+ * Throws when Shopify cannot be reached, so the order is retried and nothing is half done.
+ */
+export const eligibleLines = async (store, candidates) => {
+  const configured = String(store.settings?.clothing_collection || '').trim();
+  if (!configured || !candidates.length) return candidates;
+  const gid = await resolveCollectionGid(store, configured);
+  if (!gid) {
+    await alert(`Shopify: the clothing collection of ${store.shop_domain} was not found`, `"${configured}" does not exist in the store. Stitching lines are accepted without the collection check until it is fixed in Admin > Shopify stores.`);
+    return candidates;
+  }
+  const inCollection = await productsInCollection(store, candidates.map((l) => l.product_id), gid);
+  const kept = candidates.filter((l) => l.product_id && inCollection.has(String(l.product_id)));
+  if (kept.length < candidates.length) {
+    await alert(`Shopify: ${candidates.length - kept.length} marked item(s) are not clothing`, `${store.shop_domain}: ${candidates.filter((l) => !kept.includes(l)).map((l) => l.title).join(', ')} carried the Stitch&Ship marker but is not in the clothing collection, so it follows the normal flow.`);
+  }
+  return kept;
+};
+
+const num = (v) => (v === null || v === undefined || v === '' ? NaN : Number(v));
+
+/**
+ * What Shopify itself says about this order's payment, never assumed:
+ *   paid     fully paid (nothing outstanding)
+ *   unpaid   money is still owed: pending, authorized-but-not-captured, or partially paid (with the amount outstanding)
+ *   unknown  refunded / voided / missing / unreadable: not treated as paid, a person confirms it
+ * `outstanding` is Shopify's own figure when it gives one; otherwise total minus what was received.
+ */
+export const shopifyPaymentInfo = (payload) => {
+  const status = String(payload?.financial_status || '').toLowerCase();
+  const total = num(payload?.total_price);
+  const currency = payload?.currency ? String(payload.currency).toUpperCase() : null;
+  const received = num(payload?.total_received);
+  const stated = num(payload?.total_outstanding);
+  const base = { financial_status: status || null, total: Number.isFinite(total) ? total : null, currency };
+  if (!(total > 0) || !currency) return { ...base, kind: 'unknown', amount_paid: null, outstanding: null };
+  const owed = Number.isFinite(stated) ? stated : Number.isFinite(received) ? total - received : NaN;
+  if (status === 'paid' || status === 'partially_refunded') {
+    if (Number.isFinite(owed) && owed > 0.005) return { ...base, kind: 'unpaid', amount_paid: Number.isFinite(received) ? received : total - owed, outstanding: round(owed) };
+    return { ...base, kind: 'paid', amount_paid: Number.isFinite(received) && received > 0 ? received : total, outstanding: 0 };
+  }
+  if (status === 'partially_paid') {
+    if (Number.isFinite(owed) && owed > 0.005) return { ...base, kind: 'unpaid', amount_paid: Number.isFinite(received) ? received : round(total - owed), outstanding: round(owed) };
+    return { ...base, kind: 'unknown', amount_paid: Number.isFinite(received) ? received : null, outstanding: null };
+  }
+  if (status === 'pending' || status === 'authorized') return { ...base, kind: 'unpaid', amount_paid: 0, outstanding: round(Number.isFinite(owed) && owed > 0 ? owed : total) };
+  return { ...base, kind: 'unknown', amount_paid: null, outstanding: null };
+};
+const round = (n) => Math.round(n * 100) / 100;
+
+/** The payment facts of the stitching lines only when the order also holds normal lines (their share of the one real payment). */
+const groupInfo = (payload, split) => {
+  const g = split.alloc.groups.stitchship;
+  const p = split.pay.groups.stitchship;
+  const base = { financial_status: split.pay.financial_status || null, total: g.total, currency: split.alloc.currency };
+  if (['paid', 'paid_unverified'].includes(p.payment_status)) return { ...base, kind: 'paid', amount_paid: p.amount_paid, outstanding: 0 };
+  if (p.outstanding > 0) return { ...base, kind: 'unpaid', amount_paid: p.amount_paid ?? 0, outstanding: p.outstanding };
+  return { ...base, kind: 'unknown', amount_paid: null, outstanding: null };
+};
+const infoFor = (payload, split) => (split?.alloc?.mixed ? groupInfo(payload, split) : shopifyPaymentInfo(payload));
+
+const paymentFields = (store, payload, split = null) => {
   const gateways = (payload.payment_gateway_names || []).map((g) => String(g)).filter(Boolean);
   const extra = (store.settings?.cod_gateway_names || []).map((g) => String(g).toLowerCase());
   const cod = gateways.find((g) => isCod(g) || extra.includes(g.toLowerCase()));
   const method = cod || gateways[0] || null;
-  const paid = ['paid', 'partially_paid', 'authorized'].includes(String(payload.financial_status || '').toLowerCase());
-  return { brand_payment_method: method ? method.slice(0, 80) : null, brand_payment_status: method ? (paid ? 'paid' : 'pending') : null };
+  const info = infoFor(payload, split);
+  const now = new Date().toISOString();
+  const base = { brand_payment_method: method ? method.slice(0, 80) : null, brand_payment_status: method ? (info.kind === 'paid' ? 'paid' : 'pending') : null };
+  // Shopify says paid: the order is Non-COD and nothing is asked for again. Anything else is COD: the customer pays what is outstanding
+  // (or, when Shopify is unclear, our team confirms the total first). The customer is not asked to choose.
+  if (info.kind === 'paid') return { ...base, payment_type: 'NON_COD', payment_type_set_at: now, cod_payment_status: null };
+  if (info.kind === 'unpaid') {
+    return { ...base, payment_type: 'COD', payment_type_set_at: now, cod_payment_status: 'UNPAID', cod_amount: info.outstanding, cod_currency: info.currency, cod_amount_status: 'verified', cod_amount_source: 'shopify', cod_amount_note: 'The amount Shopify reports as outstanding.' };
+  }
+  return { ...base, payment_type: 'COD', payment_type_set_at: now, cod_payment_status: 'UNPAID', cod_amount_status: 'needs_verification', cod_amount_source: 'shopify', cod_amount_note: 'Shopify did not say clearly whether this order is paid.' };
+};
+
+/** Keep Shopify's own payment facts on the order (migration 0044). Never throws: the order does not depend on these columns. */
+const saveShopifyPayment = async (orderId, payload, split = null) => {
+  try {
+    const info = infoFor(payload, split);
+    await supabaseAdmin.from('orders').update({ shopify_financial_status: info.financial_status, shopify_amount_paid: info.amount_paid, shopify_outstanding: info.outstanding, shopify_payment_checked_at: new Date().toISOString() }).eq('id', orderId);
+  } catch (err) {
+    console.warn('[Shopify] could not save the payment status:', err.message);
+  }
+};
+
+const addressSummary = (a, kind, extra = {}) => (a ? { kind, name: [a.first_name, a.last_name].filter(Boolean).join(' ') || a.name || null, city: a.city || null, country: a.country || null, ...extra } : null);
+
+/** Which address belongs to which group. Shopify has ONE shipping address per order, so a mixed order cannot deliver two ways: it is flagged. */
+const groupAddresses = (payload, alloc, atelierOk) => {
+  const ship = payload.shipping_address;
+  const out = { stitchship: addressSummary(ship, atelierOk ? 'atelier' : 'other', { matches_atelier: !!atelierOk }) };
+  if (alloc.mixed) {
+    // the normal items should reach the customer, but the one shipping address is the atelier: the brand must ship them separately
+    out.normal = atelierOk
+      ? addressSummary(payload.billing_address || ship, 'billing', { matches_atelier: false, needs_separate_delivery: true, note: 'The order has one shipping address and it is the atelier. These normal items need to be delivered to the customer separately.' })
+      : addressSummary(ship, 'shipping', { matches_atelier: false });
+  }
+  return out;
 };
 
 const patchRow = async (row, patch) => {
@@ -94,7 +195,7 @@ const patchRow = async (row, patch) => {
 const alert = (title, body, orderId = null) => notifyAdmins({ type: 'alert', title, body, link: '/admin/shopify', ...(orderId ? { orderId } : {}) }).catch(() => undefined);
 
 /** Make the customer's draft order from the stitching lines (same shape as a draft made from a forwarded email). */
-const createDraft = async ({ store, payload, lines, profile, ref, email }) => {
+const createDraft = async ({ store, payload, lines, profile, ref, email, split = null }) => {
   const details = await fetchLineItemDetails(store, payload.admin_graphql_api_id).catch(() => new Map());
   const items = lines.map((l) => ({
     title: String([l.title, l.variant_title && l.variant_title !== 'Default Title' ? `· ${l.variant_title}` : ''].filter(Boolean).join(' ')).slice(0, 160),
@@ -115,7 +216,8 @@ const createDraft = async ({ store, payload, lines, profile, ref, email }) => {
   // the customer's own address, offered as the delivery address of the stitched outfit (they confirm it in the portal)
   const home = billing && !addressMatchesAtelier({ shipping: billing, atelier, ref: null }) ? billing : null;
   const country = String(home?.country || profile.country || '').trim();
-  const total = Number(payload.total_price);
+  // a mixed order: the customer's stitching order is worth its own lines, not the whole checkout
+  const total = split?.alloc?.mixed ? split.alloc.groups.stitchship.total : Number(payload.total_price);
   const due = new Date();
   due.setUTCDate(due.getUTCDate() + 12);
 
@@ -140,7 +242,7 @@ const createDraft = async ({ store, payload, lines, profile, ref, email }) => {
     stitching_mode: 'custom',
     brand_order_total: Number.isFinite(total) && total > 0 ? total : null,
     brand_order_currency: payload.currency || null,
-    ...paymentFields(store, payload),
+    ...paymentFields(store, payload, split),
     priority: 'normal',
     due_date: due.toISOString().slice(0, 10),
     destination_country: country || null,
@@ -174,6 +276,7 @@ const createDraft = async ({ store, payload, lines, profile, ref, email }) => {
     await supabaseAdmin.from('orders').delete().eq('id', order.id);
     throw unitsError;
   }
+  await saveShopifyPayment(order.id, payload, split);
   await addEvent(order.id, 'draft', `Order ${insert.brand_order_number} from ${insert.brand} (Shopify) with customised stitching`, null);
   return order;
 };
@@ -254,8 +357,8 @@ const releaseHold = async (store, row) => {
 
 /** A new Shopify order. Returns what happened; throws only for problems worth retrying. */
 export const processOrderCreate = async (store, payload) => {
-  const lines = stitchingLines(payload);
-  if (!lines.length) return { status: 'ignored' };
+  const marked = stitchingLines(payload);
+  if (!marked.length) return { status: 'ignored' };
   const shopifyId = String(payload.id);
   const email = normaliseEmail(payload.email || payload.contact_email || payload.customer?.email);
   const ref = stitchingRef(payload);
@@ -263,6 +366,9 @@ export const processOrderCreate = async (store, payload) => {
   let { data: row } = await supabaseAdmin.from('shopify_orders').select('*').eq('store_id', store.id).eq('shopify_order_id', shopifyId).maybeSingle();
   if (row && row.state === 'cancelled') return { status: 'cancelled' };
   if (row && row.state === 'draft_created' && row.notified_at) return { status: 'duplicate' };
+  // only products really in the clothing collection are stitched; asked of Shopify before anything is stored (a failure retries cleanly)
+  const lines = await eligibleLines(store, marked);
+  if (!lines.length) return { status: 'ignored' };
   if (!row) {
     const ins = await supabaseAdmin
       .from('shopify_orders')
@@ -305,21 +411,41 @@ export const processOrderCreate = async (store, payload) => {
     if (ok) await releaseHold(store, row);
     else if (!wasKnown) await alert(`Shopify: ${payload.name} is not going to the atelier`, `${store.shop_domain}: the shipping address of ${payload.name} is not the atelier address. The shipment is on hold until the customer confirms.`);
 
+    // what each group of lines is worth and how much of the one real payment covers it (Shopify's own data, never the page's)
+    const alloc = allocateOrder(payload, lines.map((l) => l.id));
+    const fetched = await fetchOrderFinancials(store, payload.admin_graphql_api_id).catch((err) => {
+      console.warn('[Shopify] could not read the payment of', payload.name, err.message);
+      return null;
+    });
+    const pay = allocatePayment(alloc, readFinancials(payload, fetched));
+    const split = { alloc, pay };
+    if (alloc.mixed && !row.order_id) {
+      await alert(`Shopify: ${payload.name} mixes stitching and normal items`, `${store.shop_domain}: ${lines.length} stitching line(s) and ${alloc.groups.normal.line_ids.length} normal line(s) were bought in one checkout, so they share one shipping address${ok ? ' (the atelier): the normal items must be delivered to the customer separately' : ''}.`);
+    }
+
     // 4. the customer and their draft order
     if (!row.order_id) {
       const { profile } = await findOrCreateCustomerByEmail({ email, name: payload.customer ? `${payload.customer.first_name || ''} ${payload.customer.last_name || ''}`.trim() : payload.shipping_address?.name });
-      const order = await createDraft({ store, payload, lines, profile, ref, email });
+      const order = await createDraft({ store, payload, lines, profile, ref, email, split });
       await patchRow(row, { order_id: order.id, state: 'draft_created', last_error: null });
       row.__order = order;
     }
     const order = row.__order || (await supabaseAdmin.from('orders').select('*').eq('id', row.order_id).maybeSingle()).data;
 
     // 5. tag in Shopify (for the brand's own view), then email the customer
-    await addOrderTag(store, payload.admin_graphql_api_id, STITCH_TAG).catch((err) => patchRow(row, { last_error: `Could not tag the order: ${err.message}` }));
+    const tag = alloc.mixed ? STITCH_MIXED_TAG : STITCH_TAG;
+    await addOrderTag(store, payload.admin_graphql_api_id, tag).catch((err) => patchRow(row, { last_error: `Could not tag the order: ${err.message}` }));
+    // the price split of this order (idempotent: one row per original order and group), with the address each group uses
+    const saved = await saveSplit({ row, store, payload, alloc, pay, orderId: row.order_id, addresses: groupAddresses(payload, alloc, ok), tags: { stitchship: STITCH_TAG, normal: null } });
+    const splitFailed = !saved.saved && !/does not exist|schema cache|could not find the table/i.test(saved.error || '');
     if (order && !row.notified_at) await sendCustomerEmail({ row, order, email, mismatch: !ok, store });
 
-    // the Shopify copy holds personal data: keep it only while something is still open
-    if (ok && row.notified_at && row.hold_state !== 'failed') await patchRow(row, { payload: null });
+    if (splitFailed) {
+      await patchRow(row, { last_error: `Could not save the price split: ${saved.error}`.slice(0, 500) });
+      await alert(`Shopify: the price split of ${payload.name} was not saved`, `${store.shop_domain}: ${saved.error}. Use "Try again" on the order.`);
+    }
+    // the Shopify copy holds personal data: keep it only while something is still open (an unsaved split is still open)
+    if (ok && row.notified_at && row.hold_state !== 'failed' && !splitFailed) await patchRow(row, { payload: null });
     return { status: 'processed', addressOk: ok, orderId: row.order_id };
   } catch (err) {
     if (err instanceof ConflictError) {
@@ -339,8 +465,15 @@ export const processOrderUpdated = async (store, payload) => {
   if (payload.cancelled_at) return cancelRow(store, row);
 
   if (row.order_id && payload.financial_status) {
-    const paid = ['paid', 'partially_paid', 'authorized'].includes(String(payload.financial_status).toLowerCase());
-    await supabaseAdmin.from('orders').update({ brand_payment_status: paid ? 'paid' : 'pending' }).eq('id', row.order_id).eq('status', 'draft').not('brand_payment_method', 'is', null);
+    const info = shopifyPaymentInfo(payload);
+    await supabaseAdmin.from('orders').update({ brand_payment_status: info.kind === 'paid' ? 'paid' : 'pending' }).eq('id', row.order_id).eq('status', 'draft').not('brand_payment_method', 'is', null);
+    await saveShopifyPayment(row.order_id, payload);
+    await refreshSplit(store, row, payload).catch((err) => console.warn('[Shopify] could not update the price split:', err.message));
+    // Shopify now shows the order fully paid: stop asking for payment (a payment already made here is kept)
+    if (info.kind === 'paid') {
+      const { data: order } = await supabaseAdmin.from('orders').select('*').eq('id', row.order_id).maybeSingle();
+      if (order) await markPaidAtShopify(order).catch((err) => console.warn('[Shopify] could not close the payment:', err.message));
+    }
   }
   if (row.address_state === 'address_mismatch' && row.hold_state === 'held') {
     const atelier = await loadShipTo().catch(() => ({}));
@@ -353,8 +486,52 @@ export const processOrderUpdated = async (store, payload) => {
   return { status: 'updated' };
 };
 
+/**
+ * Work the price split out again from Shopify's current order (a payment arrived, a refund was made): the same groups, new payment figures.
+ * @param {object|null} payload the Shopify order; without it only the payment is re-read for the saved groups
+ */
+export const refreshSplit = async (store, row, payload = null) => {
+  const rows = await loadSplit(row.id);
+  const stitch = rows.find((r) => r.kind === 'stitchship');
+  if (!stitch) return { refreshed: false };
+  let alloc;
+  let order = payload;
+  if (payload) alloc = allocateOrder(payload, stitch.line_ids || []);
+  else {
+    // the Shopify copy was cleared once the order was settled: the groups are rebuilt from what was saved
+    const groups = Object.fromEntries(rows.map((r) => [r.kind, { ...r, total: Number(r.total), _cents: Math.round(Number(r.total) * 100) }]));
+    for (const kind of ['stitchship', 'normal']) groups[kind] ||= { kind, line_ids: [], lines: [], total: 0, _cents: 0, subtotal: 0, discounts: 0, taxes: 0, shipping: 0, shipping_tax: 0 };
+    alloc = { groups, mixed: rows.length > 1, currency: stitch.currency, taxes_included: stitch.taxes_included, reconciled: stitch.reconciled, unallocated: Number(stitch.unallocated || 0) };
+    order = { id: row.shopify_order_id, name: row.shopify_order_name, total_price: String(Number(stitch.total) + Number(rows.find((r) => r.kind === 'normal')?.total || 0)), financial_status: stitch.financial_status, currency: stitch.currency };
+  }
+  const fetched = await fetchOrderFinancials(store, `gid://shopify/Order/${row.shopify_order_id}`);
+  const pay = allocatePayment(alloc, readFinancials(order, fetched));
+  const addresses = Object.fromEntries(rows.map((r) => [r.kind, r.address]));
+  const tags = Object.fromEntries(rows.map((r) => [r.kind, r.tag]));
+  const saved = await saveSplit({ row, store, payload: order, alloc, pay, addresses, tags, orderId: row.order_id });
+  if (!saved.saved) throw new Error(saved.error);
+  return { refreshed: true };
+};
+
+/** The split of an order that was taken in but whose split was not saved: worked out again from the kept Shopify copy. Idempotent. */
+export const rebuildSplit = async (store, row) => {
+  const payload = row.payload;
+  const marked = stitchingLines(payload);
+  const lines = await eligibleLines(store, marked);
+  if (!lines.length) return { rebuilt: false };
+  const alloc = allocateOrder(payload, lines.map((l) => l.id));
+  const fetched = await fetchOrderFinancials(store, payload.admin_graphql_api_id).catch(() => null);
+  const pay = allocatePayment(alloc, readFinancials(payload, fetched));
+  const saved = await saveSplit({ row, store, payload, alloc, pay, orderId: row.order_id, addresses: groupAddresses(payload, alloc, row.address_state === 'address_ok'), tags: { stitchship: STITCH_TAG, normal: null } });
+  if (!saved.saved) throw new Error(saved.error);
+  await patchRow(row, { last_error: null });
+  if (row.address_state === 'address_ok' && row.notified_at && row.hold_state !== 'failed') await patchRow(row, { payload: null });
+  return { rebuilt: true };
+};
+
 const cancelRow = async (store, row) => {
   if (row.state === 'cancelled') return { status: 'cancelled' };
+  await markSplitCancelled(row.id);
   await patchRow(row, { state: 'cancelled', payload: null });
   if (row.order_id) {
     const { data: order } = await supabaseAdmin.from('orders').select('id, reference, status').eq('id', row.order_id).maybeSingle();
@@ -407,10 +584,32 @@ export const confirmAtelierAddress = async ({ order, actorId }) => {
 export const retryShopifyOrder = async (rowId) => {
   const { data: row } = await supabaseAdmin.from('shopify_orders').select('*').eq('id', rowId).maybeSingle();
   if (!row) throw new ConflictError('Shopify order not found.');
-  if (!row.payload) throw new ConflictError('There is nothing left to retry for this order.');
   const { data: store } = await supabaseAdmin.from('shopify_stores').select('*').eq('id', row.store_id).maybeSingle();
   const active = store?.status === 'active' ? store : null;
   if (!active) throw new ConflictError('The brand store is not connected.');
+  // an order that was taken in, whose price split was not saved: worked out again from the kept Shopify copy
+  if (row.payload && row.state === 'draft_created' && row.order_id) {
+    const existing = await loadSplit(row.id);
+    if (!existing.length) {
+      try {
+        const done = await rebuildSplit(active, row);
+        return { status: done.rebuilt ? 'split_saved' : 'ignored' };
+      } catch (err) {
+        throw new ConflictError(`The price split could not be saved: ${err.message}`);
+      }
+    }
+  }
+  // a settled order (its Shopify copy was cleared): only the payment of its saved price split is checked with Shopify again
+  if (!row.payload) {
+    try {
+      const done = await refreshSplit(active, row, null);
+      if (!done.refreshed) throw new ConflictError('There is nothing left to retry for this order.');
+      return { status: 'payment_rechecked' };
+    } catch (err) {
+      if (err instanceof ConflictError) throw err;
+      throw new ConflictError(`Shopify could not be reached to check the payment: ${err.message}`);
+    }
+  }
   if (row.state === 'failed') await patchRow(row, { state: 'received', last_error: null });
   return processOrderCreate(active, row.payload);
 };
@@ -432,8 +631,11 @@ export const shopifyQueue = async () => {
     .order('created_at', { ascending: false })
     .limit(200);
   if (error) throw error;
+  const rowIds = (data || []).map((r) => r.id);
+  const splits = await loadSplits(rowIds);
+  const splitAttention = (list) => (list || []).some((x) => ['verification_pending', 'paid_unverified'].includes(x.payment_status) || x.reconciled === false || x.address?.needs_separate_delivery);
   const attention = (r) => r.state === 'failed' || (r.address_state === 'address_mismatch' && r.hold_state === 'held') || r.hold_state === 'failed' || (r.state === 'draft_created' && !r.notified_at);
-  return (data || []).map((r) => ({ ...r, store: Array.isArray(r.store) ? r.store[0] : r.store, order: Array.isArray(r.order) ? r.order[0] : r.order, needs_attention: attention(r) }));
+  return (data || []).map((r) => ({ ...r, store: Array.isArray(r.store) ? r.store[0] : r.store, order: Array.isArray(r.order) ? r.order[0] : r.order, split: (splits.get(r.id) || []).sort((a, b) => (a.kind < b.kind ? 1 : -1)), needs_attention: attention(r) || splitAttention(splits.get(r.id)) }));
 };
 
 export { getActiveStore };

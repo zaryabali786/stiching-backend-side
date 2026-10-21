@@ -1,4 +1,4 @@
-import { getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
+import { checkStaffCodPayment, getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { Router } from 'express';
 import {
   getPartnerOverview,
@@ -113,6 +113,7 @@ router.post('/receiving/units/:unitId/receive-corrected', need('receiving.return
 router.post('/receiving/units/:unitId/issue', need('receiving.issue'), ownsUnit('unitId'), reportUnitIssue);
 router.post('/receiving/orders/:orderId/receive-all', need('receiving.receive'), ownsOrder('orderId'), receiveAllUnits);
 router.get('/receiving/orders/:orderId/cod', need('receiving.view'), ownsOrder('orderId'), getOrderCod);
+router.post('/receiving/orders/:orderId/cod/check', need('receiving.view'), ownsOrder('orderId'), checkStaffCodPayment);
 router.put('/receiving/orders/:orderId/payment-type', need('receiving.receive'), ownsOrder('orderId'), setStaffPaymentType);
 router.put('/receiving/orders/:orderId/cod-amount', need('receiving.receive'), ownsOrder('orderId'), setStaffCodAmount);
 router.post('/receiving/orders/:orderId/parcel-media', need('receiving.receive'), ownsOrder('orderId'), addParcelMedia);

@@ -1,4 +1,4 @@
-import { attachCodSummary } from '../services/cod-payment.service.js';
+import { assertReceivableById, attachCodSummary } from '../services/cod-payment.service.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { parseListQuery, sendPage, ilikeAny } from '../utils/pagination.js';
@@ -316,6 +316,7 @@ export const updateAdminOrder = catchAsync(async (req, res) => {
 export const resolveUnitIssue = catchAsync(async (req, res) => {
   const unit = unwrapOne(await supabaseAdmin.from('order_units').select('*').eq('id', req.params.unitId).eq('order_id', req.params.id).maybeSingle(), 'Unit not found');
   if (unit.status !== 'issue') throw new BadRequestError('This unit has no open issue.');
+  await assertReceivableById(req.params.id); // an unpaid COD order is not received this way either
   unwrap(await supabaseAdmin.from('order_units').update({ status: 'received', received_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', unit.id));
   const order = await getOrderOr404(req.params.id);
   await addEvent(order.id, order.status, `Issue resolved for "${unit.unit_title}"${req.body?.note ? `: ${req.body.note}` : ''}`, req.userId);

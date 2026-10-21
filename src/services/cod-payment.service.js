@@ -6,7 +6,7 @@ import { addEvent, STATUS_LABELS } from './order.service.js';
 import { isCod } from './email-order-match.service.js';
 import { notifyUser, notifyAdmins } from './notification.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
-import { createCheckoutSession, expireCheckoutSession, isStripeEnabled, retrieveCheckoutSession, toMinorUnits } from './stripe.service.js';
+import { cancelPaymentIntent, createCheckoutSession, createCodPaymentIntent, expireCheckoutSession, isStripeEnabled, retrieveCheckoutSession, retrievePaymentIntent, toMinorUnits } from './stripe.service.js';
 
 /**
  * Cash on delivery (COD) for orders that came from an email.
@@ -33,6 +33,33 @@ export const isEmailOrder = (order) => order?.order_source === 'email' || order?
 /** COD and not paid yet: editing stays blocked until Stripe confirms the payment. */
 export const isCodLocked = (order) => order?.payment_type === 'COD' && order?.cod_payment_status !== 'PAID';
 
+export const COD_RECEIVE_MESSAGE = 'Payment is required before receiving this order. The client has to pay the order total first.';
+
+/**
+ * The backend rule behind the Received button: a COD order is not received until its payment is confirmed by Stripe. This is checked on
+ * the server for every receiving call (the app only mirrors it by disabling the button).
+ */
+export const assertReceivable = (order) => {
+  if (isCodLocked(order)) throw new ConflictError(COD_RECEIVE_MESSAGE);
+};
+
+/** Same rule for a caller that only has the order's id (receiving). Orders from before the COD feature have no payment type and pass. */
+export const assertReceivableById = async (orderId) => {
+  const { data, error } = await supabaseAdmin.from('orders').select('id, payment_type, cod_payment_status').eq('id', orderId).maybeSingle();
+  // the columns do not exist before database update 0041: then nothing is COD and receiving is not restricted
+  if (error || !data) return;
+  assertReceivable(data);
+};
+
+/** Tell everyone who watches this order that its payment state changed (customer app, admins, the partner's receiving people). */
+export const emitPaymentUpdate = (order) => {
+  const payload = { orderId: order.id, reference: order.reference, unitId: null, orderStatus: order.status, status: order.status, status_label: STATUS_LABELS[order.status], payment: true, at: new Date().toISOString() };
+  emitTo(rooms.user(order.customer_id), 'order:update', payload);
+  emitTo(rooms.user(order.customer_id), 'unit:update', payload);
+  emitTo(rooms.admins, 'unit:update', payload);
+  if (order.partner_id) emitTo(rooms.production(order.partner_id), 'unit:update', payload);
+};
+
 /** The backend rule behind the Edit button (the app hides it too, but this is what counts). */
 export const assertCodEditable = (order) => {
   if (isCodLocked(order)) throw new ForbiddenError(COD_LOCK_MESSAGE);
@@ -45,8 +72,19 @@ export const codView = (order) => {
   const type = order.payment_type ?? null;
   const status = type === 'COD' ? order.cod_payment_status || 'UNPAID' : order.cod_payment_status ?? null;
   const amountOk = AMOUNT_OK.includes(order.cod_amount_status) && Number(order.cod_amount) > 0 && !!order.cod_currency;
+  const needsVerification = type === 'COD' && !amountOk && status !== 'PAID';
+  const locked = isCodLocked(order);
+  // one readable payment state for the apps, kept apart from the order's workflow status
+  const paymentState = type !== 'COD' ? 'not_required' : status === 'PAID' ? 'paid' : needsVerification ? 'verification_pending' : status === 'PENDING' ? 'processing' : 'payment_required';
   return {
     payment_type: type,
+    source: order.external_source === 'shopify' ? 'shopify' : isEmailOrder(order) ? 'email' : 'manual',
+    payment_state: paymentState,
+    receive_blocked: locked,
+    receive_block_reason: locked ? COD_RECEIVE_MESSAGE : null,
+    shopify: order.shopify_financial_status
+      ? { financial_status: order.shopify_financial_status, amount_paid: order.shopify_amount_paid == null ? null : Number(order.shopify_amount_paid), outstanding: order.shopify_outstanding == null ? null : Number(order.shopify_outstanding) }
+      : null,
     email_order: isEmailOrder(order),
     email_says_cod: isCod(order.brand_payment_method),
     // the two options are shown while nothing was chosen on an email order that is still open
@@ -56,9 +94,9 @@ export const codView = (order) => {
     amount_status: order.cod_amount_status ?? null,
     amount_note: order.cod_amount_note ?? null,
     payment_status: status,
-    needs_verification: type === 'COD' && !amountOk && status !== 'PAID',
+    needs_verification: needsVerification,
     can_pay: type === 'COD' && amountOk && status !== 'PAID',
-    locked: isCodLocked(order),
+    locked,
     paid_at: order.cod_paid_at ?? null,
   };
 };
@@ -201,7 +239,20 @@ const reload = async (orderId) => {
 };
 
 const retireSession = async (order) => {
-  if (order.cod_stripe_session_id && isStripeEnabled()) await expireCheckoutSession(order.cod_stripe_session_id);
+  if (!isStripeEnabled()) return;
+  if (order.cod_stripe_session_id) await expireCheckoutSession(order.cod_stripe_session_id);
+  if (order.cod_stripe_payment_intent && order.cod_payment_status !== 'PAID') await cancelPaymentIntent(order.cod_stripe_payment_intent);
+};
+
+/** The payment history of COD orders (table cod_payments, migration 0044). Never throws: the payment itself must not depend on it. */
+const ledger = async (orderId, ref, patch, { insert = null } = {}) => {
+  try {
+    if (!ref) return;
+    if (insert) await supabaseAdmin.from('cod_payments').upsert({ order_id: orderId, provider: 'stripe', provider_ref: ref, ...insert }, { onConflict: 'provider_ref', ignoreDuplicates: true });
+    if (patch) await supabaseAdmin.from('cod_payments').update({ ...patch, updated_at: new Date().toISOString() }).eq('provider_ref', ref);
+  } catch (err) {
+    console.warn('[COD] could not write the payment history:', err.message);
+  }
 };
 
 /** The order is discarded or cancelled: a Stripe page that is still open must not be payable any more. Never throws. */
@@ -223,8 +274,16 @@ export const setPaymentType = async ({ order, type, actor }) => {
   if (!isEmailOrder(order)) throw new BadRequestError('COD / Non-COD applies to orders that came from an email.');
   if (order.status === 'cancelled') throw new BadRequestError('This order is cancelled.');
   if (order.payment_type === type) return { order, changed: false };
+  // a Shopify order Shopify itself reports as fully paid has nothing left to collect: never ask for the same money twice
+  if (type === 'COD' && order.external_source === 'shopify' && String(order.shopify_financial_status || '').toLowerCase() === 'paid' && !(Number(order.shopify_outstanding) > 0)) {
+    throw new ConflictError('Shopify shows this order as fully paid, so there is nothing to collect.');
+  }
   if (order.payment_type === 'COD' && order.cod_payment_status === 'PAID') throw new ConflictError('This COD order is already paid; its payment type cannot be changed.');
 
+  // moving an unpaid COD order to Non-COD would skip the payment: only an admin may (for example a misread email), never the partner's people
+  if (actor.role === 'staff' && !actor.admin && order.payment_type === 'COD' && type === 'NON_COD') {
+    throw new ForbiddenError('Only an admin can change an unpaid COD order to Non-COD. The customer has to pay first.');
+  }
   if (actor.role === 'customer') {
     if (!['draft', 'submitted'].includes(order.status)) throw new ForbiddenError('The payment type can be chosen only while the order is open. Ask our team to change it.');
     if (order.payment_type === 'COD') throw new ForbiddenError('Only our team can change a COD order to Non-COD.');
@@ -237,7 +296,10 @@ export const setPaymentType = async ({ order, type, actor }) => {
   if (type === 'COD') {
     // keep an amount staff already confirmed; otherwise read it from the original email now
     const confirmed = AMOUNT_OK.includes(order.cod_amount_status) && Number(order.cod_amount) > 0 && order.cod_currency;
-    if (!confirmed) {
+    if (!confirmed && order.external_source === 'shopify' && Number(order.shopify_outstanding) > 0 && order.brand_order_currency) {
+      // the amount Shopify says is still owed (not the whole order when part of it was paid)
+      Object.assign(patch, { cod_amount: Number(order.shopify_outstanding), cod_currency: normaliseCurrency(order.brand_order_currency), cod_amount_status: 'verified', cod_amount_source: 'shopify', cod_amount_note: 'The amount Shopify reports as outstanding.' });
+    } else if (!confirmed) {
       const email = await loadOrderEmail(order);
       const read = readCodAmount({ order, emailText: email?.text || '' });
       Object.assign(patch, {
@@ -260,7 +322,13 @@ export const setPaymentType = async ({ order, type, actor }) => {
   const { data, error } = await supabaseAdmin.from('orders').update(patch).eq('id', order.id).select('*').maybeSingle();
   if (error) dbError(error, 'save the payment type');
   await addEvent(order.id, order.status, type === 'COD' ? 'Marked as cash on delivery (COD)' : 'Marked as Non-COD', actor.id);
-  return { order: data || { ...order, ...patch }, changed: true };
+  const saved = data || { ...order, ...patch };
+  // staff marked it COD: the customer is told that payment is needed, and every open screen refreshes
+  if (type === 'COD' && actor.role === 'staff') {
+    await notifyUser(order.customer_id, { type: 'invoice', title: `Payment required: ${order.reference}`, body: 'Please pay the order total in the app. Your parcel is received after the payment is confirmed.', link: `/app/orders/${order.id}`, orderId: order.id }).catch(() => undefined);
+  }
+  emitPaymentUpdate(saved);
+  return { order: saved, changed: true };
 };
 
 // ───────────── staff confirm or correct the total ─────────────
@@ -377,8 +445,74 @@ export const createCodCheckout = async ({ order, customer }) => {
   return { url: session.url, sessionId: session.id, amount, currency, reused: false };
 };
 
+/**
+ * The PaymentIntent the app's Payment Element pays, for this COD order. The amount is the verified total in the database. An open intent for
+ * the same amount is reused, so reopening the sheet or clicking twice never creates a second payable intent.
+ */
+export const startCodPayment = async ({ order, customer }) => {
+  if (!isStripeEnabled()) throw new BadRequestError('Card payments are not available yet.');
+  const view = codView(order);
+  if (order.payment_type !== 'COD') throw new BadRequestError('This is not a cash on delivery order.');
+  if (view.payment_status === 'PAID') throw new ConflictError('This order is already paid.');
+  if (view.needs_verification || !view.can_pay) throw new ConflictError('Our team is still confirming the total of this order. You can pay once it is confirmed.');
+  const { amount, currency } = view;
+  const minor = toMinorUnits(amount, currency);
+  const currencyLow = String(currency).toLowerCase();
+
+  if (order.cod_stripe_payment_intent) {
+    try {
+      const existing = await retrievePaymentIntent(order.cod_stripe_payment_intent);
+      if (existing.status === 'succeeded') {
+        await settleCodIntent(existing);
+        throw new ConflictError('This order is already paid.');
+      }
+      if (['requires_payment_method', 'requires_confirmation', 'requires_action'].includes(existing.status) && existing.amount === minor && existing.currency === currencyLow) {
+        return { clientSecret: existing.client_secret, paymentIntentId: existing.id, amount, currency, reference: order.reference, publishableKey: config.stripe.publishableKey, reused: true };
+      }
+      if (existing.status === 'processing') throw new ConflictError('A payment for this order is still being processed. Use "Check payment again" in a moment.');
+      await cancelPaymentIntent(existing.id);
+      await ledger(order.id, existing.id, { status: 'canceled' });
+    } catch (err) {
+      if (err instanceof ConflictError) throw err;
+      // an intent Stripe no longer knows is simply replaced below
+    }
+  }
+  // a Stripe Checkout page opened by an older version of the app must not stay payable next to the new intent
+  if (order.cod_stripe_session_id) await expireCheckoutSession(order.cod_stripe_session_id);
+
+  const { intent } = await createCodPaymentIntent({
+    order,
+    customer,
+    amount,
+    currency,
+    // the previous intent id is part of the key: two clicks from the same state get the same intent, a retry after cancel gets a new one
+    idempotencyKey: `codpi:${order.id}:${minor}:${currencyLow}:${order.cod_stripe_payment_intent || 'first'}`,
+  });
+  const { data, error } = await notPaid(
+    supabaseAdmin.from('orders').update({ cod_stripe_payment_intent: intent.id, cod_payment_status: 'PENDING', updated_at: new Date().toISOString() }).eq('id', order.id)
+  )
+    .select('id')
+    .maybeSingle();
+  if (error) dbError(error, 'save the payment');
+  if (!data) {
+    await cancelPaymentIntent(intent.id);
+    throw new ConflictError('This order was just paid.');
+  }
+  await ledger(order.id, intent.id, null, { insert: { amount, currency: String(currency).toUpperCase(), status: 'pending', created_by: order.customer_id } });
+  emitPaymentUpdate({ ...order, cod_payment_status: 'PENDING' });
+  return { clientSecret: intent.client_secret, paymentIntentId: intent.id, amount, currency, reference: order.reference, publishableKey: config.stripe.publishableKey, reused: false };
+};
+
 const alertAdmins = (order, body) =>
   notifyAdmins({ type: 'alert', title: `Check payment for ${order.reference}`, body, link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
+
+/** Everyone who needs to know that a COD order was paid: the order's history, the customer, the admins, and every open screen. */
+const announcePaid = async (order) => {
+  await addEvent(order.id, order.status, `Cash on delivery payment received · ${order.cod_currency} ${round2(order.cod_amount)} (Stripe)`, order.customer_id);
+  await notifyUser(order.customer_id, { type: 'invoice', title: `Payment confirmed: ${order.reference}`, body: 'Thank you! Your payment is confirmed. Your parcel can now be received.', link: `/app/orders/${order.id}`, orderId: order.id });
+  await notifyAdmins({ type: 'invoice', title: `COD payment received: ${order.reference}`, body: `${order.cod_currency} ${round2(order.cod_amount)} · ${order.customer_name || ''}`.trim(), link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
+  emitPaymentUpdate({ ...order, cod_payment_status: 'PAID' });
+};
 
 /**
  * Turn a paid Stripe Checkout Session into PAID. Safe to run any number of times and from several places (webhook and the
@@ -418,11 +552,84 @@ export const settleCodSession = async (session) => {
   if (error) dbError(error, 'mark the order paid');
   if (!flipped) return { settled: false, reason: 'already paid' };
 
-  await addEvent(order.id, order.status, `Cash on delivery payment received · ${order.cod_currency} ${round2(order.cod_amount)} (Stripe)`, order.customer_id);
-  await notifyUser(order.customer_id, { type: 'invoice', title: `Payment confirmed: ${order.reference}`, body: 'Thank you! Your payment is confirmed and you can now edit your order.', link: `/app/orders/${order.id}`, orderId: order.id });
-  await notifyAdmins({ type: 'invoice', title: `COD payment received: ${order.reference}`, body: `${order.cod_currency} ${round2(order.cod_amount)} · ${order.customer_name || ''}`.trim(), link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
-  emitTo(rooms.user(order.customer_id), 'order:update', { orderId: order.id, status: order.status, status_label: STATUS_LABELS[order.status] });
+  await announcePaid(order);
   return { settled: true };
+};
+
+/**
+ * Turn a succeeded PaymentIntent (the in-app Payment Element) into PAID. Safe to run any number of times and from several places (the
+ * webhook and the customer's "check payment" call): only the first caller flips the order. It must be this order's current intent and the
+ * money must match the verified total, otherwise nothing is marked paid and an administrator is told.
+ */
+export const settleCodIntent = async (intent) => {
+  if (intent?.metadata?.kind !== 'cod') return { settled: false, reason: 'not a cash on delivery payment' };
+  if (intent.status !== 'succeeded') return { settled: false, reason: 'not paid yet' };
+  const order = intent.metadata.order_id ? await reload(intent.metadata.order_id) : null;
+  if (!order) return { settled: false, reason: 'order not found' };
+  if (order.cod_payment_status === 'PAID') return { settled: false, reason: 'already paid' };
+
+  const paidMinor = intent.amount_received ?? intent.amount;
+  const expectedMinor = order.cod_amount != null && order.cod_currency ? toMinorUnits(order.cod_amount, order.cod_currency) : null;
+  const matches =
+    order.payment_type === 'COD' &&
+    order.cod_stripe_payment_intent === intent.id &&
+    expectedMinor != null &&
+    paidMinor === expectedMinor &&
+    String(intent.currency).toLowerCase() === String(order.cod_currency).toLowerCase();
+  if (!matches) {
+    await alertAdmins(order, `Stripe received ${String(intent.currency).toUpperCase()} ${((paidMinor ?? 0) / 100).toFixed(2)} (${intent.id}) but the order expects ${order.cod_currency || '-'} ${order.cod_amount ?? '-'} (${order.payment_type || 'no payment type'}).`);
+    return { settled: false, reason: 'amount or order state mismatch' };
+  }
+
+  const now = new Date().toISOString();
+  const { data: flipped, error } = await notPaid(
+    supabaseAdmin.from('orders').update({ cod_payment_status: 'PAID', cod_paid_at: now, cod_paid_minor: paidMinor, cod_stripe_payment_intent: intent.id, updated_at: now }).eq('id', order.id)
+  )
+    .select('id')
+    .maybeSingle();
+  if (error) dbError(error, 'mark the order paid');
+  if (!flipped) return { settled: false, reason: 'already paid' };
+  await ledger(order.id, intent.id, { status: 'succeeded', failure_message: null });
+  await announcePaid(order);
+  return { settled: true };
+};
+
+/**
+ * Shopify itself now reports the brand order as fully paid (the customer paid the brand after all): there is nothing to collect, so a COD
+ * order that has not been paid here becomes Non-COD, its open payment is closed, and receiving is no longer blocked. A COD order the
+ * customer already paid here keeps its payment (that money is on our ledger; it is never silently dropped).
+ */
+export const markPaidAtShopify = async (order) => {
+  if (order.payment_type !== 'COD' || order.cod_payment_status === 'PAID') return { changed: false };
+  await retireSession(order);
+  const now = new Date().toISOString();
+  const { data, error } = await notPaid(
+    supabaseAdmin.from('orders').update({ payment_type: 'NON_COD', payment_type_set_at: now, cod_payment_status: null, updated_at: now }).eq('id', order.id).eq('payment_type', 'COD')
+  )
+    .select('id')
+    .maybeSingle();
+  if (error) dbError(error, 'update the payment type');
+  if (!data) return { changed: false };
+  await addEvent(order.id, order.status, 'Shopify reports the brand order as fully paid: nothing to collect, the order is Non-COD', null);
+  emitPaymentUpdate({ ...order, payment_type: 'NON_COD', cod_payment_status: null });
+  return { changed: true };
+};
+
+/** The card was declined or the intent was cancelled: the order stays Unpaid (and blocked) and the customer can try again. */
+export const releaseCodIntent = async (intent) => {
+  if (intent?.metadata?.kind !== 'cod' || !intent.metadata.order_id) return { released: false };
+  const failure = intent.last_payment_error?.message || (intent.status === 'canceled' ? 'The payment was cancelled.' : null);
+  await ledger(intent.metadata.order_id, intent.id, { status: intent.status === 'canceled' ? 'canceled' : 'failed', failure_message: failure });
+  // a decline leaves the same intent usable (the customer retries with another card): the order only drops back to Unpaid when the intent is cancelled
+  if (intent.status !== 'canceled') return { released: false };
+  const { data, error } = await notPaid(
+    supabaseAdmin.from('orders').update({ cod_payment_status: 'UNPAID', updated_at: new Date().toISOString() }).eq('id', intent.metadata.order_id).eq('cod_stripe_payment_intent', intent.id)
+  )
+    .select('id, reference, customer_id, partner_id, status')
+    .maybeSingle();
+  if (error) dbError(error, 'release the payment');
+  if (data) emitPaymentUpdate(data);
+  return { released: !!data };
 };
 
 /** A session that expired, or whose delayed payment failed: the order is Unpaid again and the customer can retry. */
@@ -446,6 +653,27 @@ export const releaseCodSession = async (session) => {
  */
 export const confirmCodPayment = async (order) => {
   if (order.cod_payment_status === 'PAID') return { paid: true, status: 'PAID' };
+  if (order.cod_stripe_payment_intent && isStripeEnabled()) {
+    let intent = null;
+    try {
+      intent = await retrievePaymentIntent(order.cod_stripe_payment_intent);
+    } catch {
+      /* Stripe cannot be reached: the order keeps its state and the check can be repeated */
+    }
+    if (intent) {
+      if (intent.status === 'succeeded') {
+        await settleCodIntent(intent);
+        const fresh = await reload(order.id);
+        return { paid: fresh?.cod_payment_status === 'PAID', status: fresh?.cod_payment_status || 'UNPAID' };
+      }
+      if (intent.status === 'canceled') {
+        await releaseCodIntent(intent);
+        return { paid: false, status: 'UNPAID' };
+      }
+      return { paid: false, status: order.cod_payment_status || 'PENDING', stripe_status: intent.status };
+    }
+    return { paid: false, status: order.cod_payment_status || 'PENDING' };
+  }
   if (!order.cod_stripe_session_id || !isStripeEnabled()) return { paid: false, status: order.cod_payment_status || 'UNPAID' };
   let session;
   try {
@@ -473,14 +701,14 @@ export const attachCodSummary = async (rows) => {
   try {
     const ids = [...new Set((rows || []).map((r) => r?.id).filter(Boolean))];
     if (!ids.length) return rows;
-    const { data, error } = await supabaseAdmin.from('orders').select('id, payment_type, cod_payment_status, cod_amount, cod_currency, cod_amount_status').in('id', ids);
+    const { data, error } = await supabaseAdmin.from('orders').select('id, payment_type, cod_payment_status, cod_amount, cod_currency, cod_amount_status, external_source, order_source, import_source').in('id', ids);
     if (error || !data) return rows;
     const byId = new Map(data.filter((d) => d.payment_type).map((d) => [d.id, d]));
     for (const r of rows) {
       const d = byId.get(r.id);
       if (!d) continue;
       const v = codView(d);
-      r.cod = { payment_type: v.payment_type, payment_status: v.payment_status, amount: v.amount, currency: v.currency, needs_verification: v.needs_verification, locked: v.locked };
+      r.cod = { payment_type: v.payment_type, payment_status: v.payment_status, payment_state: v.payment_state, source: v.source, amount: v.amount, currency: v.currency, needs_verification: v.needs_verification, locked: v.locked, receive_blocked: v.receive_blocked, receive_block_reason: v.receive_block_reason };
     }
   } catch {
     /* the list still works without it */

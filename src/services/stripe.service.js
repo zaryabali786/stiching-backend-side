@@ -105,6 +105,43 @@ export const createOrReusePaymentIntent = async ({ order, invoice, customer }) =
 
 export const retrievePaymentIntent = (id) => stripe().paymentIntents.retrieve(id);
 
+/** Stop a PaymentIntent that is no longer wanted (the amount changed, or the order is no longer COD). Never throws. */
+export const cancelPaymentIntent = async (id) => {
+  try {
+    const intent = await stripe().paymentIntents.retrieve(id);
+    if (!['succeeded', 'canceled', 'processing'].includes(intent.status)) await stripe().paymentIntents.cancel(id);
+  } catch {
+    /* already finished or unknown to Stripe: nothing to stop */
+  }
+};
+
+/**
+ * A PaymentIntent for one COD order, paid with the Payment Element inside the app (nothing redirects away).
+ * The amount comes from the verified order total in the database, never from the app. `idempotencyKey` makes two clicks at the same
+ * moment return the same intent.
+ */
+export const createCodPaymentIntent = async ({ order, customer, amount, currency, idempotencyKey }) => {
+  const minor = toMinorUnits(amount, currency);
+  if (!(minor > 0)) throw new BadRequestError('This order has no amount to pay.');
+  try {
+    const intent = await stripe().paymentIntents.create(
+      {
+        amount: minor,
+        currency: String(currency).toLowerCase(),
+        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+        description: `Cash on delivery order ${order.reference || ''}`.trim(),
+        receipt_email: customer?.email || undefined,
+        metadata: { kind: 'cod', order_id: order.id, order_reference: order.reference || '', customer_id: order.customer_id },
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+    return { intent, minor };
+  } catch (err) {
+    // e.g. a currency Stripe cannot charge, or an amount below Stripe's minimum
+    throw new BadRequestError(err?.raw?.message || err.message || 'The payment could not be started.');
+  }
+};
+
 /** Verify a webhook delivery. `rawBody` must be the exact bytes Stripe sent. */
 export const constructWebhookEvent = (rawBody, signature) => {
   if (!config.stripe.webhookSecret) throw new AppError('Stripe webhook is not configured (STRIPE_WEBHOOK_SECRET).', 503);

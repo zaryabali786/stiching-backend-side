@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, NotFoundError } from '../utils/error.helper.js';
 import { getOrderOr404 } from '../services/order.service.js';
-import { codAmountHistory, codView, confirmCodPayment, createCodCheckout, setPaymentType, verifyCodAmount } from '../services/cod-payment.service.js';
+import { codAmountHistory, codView, confirmCodPayment, createCodCheckout, setPaymentType, startCodPayment, verifyCodAmount } from '../services/cod-payment.service.js';
 
 /** The customer's own order; 404 for anyone else's. */
 const loadOwnOrder = async (req) => {
@@ -11,7 +11,7 @@ const loadOwnOrder = async (req) => {
   return data;
 };
 
-const staffActor = (req) => ({ id: req.userId, role: 'staff' });
+const staffActor = (req) => ({ id: req.userId, role: 'staff', admin: req.access?.isAdmin === true });
 
 // ───────────── customer ─────────────
 
@@ -37,6 +37,17 @@ export const startCodCheckout = catchAsync(async (req, res) => {
 });
 
 /**
+ * POST /api/client/orders/:id/cod/payment-intent
+ * Pay Now inside the app: the PaymentIntent that Stripe's Payment Element pays. The amount comes from the database, never from the app.
+ * -> { clientSecret, paymentIntentId, amount, currency, reference, publishableKey }
+ */
+export const startCodPaymentIntent = catchAsync(async (req, res) => {
+  const order = await loadOwnOrder(req);
+  const result = await startCodPayment({ order, customer: req.profile });
+  return ApiResponse.success(res, result, result.reused ? 'Payment resumed.' : 'Payment started.');
+});
+
+/**
  * POST /api/client/orders/:id/cod/confirm
  * After the customer is back from Stripe: the server asks Stripe about this order's own session and settles it only if Stripe
  * says it is paid. Returning to a success page proves nothing by itself.
@@ -56,6 +67,17 @@ const idOf = (req) => req.params.id ?? req.params.orderId;
 export const getOrderCod = catchAsync(async (req, res) => {
   const order = await getOrderOr404(idOf(req));
   return ApiResponse.success(res, { cod: codView(order), history: await codAmountHistory(order.id) });
+});
+
+/**
+ * POST .../orders/:id/cod/check — "Check payment again" for staff: the server asks Stripe about this order's own stored payment and settles
+ * it if Stripe says it is paid. It only reads from Stripe; it never creates a charge or a payment.
+ */
+export const checkStaffCodPayment = catchAsync(async (req, res) => {
+  const order = await getOrderOr404(idOf(req));
+  const result = await confirmCodPayment(order);
+  const fresh = await getOrderOr404(order.id);
+  return ApiResponse.success(res, { ...result, cod: codView(fresh), history: await codAmountHistory(order.id) }, result.paid ? 'Payment confirmed.' : 'Not paid yet.');
 });
 
 /** PUT .../orders/:id/payment-type  body: { type } — staff may also move an order away from COD (for example a misread email). */

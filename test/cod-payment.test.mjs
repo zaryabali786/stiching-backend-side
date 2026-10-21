@@ -15,7 +15,7 @@ const dbProxy = new Proxy({}, { get: (_, key) => db[key] });
 const note = (kind) => async (...args) => notices.push({ kind, args });
 
 before(async () => {
-  stripeState = { sessions: {}, byKey: {}, created: [], expired: [], n: 0, enabled: true };
+  stripeState = { sessions: {}, byKey: {}, created: [], expired: [], intents: {}, intentByKey: {}, intentCreated: [], canceled: [], n: 0, enabled: true };
   mock.module('../src/config/supabase.js', { namedExports: { supabaseAdmin: dbProxy, supabase: dbProxy } });
   mock.module('../src/services/notification.service.js', {
     namedExports: { notifyAdmins: note('admins'), notifyPartner: note('partner'), notifyUser: note('user'), notifyUsers: note('users'), notifyStaff: note('staff'), partnerRecipients: async () => [] },
@@ -26,7 +26,33 @@ before(async () => {
       toMinorUnits: (amount) => Math.round(Number(amount) * 100),
       invoiceCharge: () => ({}),
       createOrReusePaymentIntent: async () => ({}),
-      retrievePaymentIntent: async () => ({}),
+      retrievePaymentIntent: async (id) => {
+        if (!stripeState.intents[id]) throw new Error('No such payment intent');
+        return stripeState.intents[id];
+      },
+      cancelPaymentIntent: async (id) => {
+        stripeState.canceled.push(id);
+        if (stripeState.intents[id] && !['succeeded', 'canceled'].includes(stripeState.intents[id].status)) stripeState.intents[id].status = 'canceled';
+      },
+      createCodPaymentIntent: async (args) => {
+        stripeState.intentCreated.push(args);
+        const existing = stripeState.intentByKey[args.idempotencyKey];
+        if (existing) return { intent: existing };
+        const n = ++stripeState.n;
+        const minor = Math.round(Number(args.amount) * 100);
+        const intent = {
+          id: `pi_cod_${n}`,
+          client_secret: `pi_cod_${n}_secret_x`,
+          status: 'requires_payment_method',
+          amount: minor,
+          amount_received: 0,
+          currency: String(args.currency).toLowerCase(),
+          metadata: { kind: 'cod', order_id: args.order.id, customer_id: args.order.customer_id },
+        };
+        stripeState.intents[intent.id] = intent;
+        stripeState.intentByKey[args.idempotencyKey] = intent;
+        return { intent, minor };
+      },
       constructWebhookEvent: (raw, sig) => {
         if (sig !== 'good') throw new Error('bad signature');
         return JSON.parse(raw);
@@ -92,12 +118,17 @@ beforeEach(() => {
   stripeState.byKey = {};
   stripeState.created = [];
   stripeState.expired = [];
+  stripeState.intents = {};
+  stripeState.intentByKey = {};
+  stripeState.intentCreated = [];
+  stripeState.canceled = [];
   stripeState.enabled = true;
   db = createFakeDb({
     orders: [baseOrder()],
     inbox_emails: [{ id: 'em1', import_id: 'imp1', body_text: EMAIL }],
     order_events: [],
     cod_amount_audit: [],
+    cod_payments: [],
   });
 });
 
@@ -191,7 +222,7 @@ test('a customer cannot pick Non-COD when the email says cash on delivery, canno
   await assert.rejects(() => cod.setPaymentType({ order: order(), type: 'NON_COD', actor: customer }), /says cash on delivery/);
   await cod.setPaymentType({ order: order(), type: 'COD', actor: customer });
   await assert.rejects(() => cod.setPaymentType({ order: order(), type: 'NON_COD', actor: customer }), /Only our team/);
-  const moved = await cod.setPaymentType({ order: order(), type: 'NON_COD', actor: staff });
+  const moved = await cod.setPaymentType({ order: order(), type: 'NON_COD', actor: { ...staff, admin: true } });
   assert.equal(moved.changed, true, 'authorised staff can move an order away from COD');
   assert.equal(order().cod_payment_status ?? null, null);
   db = createFakeDb({ orders: [baseOrder({ order_source: 'customer', import_source: null, import_id: null })], order_events: [] });
@@ -400,8 +431,9 @@ test('the webhook releases an expired session', async () => {
 test('the view shown to the apps has the type, amount, currency and status but no Stripe ids', async () => {
   const session = await payFor();
   const view = cod.codView(order());
-  assert.deepEqual(Object.keys(view).sort(), ['amount', 'amount_note', 'amount_status', 'can_choose', 'can_pay', 'currency', 'email_order', 'email_says_cod', 'locked', 'needs_verification', 'paid_at', 'payment_status', 'payment_type']);
+  assert.deepEqual(Object.keys(view).sort(), ['amount', 'amount_note', 'amount_status', 'can_choose', 'can_pay', 'currency', 'email_order', 'email_says_cod', 'locked', 'needs_verification', 'paid_at', 'payment_state', 'payment_status', 'payment_type', 'receive_block_reason', 'receive_blocked', 'shopify', 'source']);
   assert.equal(JSON.stringify(view).includes(session.id), false);
+  assert.equal(/pi_|cs_test|secret/.test(JSON.stringify(view)), false, 'no Stripe reference or secret reaches the app');
 });
 
 test('before the database update 0041 is applied, choosing COD says so instead of a raw database error', async () => {
@@ -446,4 +478,233 @@ test('list rows get the COD state (type, paid or not, total) so receiving staff 
   assert.deepEqual({ s: by.b.payment_status, locked: by.b.locked }, { s: 'PAID', locked: false });
   assert.equal(by.c.payment_type, 'NON_COD');
   assert.equal(by.d, undefined, 'orders that never chose get nothing');
+});
+
+// ───────────── paying inside the app (Stripe Payment Element) ─────────────
+
+const intentFor = async () => {
+  await cod.setPaymentType({ order: order(), type: 'COD', actor: customer });
+  const start = await cod.startCodPayment({ order: order(), customer: { email: 'a@b.c' } });
+  return { start, intent: stripeState.intents[start.paymentIntentId] };
+};
+const succeed = (intent) => {
+  intent.status = 'succeeded';
+  intent.amount_received = intent.amount;
+  return intent;
+};
+
+test('Pay Now makes one PaymentIntent for the verified amount; opening the sheet again reuses it', async () => {
+  const { start, intent } = await intentFor();
+  assert.equal(start.reused, false);
+  assert.ok(start.clientSecret.startsWith('pi_cod_'), 'the app gets the one-time secret of the Payment Element');
+  assert.equal(start.amount, 4200);
+  assert.equal(stripeState.intentCreated.length, 1);
+  assert.equal(stripeState.intentCreated[0].amount, 4200, 'the amount comes from the saved total, never from the app');
+  assert.equal(order().cod_payment_status, 'PENDING');
+  assert.equal(order().cod_stripe_payment_intent, intent.id);
+  assert.equal(db.table('cod_payments').length, 1, 'one history row');
+  assert.equal(db.table('cod_payments')[0].status, 'pending');
+
+  const again = await cod.startCodPayment({ order: order(), customer: {} });
+  assert.equal(again.reused, true);
+  assert.equal(again.paymentIntentId, intent.id);
+  assert.equal(stripeState.intentCreated.length, 1, 'no second payable intent');
+  assert.equal(db.table('cod_payments').length, 1);
+});
+
+test('an intent for an old amount is cancelled and replaced when the total changes', async () => {
+  const { intent } = await intentFor();
+  await cod.verifyCodAmount({ order: order(), amount: '5000', currency: 'PKR', reason: 'Email total was wrong', actor: staff });
+  const next = await cod.startCodPayment({ order: order(), customer: {} });
+  assert.notEqual(next.paymentIntentId, intent.id);
+  assert.ok(stripeState.canceled.includes(intent.id), 'the old intent can no longer be paid');
+  assert.equal(next.amount, 5000);
+});
+
+test('Pay Now in the app needs Stripe, COD, a verified amount, and an order that is not paid', async () => {
+  await assert.rejects(() => cod.startCodPayment({ order: order(), customer: {} }), /not a cash on delivery/);
+  await cod.setPaymentType({ order: order(), type: 'COD', actor: customer });
+  stripeState.enabled = false;
+  await assert.rejects(() => cod.startCodPayment({ order: order(), customer: {} }), /not available/);
+  stripeState.enabled = true;
+  db.table('orders')[0].cod_amount_status = 'needs_verification';
+  await assert.rejects(() => cod.startCodPayment({ order: order(), customer: {} }), /still confirming/);
+  db.table('orders')[0].cod_amount_status = 'extracted';
+  db.table('orders')[0].cod_payment_status = 'PAID';
+  await assert.rejects(() => cod.startCodPayment({ order: order(), customer: {} }), /already paid/);
+});
+
+test('only a succeeded intent of this order, with the verified amount, marks it PAID, once', async () => {
+  const { intent } = await intentFor();
+  assert.equal((await cod.settleCodIntent({ ...intent, status: 'processing' })).settled, false, 'a payment still processing proves nothing');
+  assert.equal(order().cod_payment_status, 'PENDING');
+
+  const done = await cod.settleCodIntent(succeed(intent));
+  assert.equal(done.settled, true);
+  assert.equal(order().cod_payment_status, 'PAID');
+  assert.equal(order().cod_paid_minor, 420000);
+  assert.ok(order().cod_paid_at);
+  assert.equal(db.table('cod_payments')[0].status, 'succeeded');
+  assert.ok(notices.some((n) => n.kind === 'user'), 'the customer is told');
+  assert.ok(notices.some((n) => n.kind === 'admins'), 'the admins are told');
+  assert.ok(db.table('order_events').some((e) => /payment received/i.test(e.note || '')), 'it is in the order history');
+
+  const paidAt = order().cod_paid_at;
+  const again = await cod.settleCodIntent(intent);
+  assert.equal(again.settled, false);
+  assert.equal(order().cod_paid_at, paidAt, 'a duplicate event changes nothing');
+  assert.equal(notices.filter((n) => n.kind === 'user').length, 1, 'and does not notify twice');
+});
+
+test('a payment that does not match the order is not marked paid and an administrator is told', async () => {
+  const { intent } = await intentFor();
+  succeed(intent);
+  intent.amount_received = 100;
+  assert.equal((await cod.settleCodIntent(intent)).settled, false);
+  intent.amount_received = intent.amount;
+  assert.equal((await cod.settleCodIntent({ ...intent, id: 'pi_someone_else' })).settled, false, 'another intent id is not this order payment');
+  assert.equal((await cod.settleCodIntent({ ...intent, metadata: { kind: 'invoice', order_id: 'o1' } })).settled, false);
+  assert.equal(order().cod_payment_status, 'PENDING');
+  assert.ok(notices.some((n) => n.kind === 'admins' && /Check payment/.test(JSON.stringify(n.args))));
+});
+
+test('"Check payment again" asks Stripe about the stored intent: it never charges and never trusts the app', async () => {
+  const { intent } = await intentFor();
+  const waiting = await cod.confirmCodPayment(order());
+  assert.equal(waiting.paid, false);
+  assert.equal(waiting.status, 'PENDING');
+  assert.equal(stripeState.intentCreated.length, 1, 'checking creates nothing new');
+
+  succeed(intent);
+  const paid = await cod.confirmCodPayment(order());
+  assert.equal(paid.paid, true);
+  assert.equal(order().cod_payment_status, 'PAID');
+});
+
+test('a cancelled intent leaves the order Unpaid and blocked; a declined card keeps the same intent for a retry', async () => {
+  const { intent } = await intentFor();
+  await cod.releaseCodIntent({ ...intent, last_payment_error: { message: 'Your card was declined.' } });
+  assert.equal(order().cod_payment_status, 'PENDING', 'a decline keeps the intent usable');
+  assert.equal(db.table('cod_payments')[0].status, 'failed');
+  assert.equal(db.table('cod_payments')[0].failure_message, 'Your card was declined.');
+  assert.throws(() => cod.assertReceivable(order()), /Payment is required/);
+
+  intent.status = 'canceled';
+  await cod.releaseCodIntent(intent);
+  assert.equal(order().cod_payment_status, 'UNPAID');
+  assert.throws(() => cod.assertReceivable(order()), /Payment is required/);
+  assert.equal(cod.codView(order()).can_pay, true, 'the customer can pay again');
+});
+
+test('the webhook settles a COD payment_intent.succeeded once, ignores duplicates, and rejects a forged one', async () => {
+  const { intent } = await intentFor();
+  succeed(intent);
+  assert.equal((await hook({ type: 'payment_intent.succeeded', data: { object: intent } }, 'forged')).code, 400);
+  assert.equal(order().cod_payment_status, 'PENDING', 'a forged event changes nothing');
+  assert.equal((await hook({ type: 'payment_intent.succeeded', data: { object: intent } })).code, 200);
+  assert.equal(order().cod_payment_status, 'PAID');
+  const paidAt = order().cod_paid_at;
+  assert.equal((await hook({ type: 'payment_intent.succeeded', data: { object: intent } })).code, 200);
+  assert.equal(order().cod_paid_at, paidAt);
+  assert.equal(db.table('cod_payments').length, 1, 'no duplicate payment record');
+});
+
+test('the webhook records a failed card and a cancelled intent', async () => {
+  const { intent } = await intentFor();
+  await hook({ type: 'payment_intent.payment_failed', data: { object: { ...intent, last_payment_error: { message: 'Insufficient funds.' } } } });
+  assert.equal(db.table('cod_payments')[0].status, 'failed');
+  assert.equal(order().cod_payment_status, 'PENDING');
+  await hook({ type: 'payment_intent.canceled', data: { object: { ...intent, status: 'canceled' } } });
+  assert.equal(order().cod_payment_status, 'UNPAID');
+});
+
+// ───────────── receiving needs a confirmed payment ─────────────
+
+test('a COD order cannot be received until its payment is confirmed; Non-COD and older orders are not affected', async () => {
+  const blocked = (o) => {
+    try {
+      cod.assertReceivable(o);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  assert.equal(blocked(order()), false, 'older order: no payment type, nothing changes');
+  await cod.setPaymentType({ order: order(), type: 'NON_COD', actor: customer });
+  assert.equal(blocked(order()), false, 'Non-COD: normal receiving');
+  db.table('orders')[0].payment_type = null;
+  await cod.setPaymentType({ order: order(), type: 'COD', actor: customer });
+  assert.equal(blocked(order()), true, 'COD unpaid');
+  db.table('orders')[0].cod_payment_status = 'PENDING';
+  assert.equal(blocked(order()), true, 'payment started but not confirmed');
+  assert.equal(cod.codView(order()).receive_blocked, true);
+  assert.equal(cod.codView(order()).payment_state, 'processing');
+  db.table('orders')[0].cod_payment_status = 'PAID';
+  assert.equal(blocked(order()), false, 'paid: receiving is open without anyone touching the order');
+  assert.equal(cod.codView(order()).receive_blocked, false);
+  assert.equal(cod.codView(order()).payment_state, 'paid');
+});
+
+test('the receiving check also works from just the order id (what the receiving API uses)', async () => {
+  await cod.setPaymentType({ order: order(), type: 'COD', actor: customer });
+  await assert.rejects(() => cod.assertReceivableById('o1'), /Payment is required before receiving/);
+  await cod.assertReceivableById('someone-elses-order'); // an unknown id is left to the caller's own not-found handling
+  db.table('orders')[0].cod_payment_status = 'PAID';
+  await cod.assertReceivableById('o1');
+});
+
+test('partner staff cannot turn an unpaid COD order into Non-COD to get around the payment; an admin can', async () => {
+  await cod.setPaymentType({ order: order(), type: 'COD', actor: customer });
+  await assert.rejects(() => cod.setPaymentType({ order: order(), type: 'NON_COD', actor: staff }), /Only an admin/);
+  assert.equal(order().payment_type, 'COD');
+  assert.throws(() => cod.assertReceivable(order()), /Payment is required/);
+  await cod.setPaymentType({ order: order(), type: 'NON_COD', actor: { ...staff, admin: true } });
+  assert.equal(order().payment_type, 'NON_COD');
+});
+
+test('staff marking an order COD tells the customer, with the same amount the customer will be asked to pay', async () => {
+  const done = await cod.setPaymentType({ order: order(), type: 'COD', actor: staff });
+  assert.equal(done.order.cod_amount, 4200);
+  const note = notices.find((n) => n.kind === 'user');
+  assert.ok(note, 'the customer is notified');
+  assert.match(JSON.stringify(note.args), /Payment required/);
+  const start = await cod.startCodPayment({ order: order(), customer: {} });
+  assert.equal(start.amount, done.order.cod_amount, 'the client sees exactly the amount staff saw');
+});
+
+test('the customer choosing COD themselves is not notified about their own action', async () => {
+  await cod.setPaymentType({ order: order(), type: 'COD', actor: customer });
+  assert.equal(notices.filter((n) => n.kind === 'user').length, 0);
+});
+
+test('a Shopify order that Shopify reports as fully paid cannot be marked COD (no second charge)', async () => {
+  db.table('orders')[0].external_source = 'shopify';
+  db.table('orders')[0].shopify_financial_status = 'paid';
+  db.table('orders')[0].shopify_outstanding = 0;
+  await assert.rejects(() => cod.setPaymentType({ order: order(), type: 'COD', actor: staff }), /fully paid/);
+  assert.equal(order().payment_type, null);
+});
+
+test('a COD amount for a partly paid Shopify order is what Shopify says is outstanding, not the whole total', async () => {
+  Object.assign(db.table('orders')[0], { external_source: 'shopify', shopify_financial_status: 'partially_paid', shopify_outstanding: 1200, brand_order_total: 4200, brand_order_currency: 'PKR' });
+  const done = await cod.setPaymentType({ order: order(), type: 'COD', actor: staff });
+  assert.equal(done.order.cod_amount, 1200);
+  assert.equal(done.order.cod_currency, 'PKR');
+  assert.equal(done.order.cod_amount_status, 'verified');
+  assert.equal(cod.codView(order()).can_pay, true);
+});
+
+test('when Shopify later shows the order as paid, an unpaid COD order becomes Non-COD and its open payment is closed; a payment already made here is kept', async () => {
+  const { intent } = await intentFor();
+  const res = await cod.markPaidAtShopify(order());
+  assert.equal(res.changed, true);
+  assert.equal(order().payment_type, 'NON_COD');
+  assert.equal(order().cod_payment_status, null);
+  assert.ok(stripeState.canceled.includes(intent.id), 'the open intent can no longer be paid');
+  assert.doesNotThrow(() => cod.assertReceivable(order()));
+
+  db.table('orders')[0].payment_type = 'COD';
+  db.table('orders')[0].cod_payment_status = 'PAID';
+  assert.equal((await cod.markPaidAtShopify(order())).changed, false, 'the customer already paid here: kept');
+  assert.equal(order().payment_type, 'COD');
 });

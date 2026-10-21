@@ -1,4 +1,4 @@
-import { attachCodSummary } from '../services/cod-payment.service.js';
+import { assertReceivableById, attachCodSummary } from '../services/cod-payment.service.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError } from '../utils/error.helper.js';
 import { createUser, updateUser, setMemberUser } from '../services/partner-users.service.js';
@@ -253,6 +253,8 @@ export const receiveCorrectedArticle = catchAsync(async (req, res) => {
 export const receiveUnit = catchAsync(async (req, res) => {
   const unit = await loadUnit(req.params.unitId);
   if (unit.order.status === 'cancelled') throw new BadRequestError('This order was cancelled.');
+  // a COD order is received only after its payment is confirmed (checked here, not just by the disabled button)
+  await assertReceivableById(unit.order.id);
   // a held article is received with "Receive Corrected Article"; a rejected one waits until it is sent back
   if (unit.return_status === 'held') throw new BadRequestError('This article is on hold. Use “Receive Corrected Article” when the corrected one arrives.');
   if (unit.return_status === 'requested') throw new BadRequestError('Send the rejected article back first.');
@@ -337,6 +339,7 @@ export const reportUnitIssue = catchAsync(async (req, res) => {
 export const receiveAllUnits = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.orderId);
   if (order.status === 'cancelled') throw new BadRequestError('This order was cancelled.');
+  await assertReceivableById(order.id);
   const pendingUnits = unwrap(await supabaseAdmin.from('order_units').select('id, unit_title, code, return_status, resubmit_count').eq('order_id', order.id).eq('status', 'pending'));
   for (const u of pendingUnits) await logUnitEvent(u.id, order.id, 'received', { actorId: req.userId });
   unwrap(await supabaseAdmin.from('order_units').update({

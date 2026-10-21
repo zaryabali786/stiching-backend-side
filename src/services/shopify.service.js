@@ -270,3 +270,75 @@ export const fetchLineItemDetails = async (store, orderGid) => {
     return new Map();
   }
 };
+
+// ───────────── payment facts and clothing eligibility (read only) ─────────────
+
+const ORDER_FINANCIALS = `query($id: ID!) { order(id: $id) {
+  displayFinancialStatus
+  totalReceivedSet { shopMoney { amount } }
+  totalRefundedSet { shopMoney { amount } }
+  totalOutstandingSet { shopMoney { amount } }
+  transactions(first: 100) { id kind status amountSet { shopMoney { amount } } }
+  refunds(first: 50) { id totalRefundedSet { shopMoney { amount } } refundLineItems(first: 100) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } totalTaxSet { shopMoney { amount } } } } }
+} }`;
+
+const centsOf = (money) => Math.round(Number(money?.shopMoney?.amount || 0) * 100);
+
+/**
+ * What Shopify itself says was collected and refunded for one order, from its transactions (the authoritative record, not the webhook).
+ * Throws when Shopify cannot be reached: the caller keeps the payment as "not verified" and retries later.
+ * @returns {{ financial_status: string, total_received: number, total_refunded: number, outstanding: number, transactions_ok: boolean, refunds: object[] }} amounts in major units
+ */
+export const fetchOrderFinancials = async (store, orderGid) => {
+  const data = await shopifyGraphql(store, ORDER_FINANCIALS, { id: orderGid });
+  const o = data?.order;
+  if (!o) throw new ShopifyError('Shopify did not return the order.', 404);
+  const ok = (t) => String(t.status).toUpperCase() === 'SUCCESS';
+  // money in = successful sales and captures; money out = successful refunds
+  const received = (o.transactions || []).filter((t) => ok(t) && ['SALE', 'CAPTURE'].includes(String(t.kind).toUpperCase())).reduce((n, t) => n + centsOf(t.amountSet), 0);
+  const refunded = (o.transactions || []).filter((t) => ok(t) && String(t.kind).toUpperCase() === 'REFUND').reduce((n, t) => n + centsOf(t.amountSet), 0);
+  return {
+    financial_status: String(o.displayFinancialStatus || '').toLowerCase(),
+    // Shopify's own totals are kept next to the transaction sums: they must agree for the payment to count as verified
+    total_received: received / 100,
+    total_refunded: refunded / 100,
+    outstanding: centsOf(o.totalOutstandingSet) / 100,
+    transactions_ok: received === centsOf(o.totalReceivedSet),
+    refunds: (o.refunds || []).map((r) => ({
+      total: centsOf(r.totalRefundedSet),
+      lines: (r.refundLineItems?.nodes || []).map((n) => ({ line_id: String(n.lineItem?.id || '').split('/').pop(), cents: centsOf(n.subtotalSet) + centsOf(n.totalTaxSet) })),
+    })),
+  };
+};
+
+const COLLECTION_BY_HANDLE = `query($handle: String!) { collectionByIdentifier(identifier: { handle: $handle }) { id } }`;
+const PRODUCT_IN_COLLECTION = `query($id: ID!, $collection: ID!) { product(id: $id) { id inCollection(id: $collection) } }`;
+const collectionCache = new Map();
+
+/** The clothing collection the brand configured (a handle, a numeric id or a gid) as a gid; null when nothing is configured or it does not exist. */
+export const resolveCollectionGid = async (store, configured) => {
+  const value = String(configured || '').trim();
+  if (!value) return null;
+  if (/^gid:\/\/shopify\/Collection\/\d+$/.test(value)) return value;
+  if (/^\d+$/.test(value)) return `gid://shopify/Collection/${value}`;
+  const key = `${store.id}:${value.toLowerCase()}`;
+  if (collectionCache.has(key)) return collectionCache.get(key);
+  const data = await shopifyGraphql(store, COLLECTION_BY_HANDLE, { handle: value.toLowerCase() });
+  const gid = data?.collectionByIdentifier?.id || null;
+  if (gid) collectionCache.set(key, gid);
+  return gid;
+};
+
+/**
+ * Which of these products (numeric ids) belong to the collection. Asked of Shopify itself, so a customer cannot make a product eligible
+ * by editing the page. Throws when Shopify cannot be reached.
+ * @returns {Promise<Set<string>>}
+ */
+export const productsInCollection = async (store, productIds, collectionGid) => {
+  const eligible = new Set();
+  for (const id of [...new Set(productIds.filter(Boolean).map(String))]) {
+    const data = await shopifyGraphql(store, PRODUCT_IN_COLLECTION, { id: `gid://shopify/Product/${id}`, collection: collectionGid });
+    if (data?.product?.inCollection === true) eligible.add(id);
+  }
+  return eligible;
+};

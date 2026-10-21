@@ -4,7 +4,7 @@ import { catchAsync, ApiResponse, BadRequestError, NotFoundError } from '../util
 import { unwrap } from '../utils/db.js';
 import { constructWebhookEvent, createOrReusePaymentIntent, isStripeEnabled, retrievePaymentIntent } from '../services/stripe.service.js';
 import { recordFailedIntent, settleSucceededIntent } from '../services/payment.service.js';
-import { releaseCodSession, settleCodSession } from '../services/cod-payment.service.js';
+import { releaseCodIntent, releaseCodSession, settleCodIntent, settleCodSession } from '../services/cod-payment.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
 
@@ -92,8 +92,9 @@ export const stripeWebhook = async (req, res) => {
   }
 
   try {
-    if (event.type === 'payment_intent.succeeded') await settleSucceededIntent(event.data.object);
-    else if (event.type === 'payment_intent.payment_failed') await recordFailedIntent(event.data.object);
+    // a cash on delivery payment (kind 'cod') settles the order; any other intent is an invoice payment
+    if (event.type === 'payment_intent.succeeded') await (event.data.object.metadata?.kind === 'cod' ? settleCodIntent(event.data.object) : settleSucceededIntent(event.data.object));
+    else if (event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') await (event.data.object.metadata?.kind === 'cod' ? releaseCodIntent(event.data.object) : event.type === 'payment_intent.payment_failed' ? recordFailedIntent(event.data.object) : undefined);
     // cash on delivery orders pay through Stripe Checkout: only a paid session marks the order paid
     else if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') await settleCodSession(event.data.object);
     else if (event.type === 'checkout.session.expired' || event.type === 'checkout.session.async_payment_failed') await releaseCodSession(event.data.object);

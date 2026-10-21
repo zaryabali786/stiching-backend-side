@@ -118,6 +118,8 @@ export const updateShopifyStore = catchAsync(async (req, res) => {
       ...(names ? { cod_gateway_names: names } : {}),
       ...(req.body.settings.brand_name ? { brand_name: String(req.body.settings.brand_name).slice(0, 80) } : {}),
       ...(typeof req.body.settings.sms_enabled === 'boolean' ? { sms_enabled: req.body.settings.sms_enabled } : {}),
+      // the clothing collection (handle, numeric id or gid): only products in it can be stitched; empty = no restriction
+      ...(typeof req.body.settings.clothing_collection === 'string' ? { clothing_collection: req.body.settings.clothing_collection.trim().slice(0, 120) } : {}),
     };
   }
   const { data, error } = await supabaseAdmin.from('shopify_stores').update(patch).eq('id', req.params.id).select('*').maybeSingle();

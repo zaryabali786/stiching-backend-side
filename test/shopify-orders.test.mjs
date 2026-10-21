@@ -61,6 +61,18 @@ before(async () => {
       },
       updateShippingAddress: async (store, gid, address) => calls.addressUpdates.push({ gid, address }),
       fetchLineItemDetails: async () => new Map([['111', { image_url: 'https://cdn.example/a.png', url: 'https://brand.example/products/suit' }]]),
+      // Shopify's own payment record of the order (the transactions), the collection of the clothing products, and who belongs to it
+      fetchOrderFinancials: async (store, gid) => {
+        calls.financialReads.push(gid);
+        if (behave.financialsFail) throw new Error('Shopify is down');
+        return behave.financials ? behave.financials(gid) : null;
+      },
+      resolveCollectionGid: async (store, value) => (behave.collectionMissing ? null : `gid://shopify/Collection/${value}`),
+      productsInCollection: async (store, ids, gid) => {
+        calls.collectionChecks.push({ ids, gid });
+        if (behave.collectionFails) throw new Error('Shopify is down');
+        return new Set(ids.filter((id) => (behave.clothing || []).includes(String(id))).map(String));
+      },
     },
   });
   // the real phone-number reading, with the sending itself faked
@@ -95,7 +107,7 @@ before(async () => {
 });
 
 const beforeEachReset = () => {
-  calls = { holds: [], releases: [], tags: [], addressUpdates: [], emails: [], admins: [], users: [], sms: [] };
+  calls = { holds: [], releases: [], tags: [], addressUpdates: [], emails: [], admins: [], users: [], sms: [], financialReads: [], collectionChecks: [] };
   behave = {};
   STORE.settings = {};
   db = createFakeDb(
@@ -110,6 +122,7 @@ const beforeEachReset = () => {
       profiles: [],
       platform_settings: [ATELIER],
       login_codes: [],
+      shopify_order_splits: [],
     },
     { uniques: { shopify_orders: { when: () => true, key: (r) => `${r.store_id}:${r.shopify_order_id}` } } }
   );
@@ -417,4 +430,390 @@ test('resending the email does not text a customer who already got the text', as
   await orders.resendCustomerEmail(row().id);
   assert.equal(calls.emails.length, 1);
   assert.equal(calls.sms.length, 1);
+});
+
+// ───────────── what Shopify says about the payment ─────────────
+
+test('Shopify payment status is read from its own figures, never assumed', () => {
+  const info = (extra) => orders.shopifyPaymentInfo(shopifyOrder(extra));
+  assert.deepEqual(pick(info({ financial_status: 'paid' })), { kind: 'paid', outstanding: 0, paid: 12500 });
+  assert.deepEqual(pick(info({ financial_status: 'pending' })), { kind: 'unpaid', outstanding: 12500, paid: 0 });
+  assert.deepEqual(pick(info({ financial_status: 'authorized' })), { kind: 'unpaid', outstanding: 12500, paid: 0 }, 'authorized money is not collected yet');
+  assert.deepEqual(pick(info({ financial_status: 'partially_paid', total_outstanding: '4500.00' })), { kind: 'unpaid', outstanding: 4500, paid: 8000 });
+  assert.deepEqual(pick(info({ financial_status: 'partially_paid', total_received: '10000.00' })), { kind: 'unpaid', outstanding: 2500, paid: 10000 }, 'outstanding = total minus received');
+  assert.equal(info({ financial_status: 'partially_paid' }).kind, 'unknown', 'partly paid with no figures: not guessed');
+  assert.equal(info({ financial_status: 'refunded' }).kind, 'unknown');
+  assert.equal(info({ financial_status: 'voided' }).kind, 'unknown');
+  assert.equal(info({ financial_status: undefined }).kind, 'unknown');
+  assert.equal(info({ financial_status: 'paid', currency: undefined }).kind, 'unknown', 'no currency: cannot be trusted');
+  assert.equal(info({ financial_status: 'paid', total_outstanding: '300.00' }).kind, 'unpaid', 'a paid status with money still outstanding is not paid');
+});
+const pick = (i) => ({ kind: i.kind, outstanding: i.outstanding, paid: i.amount_paid });
+
+test('a Shopify order that is already fully paid is Non-COD: no choice, no payment asked', async () => {
+  const result = await orders.processOrderCreate(STORE, shopifyOrder({ financial_status: 'paid', payment_gateway_names: ['shopify_payments'] }));
+  assert.equal(result.status, 'processed');
+  const o = order();
+  assert.equal(o.payment_type, 'NON_COD');
+  assert.equal(o.cod_payment_status, null);
+  assert.equal(o.cod_amount, undefined, 'nothing to collect');
+  assert.equal(o.brand_payment_status, 'paid');
+  assert.equal(o.shopify_financial_status, 'paid');
+  assert.equal(o.shopify_outstanding, 0);
+  assert.equal(o.shopify_amount_paid, 12500);
+  const cod = await import('../src/services/cod-payment.service.js');
+  assert.equal(cod.codView(o).can_choose, false, 'the customer is not asked COD or Non-COD');
+  assert.equal(cod.codView(o).can_pay, false, 'and is not asked to pay again');
+  assert.doesNotThrow(() => cod.assertReceivable(o), 'receiving is open');
+});
+
+test('an unpaid Shopify order is COD for the amount outstanding, and cannot be received until it is paid', async () => {
+  await orders.processOrderCreate(STORE, shopifyOrder({ financial_status: 'pending' }));
+  const o = order();
+  assert.equal(o.payment_type, 'COD');
+  assert.equal(o.cod_payment_status, 'UNPAID');
+  assert.equal(o.cod_amount, 12500);
+  assert.equal(o.cod_currency, 'PKR');
+  assert.equal(o.cod_amount_status, 'verified');
+  assert.equal(o.cod_amount_source, 'shopify');
+  assert.equal(o.brand_payment_status, 'pending');
+  const cod = await import('../src/services/cod-payment.service.js');
+  const view = cod.codView(o);
+  assert.equal(view.can_pay, true);
+  assert.equal(view.source, 'shopify');
+  assert.equal(view.receive_blocked, true);
+  assert.equal(view.shopify.financial_status, 'pending');
+  assert.equal(view.shopify.outstanding, 12500);
+  assert.throws(() => cod.assertReceivable(o), /Payment is required/);
+});
+
+test('a partly paid Shopify order asks only for what is outstanding', async () => {
+  await orders.processOrderCreate(STORE, shopifyOrder({ financial_status: 'partially_paid', total_outstanding: '4500.00' }));
+  const o = order();
+  assert.equal(o.payment_type, 'COD');
+  assert.equal(o.cod_amount, 4500);
+  assert.equal(o.shopify_amount_paid, 8000);
+  assert.equal(o.shopify_outstanding, 4500);
+});
+
+test('when Shopify does not say clearly whether it is paid, nothing is assumed: our team confirms the total first', async () => {
+  await orders.processOrderCreate(STORE, shopifyOrder({ financial_status: 'refunded' }));
+  const o = order();
+  assert.equal(o.payment_type, 'COD');
+  assert.equal(o.cod_amount_status, 'needs_verification');
+  assert.equal(o.cod_amount, undefined);
+  const cod = await import('../src/services/cod-payment.service.js');
+  const view = cod.codView(o);
+  assert.equal(view.can_pay, false, 'cannot be paid until confirmed');
+  assert.equal(view.payment_state, 'verification_pending');
+  assert.equal(view.receive_blocked, true);
+});
+
+test('when Shopify later shows the order as paid, the unpaid COD order becomes Non-COD (no charge, receiving opens)', async () => {
+  await orders.processOrderCreate(STORE, shopifyOrder({ financial_status: 'pending' }));
+  assert.equal(order().payment_type, 'COD');
+  await orders.processOrderUpdated(STORE, shopifyOrder({ financial_status: 'paid' }));
+  assert.equal(order().payment_type, 'NON_COD');
+  assert.equal(order().cod_payment_status, null);
+  assert.equal(order().shopify_financial_status, 'paid');
+  assert.equal(order().brand_payment_status, 'paid');
+  assert.ok(db.table('order_events').some((e) => /Shopify reports the brand order as fully paid/.test(e.note || '')));
+});
+
+test('a Shopify update that is not paid changes nothing about the payment type', async () => {
+  await orders.processOrderCreate(STORE, shopifyOrder({ financial_status: 'pending' }));
+  await orders.processOrderUpdated(STORE, shopifyOrder({ financial_status: 'pending' }));
+  assert.equal(order().payment_type, 'COD');
+  assert.equal(order().cod_payment_status, 'UNPAID');
+});
+
+// ───────────── mixed orders: clothing eligibility, the split, tags, addresses ─────────────
+
+const mkLine = (id, price, quantity, extra = {}) => ({ id, title: `Product ${id}`, variant_title: 'M', sku: `SKU-${id}`, product_id: 900 + id, variant_id: 800 + id, price, quantity, properties: [], discount_allocations: [], tax_lines: [], ...extra });
+const MARK = [{ name: '_stitchship', value: 'yes' }, { name: '_stitchship_ref', value: 'SS-AB12CD' }];
+/** The customer's five-product checkout: A and B are ticked for stitching, C, D and E are normal. */
+const mixedOrder = (extra = {}) =>
+  shopifyOrder({
+    note_attributes: [],
+    taxes_included: false,
+    financial_status: 'paid',
+    total_price: '311.30',
+    line_items: [
+      mkLine(1, '100.00', 1, { properties: MARK, tax_lines: [{ price: '10.00' }] }),
+      mkLine(2, '50.00', 2, { properties: MARK, discount_allocations: [{ amount: '10.00' }], tax_lines: [{ price: '9.00' }] }),
+      mkLine(3, '30.00', 1, { tax_lines: [{ price: '3.00' }] }),
+      mkLine(4, '20.00', 1, { discount_allocations: [{ amount: '2.00' }], tax_lines: [{ price: '1.80' }] }),
+      mkLine(5, '10.00', 3, { tax_lines: [{ price: '3.00' }] }),
+    ],
+    shipping_lines: [{ price: '15.00', discounted_price: '15.00', tax_lines: [{ price: '1.50' }] }],
+    ...extra,
+  });
+const splits = () => db.table('shopify_order_splits');
+const splitOf = (kind) => splits().find((r) => r.kind === kind);
+const unitsOf = () => db.table('order_units').map((u) => u.unit_title);
+
+test('a mixed order: the customer\'s stitching order has only the ticked lines, worth only those lines', async () => {
+  const result = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(result.status, 'processed');
+  assert.equal(db.table('orders').length, 1, 'one internal order');
+  assert.equal(unitsOf().length, 3, 'A once and B twice: B has a quantity of 2');
+  assert.ok(unitsOf().every((t) => /Product [12]/.test(t)), 'no normal product reached the stitching order');
+  assert.equal(order().brand_order_total, 220.69, 'its total is the stitching share, not the whole checkout');
+  assert.equal(order().brand_order_currency, 'PKR');
+});
+
+test('the split is saved once per group with products, amounts, payment and the original order\'s reference', async () => {
+  await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(splits().length, 2);
+  const s = splitOf('stitchship');
+  const n = splitOf('normal');
+  assert.equal(s.shopify_order_id, '5001');
+  assert.equal(s.shopify_order_name, '#1001');
+  assert.equal(s.order_id, order().id, 'the stitching group points at the internal order');
+  assert.equal(n.order_id, null, 'the normal group is not an operational order of ours');
+  assert.deepEqual(s.line_ids, ['1', '2']);
+  assert.deepEqual(n.line_ids, ['3', '4', '5']);
+  assert.equal(s.total, 220.69);
+  assert.equal(n.total, 90.61);
+  assert.equal(s.subtotal + n.subtotal, 280);
+  assert.equal(s.currency, 'PKR');
+  assert.equal(s.reconciled, true);
+  assert.equal(s.tag, 'stitchship');
+  assert.equal(n.tag, null);
+});
+
+test('only the stitching order is tagged stitchship: a mixed Shopify order carries the mixed tag, never the plain one', async () => {
+  await orders.processOrderCreate(STORE, mixedOrder());
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship-mixed']);
+  beforeEachReset();
+  await orders.processOrderCreate(STORE, shopifyOrder({ financial_status: 'pending' }));
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship'], 'an order that is all stitching keeps the plain tag');
+  assert.equal(splits().length, 1, 'and has only a stitching group');
+});
+
+test('the original payment is allocated, counted once, and each group is paid only to the extent the payment covers it', async () => {
+  behave.financials = () => ({ financial_status: 'paid', total_received: 311.3, total_refunded: 0, outstanding: 0, transactions_ok: true, refunds: [] });
+  await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(calls.financialReads.length, 1, 'Shopify was asked for the real transactions');
+  const s = splitOf('stitchship');
+  const n = splitOf('normal');
+  assert.equal(s.payment_status, 'paid');
+  assert.equal(n.payment_status, 'paid');
+  assert.equal(s.payment_verified, true);
+  assert.equal(Math.round((s.amount_paid + n.amount_paid) * 100), 31130, 'the payment is not counted twice');
+  assert.equal(order().payment_type, 'NON_COD', 'a paid order asks the customer for nothing more');
+  assert.equal(order().cod_payment_status, null);
+});
+
+test('an unpaid mixed order: the customer is asked for the stitching share only, never the whole checkout', async () => {
+  behave.financials = () => ({ financial_status: 'pending', total_received: 0, total_refunded: 0, outstanding: 311.3, transactions_ok: true, refunds: [] });
+  await orders.processOrderCreate(STORE, mixedOrder({ financial_status: 'pending' }));
+  assert.equal(order().payment_type, 'COD');
+  assert.equal(order().cod_amount, 220.69, 'not 311.30');
+  assert.equal(order().cod_currency, 'PKR');
+  assert.equal(splitOf('stitchship').payment_status, 'unpaid');
+  assert.equal(splitOf('stitchship').outstanding, 220.69);
+  assert.equal(splitOf('normal').outstanding, 90.61);
+});
+
+test('a partly paid mixed order: each group is owed only what the one payment does not cover', async () => {
+  behave.financials = () => ({ financial_status: 'partially_paid', total_received: 100, total_refunded: 0, outstanding: 211.3, transactions_ok: true, refunds: [] });
+  await orders.processOrderCreate(STORE, mixedOrder({ financial_status: 'partially_paid', total_outstanding: '211.30', total_received: '100.00' }));
+  assert.equal(splitOf('stitchship').payment_status, 'partially_paid');
+  assert.equal(splitOf('stitchship').amount_paid, 70.89);
+  assert.equal(order().payment_type, 'COD');
+  assert.equal(order().cod_amount, 149.8, 'what the stitching share still owes: 220.69 - 70.89');
+});
+
+test('if Shopify\'s transactions cannot be read, the order is still taken in and nothing is called verified paid', async () => {
+  behave.financialsFail = true;
+  const result = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(result.status, 'processed');
+  assert.equal(splitOf('stitchship').payment_status, 'paid_unverified');
+  assert.equal(splitOf('stitchship').payment_verified, false);
+  assert.equal(splitOf('stitchship').payment_source, 'webhook');
+  const queue = await orders.shopifyQueue();
+  assert.equal(queue[0].needs_attention, true, 'an administrator is shown that the payment is not verified');
+  // Shopify is back: "Try again" checks the saved split with Shopify and settles the payment
+  behave.financialsFail = false;
+  behave.financials = () => ({ financial_status: 'paid', total_received: 311.3, total_refunded: 0, outstanding: 0, transactions_ok: true, refunds: [] });
+  const again = await orders.retryShopifyOrder(row().id);
+  assert.equal(again.status, 'payment_rechecked');
+  assert.equal(splitOf('stitchship').payment_status, 'paid');
+  assert.equal(splitOf('stitchship').payment_verified, true);
+  assert.equal(splits().length, 2, 'no duplicate rows');
+});
+
+test('the address each group uses: the stitching address on the stitching order, the customer\'s own for the normal items', async () => {
+  // the brand order has one shipping address and it is the atelier: the normal items cannot be delivered to the customer by this order
+  await orders.processOrderCreate(STORE, mixedOrder());
+  const s = splitOf('stitchship');
+  const n = splitOf('normal');
+  assert.equal(s.address.kind, 'atelier');
+  assert.equal(s.address.matches_atelier, true);
+  assert.equal(n.address.kind, 'billing', 'the customer\'s own address is the intended one');
+  assert.equal(n.address.needs_separate_delivery, true);
+  assert.equal(n.address.city, 'Dubai');
+  assert.ok(calls.admins.some((a) => /mixes stitching and normal items/.test(a.title)), 'the admins are told');
+  assert.equal((await orders.shopifyQueue())[0].needs_attention, true);
+  assert.equal(calls.addressUpdates.length, 0, 'no address was changed by the app');
+});
+
+test('a mixed order whose address is not the atelier keeps the customer\'s address for the normal items and holds the shipment as before', async () => {
+  await orders.processOrderCreate(STORE, mixedOrder({ shipping_address: atelierAddress({ address1: '5 Canal Road', address2: '', city: 'Dubai', company: '' }) }));
+  assert.equal(splitOf('stitchship').address.matches_atelier, false);
+  assert.equal(splitOf('normal').address.kind, 'shipping');
+  assert.equal(splitOf('normal').address.needs_separate_delivery, undefined);
+  assert.equal(row().address_state, 'address_mismatch');
+  assert.equal(row().hold_state, 'held');
+  assert.equal(calls.addressUpdates.length, 0);
+});
+
+test('the same mixed order delivered twice makes one order, one tag and no duplicate split rows', async () => {
+  await orders.processOrderCreate(STORE, mixedOrder());
+  const again = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(again.status, 'duplicate');
+  assert.equal(db.table('orders').length, 1);
+  assert.equal(calls.tags.length, 1);
+  assert.equal(splits().length, 2);
+  assert.equal(calls.emails.length, 1);
+});
+
+test('a failure while saving the split does not lose the order or make a second one, and "Try again" is safe', async () => {
+  const real = db.from;
+  let failing = true;
+  db.from = (table) => (table === 'shopify_order_splits' && failing ? { upsert: async () => ({ error: { message: 'connection reset' } }) } : real(table));
+  const result = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(result.status, 'processed');
+  assert.equal(db.table('orders').length, 1);
+  assert.match(row().last_error, /price split/);
+  assert.ok(calls.admins.some((a) => /price split/.test(a.title)));
+  failing = false;
+  db.from = real;
+  assert.equal(splits().length, 0);
+  assert.ok(row().payload, 'the Shopify copy is kept while the split is not saved');
+  // "Try again" builds the split from the kept copy: no second order, no second email, no second tag
+  const retry = await orders.retryShopifyOrder(row().id);
+  assert.equal(retry.status, 'split_saved');
+  assert.equal(splits().length, 2);
+  assert.equal(row().last_error, null);
+  assert.equal(db.table('orders').length, 1);
+  assert.equal(calls.emails.length, 1);
+  assert.equal(calls.tags.length, 1);
+  assert.equal(row().payload, null, 'now that everything is saved the personal data is cleared as before');
+  // and again: nothing changes
+  const twice = await orders.retryShopifyOrder(row().id);
+  assert.equal(splits().length, 2);
+  assert.equal(twice.status, 'payment_rechecked');
+});
+
+// ───────────── only clothing is stitched ─────────────
+
+test('with a clothing collection set, only ticked products that really are in it are stitched; the rest follow the normal flow', async () => {
+  STORE.settings = { clothing_collection: 'clothing' };
+  behave.clothing = ['901']; // product A is clothing; B carries the tick but is not
+  const result = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(result.status, 'processed');
+  assert.equal(calls.collectionChecks.length, 1, 'Shopify itself was asked, once');
+  assert.deepEqual(calls.collectionChecks[0].ids.map(String).sort(), ['901', '902']);
+  assert.equal(calls.collectionChecks[0].gid, 'gid://shopify/Collection/clothing');
+  assert.deepEqual(unitsOf(), ['Product 1 · M'], 'only the clothing product was taken in');
+  assert.deepEqual(splitOf('stitchship').line_ids, ['1']);
+  assert.deepEqual(splitOf('normal').line_ids, ['2', '3', '4', '5'], 'B is a normal line: it carried the tick but is not clothing');
+  assert.ok(calls.admins.some((a) => /not clothing/.test(a.title)));
+});
+
+test('a tick on a product that is not clothing, and nothing else ticked, is not a Stitch&Ship order at all', async () => {
+  STORE.settings = { clothing_collection: 'clothing' };
+  behave.clothing = [];
+  const result = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(result.status, 'ignored');
+  assert.equal(db.table('orders').length, 0);
+  assert.equal(db.table('shopify_orders').length, 0, 'nothing is stored');
+  assert.equal(calls.tags.length, 0, 'no stitchship tag lands on an ordinary order');
+});
+
+test('products without a tick never become stitching, whatever collection they are in', async () => {
+  STORE.settings = { clothing_collection: 'clothing' };
+  behave.clothing = ['901', '902', '903', '904', '905'];
+  await orders.processOrderCreate(STORE, mixedOrder());
+  assert.deepEqual(splitOf('stitchship').line_ids, ['1', '2']);
+  assert.deepEqual(splitOf('normal').line_ids, ['3', '4', '5']);
+  assert.deepEqual(calls.collectionChecks[0].ids.map(String).sort(), ['901', '902'], 'only the ticked lines are checked');
+});
+
+test('no clothing collection configured: the ticked lines count as before', async () => {
+  STORE.settings = {};
+  await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(calls.collectionChecks.length, 0);
+  assert.deepEqual(splitOf('stitchship').line_ids, ['1', '2']);
+});
+
+test('a configured collection that no longer exists cannot be checked: the ticked lines count and the admins are told', async () => {
+  STORE.settings = { clothing_collection: 'deleted-collection' };
+  behave.collectionMissing = true;
+  const result = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(result.status, 'processed');
+  assert.deepEqual(splitOf('stitchship').line_ids, ['1', '2']);
+  assert.ok(calls.admins.some((a) => /clothing collection/.test(a.title)));
+});
+
+test('if Shopify cannot be asked about the collection, nothing is stored and the delivery is retried cleanly', async () => {
+  STORE.settings = { clothing_collection: 'clothing' };
+  behave.collectionFails = true;
+  behave.clothing = ['901', '902'];
+  await assert.rejects(() => orders.processOrderCreate(STORE, mixedOrder()), /Shopify is down/);
+  assert.equal(db.table('shopify_orders').length, 0);
+  assert.equal(db.table('orders').length, 0);
+  assert.equal(calls.tags.length, 0);
+  behave.collectionFails = false;
+  const again = await orders.processOrderCreate(STORE, mixedOrder());
+  assert.equal(again.status, 'processed');
+  assert.equal(db.table('orders').length, 1, 'one order after the retry');
+  assert.equal(splits().length, 2);
+});
+
+// ───────────── refunds, cancellations ─────────────
+
+test('a refund in Shopify updates the split: the refunded line\'s group only, with nothing counted twice', async () => {
+  behave.financials = () => ({ financial_status: 'paid', total_received: 311.3, total_refunded: 0, outstanding: 0, transactions_ok: true, refunds: [] });
+  await orders.processOrderCreate(STORE, mixedOrder());
+  behave.financials = () => ({ financial_status: 'partially_refunded', total_received: 311.3, total_refunded: 110, outstanding: 0, transactions_ok: true, refunds: [{ total: 11000, lines: [{ line_id: '1', cents: 11000 }] }] });
+  await orders.processOrderUpdated(STORE, mixedOrder({ financial_status: 'partially_refunded' }));
+  assert.equal(splitOf('stitchship').refunded, 110);
+  assert.equal(splitOf('stitchship').payment_status, 'partially_refunded');
+  assert.equal(splitOf('normal').refunded, 0);
+  assert.equal(splitOf('normal').payment_status, 'paid');
+  assert.equal(splits().length, 2, 'the same two rows, updated');
+  // the same event again changes nothing
+  await orders.processOrderUpdated(STORE, mixedOrder({ financial_status: 'partially_refunded' }));
+  assert.equal(splitOf('stitchship').refunded, 110);
+});
+
+test('a payment that arrives later settles the groups: unpaid becomes paid once Shopify says so, and the app asks nothing more', async () => {
+  behave.financials = () => ({ financial_status: 'pending', total_received: 0, total_refunded: 0, outstanding: 311.3, transactions_ok: true, refunds: [] });
+  await orders.processOrderCreate(STORE, mixedOrder({ financial_status: 'pending' }));
+  assert.equal(order().payment_type, 'COD');
+  behave.financials = () => ({ financial_status: 'paid', total_received: 311.3, total_refunded: 0, outstanding: 0, transactions_ok: true, refunds: [] });
+  await orders.processOrderUpdated(STORE, mixedOrder({ financial_status: 'paid' }));
+  assert.equal(splitOf('stitchship').payment_status, 'paid');
+  assert.equal(splitOf('normal').payment_status, 'paid');
+  assert.equal(order().payment_type, 'NON_COD');
+});
+
+test('cancelling the Shopify order closes both groups: nothing is shown as owed', async () => {
+  behave.financials = () => ({ financial_status: 'pending', total_received: 0, total_refunded: 0, outstanding: 311.3, transactions_ok: true, refunds: [] });
+  await orders.processOrderCreate(STORE, mixedOrder({ financial_status: 'pending' }));
+  await orders.processOrderCancelled(STORE, mixedOrder({ financial_status: 'voided' }));
+  assert.equal(splitOf('stitchship').payment_status, 'cancelled');
+  assert.equal(splitOf('normal').payment_status, 'cancelled');
+  assert.equal(splitOf('stitchship').outstanding, 0);
+  assert.equal(row().state, 'cancelled');
+});
+
+test('the admin queue carries the split of every order', async () => {
+  await orders.processOrderCreate(STORE, mixedOrder());
+  const queue = await orders.shopifyQueue();
+  assert.equal(queue[0].split.length, 2);
+  assert.deepEqual(queue[0].split.map((s) => s.kind), ['stitchship', 'normal']);
 });

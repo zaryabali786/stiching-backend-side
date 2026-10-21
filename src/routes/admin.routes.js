@@ -1,5 +1,5 @@
 import { addShopifyStore, getShopifyQueue, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, reconnectShopifyWebhooks, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
-import { getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
+import { checkStaffCodPayment, getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
 import { getAdminModules, createAdminUser, setAdminUserAccess, resetAdminUserPassword, listAdminRoles, createAdminRole, updateAdminRole, deleteAdminRole } from '../controllers/admin-users.controller.js';
@@ -104,6 +104,7 @@ router.post('/shopify/orders/:id/retry', retryShopifyOrderRequest);
 router.post('/shopify/orders/:id/resend', resendShopifyEmailRequest);
 router.post('/shopify/events/:id/retry', retryShopifyEvent);
 router.get('/orders/:id/cod', getOrderCod);
+router.post('/orders/:id/cod/check', inActivePartnerOrder(), checkStaffCodPayment);
 router.put('/orders/:id/payment-type', inActivePartnerOrder(), setStaffPaymentType);
 router.put('/orders/:id/cod-amount', inActivePartnerOrder(), setStaffCodAmount);
 router.patch('/orders/:id', inActivePartnerOrder(), updateAdminOrder);

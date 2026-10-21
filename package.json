@@ -20,7 +20,7 @@
     "audit:routes": "node scripts/audit-routes.mjs",
     "test:roles": "node scripts/e2e-roles-invoice.mjs",
     "test:messages": "node scripts/e2e-messages-realtime.mjs",
-    "test:unit": "node --experimental-test-module-mocks --test test/email-orders.test.mjs test/article-workflow.test.mjs test/scan-receive.test.mjs test/master-tracking.test.mjs test/return-shipments.test.mjs test/dispatch-shipments.test.mjs test/postex.test.mjs test/return-orders.test.mjs test/unit-weight.test.mjs test/brand-payment.test.mjs test/order-edit.test.mjs test/pressing.test.mjs test/partner-order-panel.test.mjs test/extra-costs.test.mjs test/fx-rate.test.mjs test/push-notifications.test.mjs test/order-flow-push.test.mjs test/article-team-push.test.mjs test/cod-payment.test.mjs test/shopify-security.test.mjs test/shopify-orders.test.mjs test/shopify-webhook.test.mjs test/auth-code.test.mjs"
+    "test:unit": "node --experimental-test-module-mocks --test test/email-orders.test.mjs test/article-workflow.test.mjs test/scan-receive.test.mjs test/master-tracking.test.mjs test/return-shipments.test.mjs test/dispatch-shipments.test.mjs test/postex.test.mjs test/return-orders.test.mjs test/unit-weight.test.mjs test/brand-payment.test.mjs test/order-edit.test.mjs test/pressing.test.mjs test/partner-order-panel.test.mjs test/extra-costs.test.mjs test/fx-rate.test.mjs test/push-notifications.test.mjs test/order-flow-push.test.mjs test/article-team-push.test.mjs test/cod-payment.test.mjs test/shopify-security.test.mjs test/shopify-orders.test.mjs test/shopify-webhook.test.mjs test/auth-code.test.mjs test/cod-receiving.test.mjs test/shopify-split.test.mjs"
   },
   "keywords": [],
   "author": "",
