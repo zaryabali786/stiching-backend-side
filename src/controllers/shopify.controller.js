@@ -118,9 +118,7 @@ export const updateShopifyStore = catchAsync(async (req, res) => {
       ...(names ? { cod_gateway_names: names } : {}),
       ...(req.body.settings.brand_name ? { brand_name: String(req.body.settings.brand_name).slice(0, 80) } : {}),
       ...(typeof req.body.settings.sms_enabled === 'boolean' ? { sms_enabled: req.body.settings.sms_enabled } : {}),
-      // splitting mixed orders in Shopify itself (a new order, the lines taken off the original): off until an administrator turns it on for the store
-      ...(typeof req.body.settings.auto_split === 'boolean' ? { auto_split: req.body.settings.auto_split } : {}),
-      // which lines are Stitch&Ship: 'enabled' = every line on a product with the box ticked (default); 'customer' = only what the customer ticked on the page
+      // when an order is a Stitch&Ship order: 'customer' (default) = the customer ticked it on the product page AND the product's box is ticked; 'enabled' = the product's box alone
       ...(['enabled', 'customer'].includes(req.body.settings.stitch_mode) ? { stitch_mode: req.body.settings.stitch_mode } : {}),
     };
   }

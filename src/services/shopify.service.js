@@ -334,47 +334,9 @@ export const fetchLineItemDetails = async (store, orderGid) => {
   }
 };
 
-// ───────────── payment facts and Stitch&Ship eligibility (read only) ─────────────
-
-const ORDER_FINANCIALS = `query($id: ID!) { order(id: $id) {
-  displayFinancialStatus
-  totalReceivedSet { shopMoney { amount } }
-  totalRefundedSet { shopMoney { amount } }
-  totalOutstandingSet { shopMoney { amount } }
-  transactions(first: 100) { id kind status gateway amountSet { shopMoney { amount } } }
-  refunds(first: 50) { id totalRefundedSet { shopMoney { amount } } refundLineItems(first: 100) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } totalTaxSet { shopMoney { amount } } } } }
-} }`;
+// ───────────── Stitch&Ship eligibility (read only) ─────────────
 
 const centsOf = (money) => Math.round(Number(money?.shopMoney?.amount || 0) * 100);
-
-/**
- * What Shopify itself says was collected and refunded for one order, from its transactions (the authoritative record, not the webhook).
- * Throws when Shopify cannot be reached: the caller keeps the payment as "not verified" and retries later.
- * @returns {{ financial_status: string, total_received: number, total_refunded: number, outstanding: number, transactions_ok: boolean, refunds: object[] }} amounts in major units
- */
-export const fetchOrderFinancials = async (store, orderGid) => {
-  const data = await shopifyGraphql(store, ORDER_FINANCIALS, { id: orderGid });
-  const o = data?.order;
-  if (!o) throw new ShopifyError('Shopify did not return the order.', 404);
-  const ok = (t) => String(t.status).toUpperCase() === 'SUCCESS';
-  // money in = successful sales and captures; money out = successful refunds
-  const received = (o.transactions || []).filter((t) => ok(t) && ['SALE', 'CAPTURE'].includes(String(t.kind).toUpperCase())).reduce((n, t) => n + centsOf(t.amountSet), 0);
-  const refunded = (o.transactions || []).filter((t) => ok(t) && String(t.kind).toUpperCase() === 'REFUND').reduce((n, t) => n + centsOf(t.amountSet), 0);
-  return {
-    financial_status: String(o.displayFinancialStatus || '').toLowerCase(),
-    // Shopify's own totals are kept next to the transaction sums: they must agree for the payment to count as verified
-    total_received: received / 100,
-    total_refunded: refunded / 100,
-    outstanding: centsOf(o.totalOutstandingSet) / 100,
-    // the real payments (id, gateway, amount): copied onto the receipt of a split order so the original payment stays traceable
-    transactions: (o.transactions || []).filter(ok).map((t) => ({ id: String(t.id).split('/').pop(), kind: String(t.kind).toLowerCase(), gateway: t.gateway || null, amount: centsOf(t.amountSet) / 100 })),
-    transactions_ok: received === centsOf(o.totalReceivedSet),
-    refunds: (o.refunds || []).map((r) => ({
-      total: centsOf(r.totalRefundedSet),
-      lines: (r.refundLineItems?.nodes || []).map((n) => ({ line_id: String(n.lineItem?.id || '').split('/').pop(), cents: centsOf(n.subtotalSet) + centsOf(n.totalTaxSet) })),
-    })),
-  };
-};
 
 const PRODUCTS_ENABLED = `query($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id metafield(namespace: "$app:stitchship", key: "enabled") { value } } } }`;
 
@@ -400,74 +362,15 @@ export const productsStitchEnabled = async (store, productIds) => {
   return enabled;
 };
 
-// ───────────── splitting an order: a new order for the stitching lines, the lines removed from the original ─────────────
+// ───────────── notes on an order ─────────────
 
-const ORDER_CREATE = `mutation($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) { orderCreate(order: $order, options: $options) { order { id name currentTotalPriceSet { shopMoney { amount } } displayFinancialStatus } userErrors { field message } } }`;
-const FIND_BY_SOURCE = `query($q: String!) { orders(first: 1, query: $q) { nodes { id name currentTotalPriceSet { shopMoney { amount } } displayFinancialStatus } } }`;
-const EDIT_BEGIN = `mutation($id: ID!) { orderEditBegin(id: $id) { calculatedOrder { id lineItems(first: 250) { nodes { id title sku quantity variant { id } } } } userErrors { field message } } }`;
-const EDIT_SET_QTY = `mutation($id: ID!, $lineItemId: ID!) { orderEditSetQuantity(id: $id, lineItemId: $lineItemId, quantity: 0, restock: false) { calculatedOrder { id } userErrors { field message } } }`;
-const EDIT_COMMIT = `mutation($id: ID!, $note: String) { orderEditCommit(id: $id, notifyCustomer: false, staffNote: $note) { order { id currentTotalPriceSet { shopMoney { amount } } } userErrors { field message } } }`;
 const ORDER_NOTE = `query($id: ID!) { order(id: $id) { id note currentTotalPriceSet { shopMoney { amount } } } }`;
 
-const orderSummary = (o) => (o ? { id: o.id, name: o.name, total_cents: centsOf(o.currentTotalPriceSet), financial_status: String(o.displayFinancialStatus || '').toLowerCase() } : null);
-
-/** Make a new order in the store (never charges anyone, never emails the customer, never touches stock). Returns { id, name, total_cents, financial_status }. */
-export const createShopifyOrder = async (store, order) => {
-  const res = await shopifyGraphql(store, ORDER_CREATE, { order, options: { inventoryBehaviour: 'BYPASS', sendReceipt: false, sendFulfillmentReceipt: false } });
-  userErrors(res.orderCreate, 'Could not create the order');
-  return orderSummary(res.orderCreate.order);
-};
-
-/** An order this app made earlier for the same source (so a retry never makes a second one), or null. */
-export const findOrderBySourceIdentifier = async (store, sourceIdentifier) => {
-  const data = await shopifyGraphql(store, FIND_BY_SOURCE, { q: `source_identifier:${sourceIdentifier}` });
-  return orderSummary(data?.orders?.nodes?.[0]);
-};
-
-/** The order's current total, in cents. */
+/** The order's note (and current total, in cents). */
 export const fetchOrderTotal = async (store, orderGid) => {
   const data = await shopifyGraphql(store, ORDER_NOTE, { id: orderGid });
   if (!data?.order) throw new ShopifyError('Shopify did not return the order.', 404);
   return { total_cents: centsOf(data.order.currentTotalPriceSet), note: data.order.note || '' };
-};
-
-/**
- * Which edit-session line is which original line: by variant, SKU, title and quantity, each used once. Nothing is guessed: a line that
- * cannot be matched exactly throws, and then nothing has been changed.
- * @param {{ variant_id?: number|string|null, sku?: string|null, title: string, quantity: number }[]} targets the original lines to remove
- * @param {{ id: string, title: string, sku: string|null, quantity: number, variant?: { id: string }|null }[]} calculated the edit session's lines
- * @returns {string[]} the edit-session line ids, one per target
- */
-export const matchCalculatedLines = (targets, calculated) => {
-  const used = new Set();
-  return targets.map((t) => {
-    const found = calculated.find((c) => {
-      if (used.has(c.id)) return false;
-      const variantOk = !t.variant_id || !c.variant?.id || String(c.variant.id).split('/').pop() === String(t.variant_id);
-      return variantOk && (c.sku || null) === (t.sku || null) && String(c.title) === String(t.title) && Number(c.quantity) === Number(t.quantity);
-    });
-    if (!found) throw new ShopifyError(`The line "${t.title}" could not be matched in Shopify's order editor, so nothing was changed.`, 422);
-    used.add(found.id);
-    return found.id;
-  });
-};
-
-/**
- * Take lines off an order (quantity to zero, stock is not returned: the same goods are on the new order). One edit session, committed only
- * after every line was matched and staged, without telling the customer. Returns the order's new total in cents.
- */
-export const removeLinesFromOrder = async (store, orderGid, targets, staffNote) => {
-  const begun = await shopifyGraphql(store, EDIT_BEGIN, { id: orderGid });
-  userErrors(begun.orderEditBegin, 'Could not open the order for editing');
-  const calc = begun.orderEditBegin.calculatedOrder;
-  const ids = matchCalculatedLines(targets, calc.lineItems?.nodes || []);
-  for (const lineItemId of ids) {
-    const set = await shopifyGraphql(store, EDIT_SET_QTY, { id: calc.id, lineItemId });
-    userErrors(set.orderEditSetQuantity, 'Could not remove a line');
-  }
-  const done = await shopifyGraphql(store, EDIT_COMMIT, { id: calc.id, note: String(staffNote || '').slice(0, 250) });
-  userErrors(done.orderEditCommit, 'Could not save the order changes');
-  return { total_cents: centsOf(done.orderEditCommit.order?.currentTotalPriceSet) };
 };
 
 /** Tag an order and add a line to its note (the note is read first, so nothing written by someone else is lost). */
