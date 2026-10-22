@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
-import { buildInstallUrl, completeInstall, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
+import { buildInstallUrl, completeInstall, connectProductMetafield, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
 import { confirmAtelierAddress, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
 import { processWebhookEvent, recordWebhookEvent } from '../services/shopify-events.service.js';
 import { loadShipTo } from '../services/ship-to.service.js';
@@ -118,8 +118,8 @@ export const updateShopifyStore = catchAsync(async (req, res) => {
       ...(names ? { cod_gateway_names: names } : {}),
       ...(req.body.settings.brand_name ? { brand_name: String(req.body.settings.brand_name).slice(0, 80) } : {}),
       ...(typeof req.body.settings.sms_enabled === 'boolean' ? { sms_enabled: req.body.settings.sms_enabled } : {}),
-      // the clothing collection (handle, numeric id or gid): only products in it can be stitched; empty = no restriction
-      ...(typeof req.body.settings.clothing_collection === 'string' ? { clothing_collection: req.body.settings.clothing_collection.trim().slice(0, 120) } : {}),
+      // splitting mixed orders in Shopify itself (a new order, the lines taken off the original): off until an administrator turns it on for the store
+      ...(typeof req.body.settings.auto_split === 'boolean' ? { auto_split: req.body.settings.auto_split } : {}),
     };
   }
   const { data, error } = await supabaseAdmin.from('shopify_stores').update(patch).eq('id', req.params.id).select('*').maybeSingle();
@@ -135,6 +135,15 @@ export const reconnectShopifyWebhooks = catchAsync(async (req, res) => {
   if (store.status !== 'active' || !store.access_token_enc) throw new ConflictError('The store has not installed the app yet.');
   const status = await connectWebhooks(store);
   return ApiResponse.success(res, status, status.ok ? 'Webhooks connected.' : 'Some webhooks could not be connected.');
+});
+
+/** POST /api/admin/shopify/stores/:id/tick-box — create the "Stitch&Ship available" tick box on the store's products (again, after the brand approved the permission). */
+export const createShopifyTickBox = catchAsync(async (req, res) => {
+  const { data: store } = await supabaseAdmin.from('shopify_stores').select('*').eq('id', req.params.id).maybeSingle();
+  if (!store) throw new NotFoundError('Store not found');
+  if (store.status !== 'active' || !store.access_token_enc) throw new ConflictError('The store has not installed the app yet.');
+  const status = await connectProductMetafield(store);
+  return ApiResponse.success(res, status, status.ok ? 'The tick box is ready on the products of the store.' : status.error);
 });
 
 /** GET /api/admin/shopify/queue — failed orders, held addresses, customers who were not emailed. */

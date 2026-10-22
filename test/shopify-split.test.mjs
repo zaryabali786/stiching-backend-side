@@ -204,3 +204,52 @@ test('refunds in the webhook order (no transaction list) are read per line too',
   assert.equal(p.groups.normal.refunded, 33);
   assert.equal(p.groups.stitchship.refunded, 0);
 });
+
+// ───────────── splitting in Shopify: the shipping stays with the original, the new order's input ─────────────
+
+test('when the stitching lines move to their own order, all the shipping stays with the original order', () => {
+  const a = split.allocateOrder(order(), STITCH, { shipping: 'normal' });
+  assert.equal(a.groups.stitchship.shipping, 0);
+  assert.equal(a.groups.stitchship.shipping_tax, 0);
+  assert.equal(a.groups.normal.shipping, 15);
+  assert.equal(a.groups.stitchship.total, 209, '200 - 10 discount + 19 tax');
+  assert.equal(a.groups.normal.total, 102.3, '80 - 2 + 7.80 tax + 15 shipping + 1.50 shipping tax');
+  assert.equal(a.reconciled, true, 'the two orders still add up to the checkout');
+});
+
+const atelier = { shipToName: 'Stitch&Ship Atelier', shipToAddress: 'House 12 Street 4 Gulberg', shipToCity: 'Lahore', shipToPhone: '042 111 2222', countryCode: 'PK' };
+const child = (o = order(), fetched = verified(311.3)) => {
+  const a = split.allocateOrder(o, STITCH, { shipping: 'normal' });
+  const payload = { ...o, admin_graphql_api_id: 'gid://shopify/Order/5001', created_at: '2026-10-22T10:00:00Z', email: 'a@b.c', shipping_address: { first_name: 'Ali', last_name: 'Khan' } };
+  return split.buildChildOrder({ payload, alloc: a, pay: split.allocatePayment(a, split.readFinancials(o, fetched)), atelier, ref: 'SS-AB12CD', transactions: [{ id: '4001', kind: 'sale', gateway: 'shopify_payments', amount: 311.3 }] });
+};
+
+test('the new order carries the discount of the moved lines as one fixed discount, and the tax lines as they were', () => {
+  const c = child();
+  assert.equal(c.discountCode.itemFixedDiscountCode.amountSet.shopMoney.amount, '10.00');
+  assert.equal(c.discountCode.itemFixedDiscountCode.code, 'STITCHSHIP-SPLIT');
+  assert.equal(c.lineItems[1].quantity, 2);
+  assert.equal(c.lineItems[1].taxLines[0].priceSet.shopMoney.amount, '9.00');
+  assert.equal(c.lineItems.length, 2, 'only the stitching lines');
+  assert.equal(c.shippingLines, undefined);
+  assert.equal(c.financialStatus, 'PAID');
+  assert.equal(c.transactions[0].amountSet.shopMoney.amount, '209.00');
+});
+
+test('no discount on the moved lines: no discount code; prices that include tax are sent as such', () => {
+  const o = order({ taxes_included: true, line_items: order().line_items.map((l) => ({ ...l, discount_allocations: [] })) });
+  const c = child(o, verified(311.3));
+  assert.equal(c.discountCode, undefined);
+  assert.equal(c.taxesIncluded, true);
+});
+
+test('only verified money is ever recorded: no verification or an unpaid order gives Pending with no transaction', () => {
+  assert.equal(child(order(), null).financialStatus, 'PENDING');
+  assert.equal(child(order(), null).transactions, undefined);
+  const unpaid = child(order({ financial_status: 'pending' }), verified(0, 0, [], 'pending'));
+  assert.equal(unpaid.financialStatus, 'PENDING');
+  assert.equal(unpaid.transactions, undefined);
+  const partial = child(order({ financial_status: 'partially_paid' }), verified(100, 0, [], 'partially_paid'));
+  assert.equal(partial.financialStatus, 'PARTIALLY_PAID');
+  assert.equal(partial.transactions[0].amountSet.shopMoney.amount, (Math.round((10000 * 20900) / 31130) / 100).toFixed(2));
+});

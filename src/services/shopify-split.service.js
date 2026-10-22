@@ -44,7 +44,7 @@ export const shareOut = (total, weights, fallback = 0) => {
  * @param {object} payload the Shopify order
  * @param {Set<string>|string[]} stitchLineIds ids of the lines that are for stitching (already validated)
  */
-export const allocateOrder = (payload, stitchLineIds) => {
+export const allocateOrder = (payload, stitchLineIds, options = {}) => {
   const stitch = new Set([...stitchLineIds].map(String));
   const included = payload?.taxes_included === true;
   const lines = (payload?.line_items || []).map((l) => {
@@ -67,8 +67,10 @@ export const allocateOrder = (payload, stitchLineIds) => {
   }
   const weights = GROUPS.map((g) => groups[g].subtotal - groups[g].discounts);
   const only = GROUPS.findIndex((g) => groups[g].line_ids.length > 0);
-  const shippingParts = shareOut(shipping, weights, only < 0 ? 1 : only);
-  const shippingTaxParts = shareOut(shippingTax, weights, only < 0 ? 1 : only);
+  // 'normal': all the shipping stays with the normal group (the original order keeps its shipping line when the stitching lines are moved off it)
+  const toNormal = (v) => (groups.normal.line_ids.length || !groups.stitchship.line_ids.length ? [0, v] : [v, 0]);
+  const shippingParts = options.shipping === 'normal' ? toNormal(shipping) : shareOut(shipping, weights, only < 0 ? 1 : only);
+  const shippingTaxParts = options.shipping === 'normal' ? toNormal(shippingTax) : shareOut(shippingTax, weights, only < 0 ? 1 : only);
   GROUPS.forEach((name, i) => {
     const g = groups[name];
     g.shipping = shippingParts[i];
@@ -174,7 +176,7 @@ export const allocatePayment = (alloc, fin) => {
 const splitKey = (rowId, kind) => `${rowId}:${kind}`;
 
 /** Best effort and idempotent: one row per original Shopify order (our row id) and group. Never throws. Returns { saved, error }. */
-export const saveSplit = async ({ row, store, payload, alloc, pay, addresses = {}, tags = {}, orderId = null }) => {
+export const saveSplit = async ({ row, store, payload, alloc, pay, addresses = {}, tags = {}, orderId = null, extra = {} }) => {
   try {
     const now = new Date().toISOString();
     for (const kind of GROUPS) {
@@ -210,6 +212,7 @@ export const saveSplit = async ({ row, store, payload, alloc, pay, addresses = {
         taxes_included: alloc.taxes_included,
         address: addresses[kind] || null,
         tag: tags[kind] || null,
+        ...(extra[kind] || {}),
         updated_at: now,
       };
       const { error } = await supabaseAdmin.from('shopify_order_splits').upsert(record, { onConflict: 'split_key' });
@@ -249,4 +252,86 @@ export const markSplitCancelled = async (rowId) => {
   } catch {
     /* best effort */
   }
+};
+
+// ───────────── the new Shopify order for the stitching lines ─────────────
+
+const gid = (type, id) => `gid://shopify/${type}/${id}`;
+const bag = (amount, currency) => ({ shopMoney: { amount: (Math.round(Number(amount) * 100) / 100).toFixed(2), currencyCode: currency } });
+const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== ''));
+/** A Shopify (REST) address as the GraphQL MailingAddressInput. */
+const mailing = (a, over = {}) => (a ? clean({ firstName: a.first_name, lastName: a.last_name, company: a.company, address1: a.address1, address2: a.address2, city: a.city, zip: a.zip, phone: a.phone, countryCode: a.country_code, provinceCode: a.province_code, ...over }) : undefined);
+
+export const SPLIT_TAG = 'stitchship-split';
+export const splitSourceIdentifier = (payload) => `stitchship-split-${payload.id}`;
+
+/**
+ * The order input for the new Stitch&Ship order: only the stitching lines (variant, quantity, price, tax lines and properties as the customer
+ * bought them), the atelier as the shipping address, the customer's own billing address, and the payment ONLY as far as Shopify's own
+ * transactions prove it was paid on the original order:
+ *   verified paid        -> PAID, with one transaction whose gateway and receipt name the original order and its real transactions
+ *   verified part paid   -> PARTIALLY_PAID for that share
+ *   anything else        -> PENDING, no transaction (never "paid" on a guess)
+ * Discounts of the moved lines go on as one fixed discount (orderCreate takes only one). Shipping stays with the original order.
+ * @param {{ payload: object, alloc: object, pay: object, fin: object, atelier: object, ref: string, transactions?: object[] }} args
+ */
+export const buildChildOrder = ({ payload, alloc, pay, atelier, ref, transactions = [] }) => {
+  const cur = alloc.currency || String(payload.currency || '').toUpperCase();
+  const g = alloc.groups.stitchship;
+  const p = pay.groups.stitchship;
+  const ids = new Set(g.line_ids.map(String));
+  const lines = (payload.line_items || []).filter((l) => ids.has(String(l.id)));
+  const receipt = { split_from_order: payload.name, split_from_order_id: payload.admin_graphql_api_id || gid('Order', payload.id), original_transactions: transactions, note: 'Recorded by Stitch&Ship: this amount was paid on the original order. No new charge was made.' };
+  let financialStatus = 'PENDING';
+  let txs;
+  if (pay.payment_verified && p.payment_status === 'paid' && g.total > 0) {
+    financialStatus = 'PAID';
+    txs = [{ kind: 'SALE', status: 'SUCCESS', gateway: `Paid on order ${payload.name}`, amountSet: bag(g.total, cur), receiptJson: JSON.stringify(receipt), processedAt: payload.created_at, test: payload.test === true }];
+  } else if (pay.payment_verified && p.payment_status === 'partially_paid' && Number(p.amount_paid) > 0) {
+    financialStatus = 'PARTIALLY_PAID';
+    txs = [{ kind: 'SALE', status: 'SUCCESS', gateway: `Paid on order ${payload.name}`, amountSet: bag(p.amount_paid, cur), receiptJson: JSON.stringify(receipt), processedAt: payload.created_at, test: payload.test === true }];
+  }
+  const ship = payload.shipping_address || {};
+  const customerId = payload.customer?.id;
+  return clean({
+    currency: cur,
+    taxesIncluded: payload.taxes_included === true,
+    email: payload.email || payload.contact_email || payload.customer?.email,
+    customer: customerId ? { toAssociate: { id: gid('Customer', customerId) } } : undefined,
+    phone: payload.phone || undefined,
+    processedAt: payload.created_at,
+    test: payload.test === true ? true : undefined,
+    tags: ['stitchship'],
+    note: `Stitch&Ship lines of order ${payload.name}. ${financialStatus === 'PENDING' ? 'Payment is still pending (nothing was paid for these lines on the original order).' : 'Paid on the original order; no new charge.'}`,
+    customAttributes: [
+      { key: 'stitchship', value: 'yes' },
+      { key: 'stitchship_ref', value: ref },
+      { key: 'stitchship_split_from', value: String(payload.name) },
+      { key: 'stitchship_split_from_id', value: String(payload.id) },
+    ],
+    sourceName: 'Stitch&Ship',
+    sourceIdentifier: splitSourceIdentifier(payload),
+    billingAddress: mailing(payload.billing_address),
+    // the atelier's address (from the settings), addressed to the customer's name so the parcel can be matched; the reference code in line 2
+    shippingAddress: clean({ firstName: ship.first_name, lastName: ship.last_name, company: atelier.shipToName || 'Stitch&Ship Atelier', address1: atelier.shipToAddress, address2: ref, city: atelier.shipToCity, countryCode: atelier.countryCode || 'PK', phone: atelier.shipToPhone }),
+    lineItems: lines.map((l) =>
+      clean({
+        title: l.title,
+        variantTitle: l.variant_title && l.variant_title !== 'Default Title' ? l.variant_title : undefined,
+        sku: l.sku,
+        vendor: l.vendor,
+        quantity: Number(l.quantity),
+        variantId: l.variant_id ? gid('ProductVariant', l.variant_id) : undefined,
+        productId: l.product_id ? gid('Product', l.product_id) : undefined,
+        priceSet: bag(l.price, cur),
+        taxable: l.taxable !== false,
+        requiresShipping: l.requires_shipping !== false,
+        taxLines: (l.tax_lines || []).map((t) => ({ title: t.title || 'Tax', rate: Number(t.rate) || 0, priceSet: bag(t.price, cur) })),
+        properties: (l.properties || []).map((x) => ({ name: String(x.name), value: String(x.value ?? '') })),
+      })
+    ),
+    discountCode: g.discounts > 0 ? { itemFixedDiscountCode: { code: 'STITCHSHIP-SPLIT', amountSet: bag(g.discounts, cur) } } : undefined,
+    financialStatus,
+    transactions: txs,
+  });
 };
