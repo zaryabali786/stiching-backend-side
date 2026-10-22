@@ -556,6 +556,20 @@ export const processOrderCreate = async (store, payload) => {
 
   // things that went wrong but must not stop the order from being recognised as Stitch&Ship: they are kept, shown to an administrator, and can be retried
   let addressWarning = null;
+  // The tag comes FIRST, before the slower steps (address, hold, internal order, email, which together took about half a minute): the order shows
+  // its Stitch&Ship tag in the Shopify admin within a second or two of being placed. An order that is split in Shopify is tagged by its own steps.
+  const splitsInShopify = !isSplitChild(payload) && autoSplitOn(store) && lines.length < (payload.line_items || []).length;
+  const tagName = lines.length < (payload.line_items || []).length ? STITCH_MIXED_TAG : STITCH_TAG;
+  let tagWarning = null;
+  if (!splitsInShopify) {
+    try {
+      await addOrderTag(store, payload.admin_graphql_api_id, tagName);
+      console.info(`[Shopify] ${store.shop_domain} order ${payload.name}: tagged "${tagName}"`);
+    } catch (err) {
+      tagWarning = `Could not tag the order: ${err.message}`.slice(0, 300);
+      console.warn(`[Shopify] ${store.shop_domain} order ${payload.name}: ${tagWarning}`);
+    }
+  }
   // Splitting in Shopify (only for stores that switched it on, and never for an order this app made itself)
   if (!isSplitChild(payload) && autoSplitOn(store)) {
     // a marked product that is not enabled counts as a normal line
@@ -624,11 +638,15 @@ export const processOrderCreate = async (store, payload) => {
     const order = row.__order || (await supabaseAdmin.from('orders').select('*').eq('id', row.order_id).maybeSingle()).data;
 
     // 5. tag in Shopify (for the brand's own view), then email the customer
-    const tag = alloc.mixed ? STITCH_MIXED_TAG : STITCH_TAG;
-    let tagWarning = null;
-    await addOrderTag(store, payload.admin_graphql_api_id, tag).catch((err) => {
-      tagWarning = `Could not tag the order: ${err.message}`.slice(0, 300);
-    });
+    // the tag was set at the start; only when that failed is it tried once more here (a tag already there is fine)
+    if (tagWarning) {
+      try {
+        await addOrderTag(store, payload.admin_graphql_api_id, tagName);
+        tagWarning = null;
+      } catch (err) {
+        tagWarning = `Could not tag the order: ${err.message}`.slice(0, 300);
+      }
+    }
     const warnings = [addressWarning, tagWarning].filter(Boolean);
     // the price split of this order (idempotent: one row per original order and group), with the address each group uses
     const saved = await saveSplit({ row, store, payload, alloc, pay, orderId: row.order_id, addresses: groupAddresses(payload, alloc, ok), tags: { stitchship: STITCH_TAG, normal: null }, extra: warnings.length ? { stitchship: { split_error: warnings.join(' | ').slice(0, 500) } } : {} });

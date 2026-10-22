@@ -48,6 +48,7 @@ before(async () => {
       normaliseShop: (v) => v,
       holdFulfillment: async (store, gid) => {
         if (behave.holdFails) throw new Error('Shopify refused the hold');
+        calls.seq.push('hold');
         calls.holds.push(gid);
         return [{ fo: 'gid://shopify/FulfillmentOrder/1', hold: 'gid://shopify/FulfillmentHold/1' }];
       },
@@ -57,11 +58,17 @@ before(async () => {
       },
       addOrderTag: async (store, gid, tag) => {
         if (behave.tagFails) throw new Error('no write access');
+        if (behave.tagFailCount > 0) {
+          behave.tagFailCount -= 1;
+          throw new Error('Shopify is busy');
+        }
+        calls.seq.push('tag');
         calls.tags.push({ gid, tag });
       },
       updateShippingAddress: async (store, gid, address) => {
         if (behave.addressRefused) throw Object.assign(new Error(behave.addressRefused), { status: 422 });
         if (behave.addressDown) throw new Error('Shopify is down');
+        calls.seq.push('address');
         calls.addressUpdates.push({ gid, address });
       },
       fetchLineItemDetails: async () => new Map([['111', { image_url: 'https://cdn.example/a.png', url: 'https://brand.example/products/suit' }]]),
@@ -134,7 +141,7 @@ before(async () => {
 });
 
 const beforeEachReset = () => {
-  calls = { holds: [], releases: [], tags: [], addressUpdates: [], emails: [], admins: [], users: [], sms: [], financialReads: [], enabledChecks: [], createdOrders: [], madeOrders: [], sourceLookups: [], edits: [], tagNotes: [] };
+  calls = { holds: [], releases: [], tags: [], addressUpdates: [], emails: [], admins: [], users: [], sms: [], financialReads: [], enabledChecks: [], createdOrders: [], madeOrders: [], sourceLookups: [], edits: [], tagNotes: [], seq: [] };
   behave = {};
   STORE.settings = { stitch_mode: 'customer' }; // these tests are about the customer's tick; the product-box mode has its own tests below
   db = createFakeDb(
@@ -1457,4 +1464,60 @@ test('a Shopify outage while setting the atelier address is retried, not turned 
   behave.addressDown = false;
   const again = await orders.processOrderCreate(STORE, noTick(10));
   assert.equal(again.status, 'processed');
+});
+
+test('the tag is the FIRST thing done to a Stitch&Ship order, before the address, the hold, the internal order and the email (so it shows in Shopify at once)', async () => {
+  enabledMode(0);
+  enable(1);
+  behave.financials = () => ({ financial_status: 'pending', total_received: 0, total_refunded: 0, outstanding: 749.95, transactions_ok: true, refunds: [], transactions: [] });
+  await orders.processOrderCreate(STORE, oneProduct({ financial_status: 'pending' }));
+  assert.equal(calls.seq[0], 'tag', JSON.stringify(calls.seq));
+  assert.ok(calls.seq.indexOf('tag') < calls.seq.indexOf('address'));
+  assert.ok(calls.seq.indexOf('tag') < calls.seq.indexOf('hold'));
+  assert.equal(calls.tags.length, 1, 'set once, not again at the end');
+});
+
+test('the same holds for a Cash on Delivery order with splitting off, and for a mixed order handled as linked records (the mixed tag)', async () => {
+  STORE.settings = {};
+  behave.financials = () => ({ financial_status: 'pending', total_received: 0, total_refunded: 0, outstanding: 130, transactions_ok: true, refunds: [], transactions: [] });
+  enable(1);
+  await orders.processOrderCreate(STORE, tenProducts(0, { financial_status: 'pending' }));
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship-mixed']);
+  assert.equal(calls.seq[0], 'tag');
+});
+
+test('an order split in Shopify is not tagged early: the original gets its split tag only after its lines were moved', async () => {
+  enabledMode(1);
+  enable(1);
+  behave.originalAfter = normalCents(1);
+  await orders.processOrderCreate(STORE, tenProducts(0));
+  assert.equal(calls.tags.length, 0, 'the plain tag is on the new order only');
+  assert.deepEqual(calls.tagNotes.map((t) => t.tag), ['stitchship-split']);
+});
+
+test('a temporary tag failure at the start is tried once more at the end of the same run, and recorded only if it still fails', async () => {
+  enabledMode(0);
+  enable(1);
+  behave.tagFailCount = 1; // the first attempt fails, the second works
+  const result = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(result.status, 'processed');
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship'], 'tagged exactly once in the end');
+  assert.equal(row().last_error, null);
+  assert.ok(!splitOf('stitchship').split_error, 'no warning is recorded');
+  assert.equal(db.table('orders').length, 1);
+});
+
+test('when both attempts fail the order is still processed and the failure is shown and retryable', async () => {
+  enabledMode(0);
+  enable(1);
+  behave.tagFailCount = 2;
+  const result = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(result.status, 'processed');
+  assert.equal(result.warnings.length, 1);
+  assert.match(row().last_error, /Could not tag the order/);
+  assert.equal(calls.tags.length, 0);
+  const retry = await orders.retryShopifyOrder(row().id);
+  assert.equal(retry.status, 'repaired');
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship']);
 });
