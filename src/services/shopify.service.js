@@ -284,10 +284,27 @@ export const holdFulfillment = async (store, orderGid, reasonNotes) => {
   return holds;
 };
 
+const HOLDS_OF = `query($id: ID!) { fulfillmentOrder(id: $id) { id status fulfillmentHolds { id } } }`;
+const RELEASE_ALL = `mutation($id: ID!) { fulfillmentOrderReleaseHold(id: $id) { userErrors { field message } } }`;
+
+/**
+ * Let go of the holds we placed. Shopify answered "internal error" once when the hold was named after the order had been edited, so a failed
+ * release is tried once more, and then, only if our hold is the ONLY hold on that shipment, released without naming it (nobody else's hold
+ * is ever released).
+ */
 export const releaseFulfillment = async (store, holds) => {
   for (const h of holds || []) {
-    const res = await shopifyGraphql(store, RELEASE, { id: h.fo, holdIds: h.hold ? [h.hold] : null });
-    userErrors(res.fulfillmentOrderReleaseHold, 'Could not release the shipment');
+    try {
+      const res = await shopifyGraphql(store, RELEASE, { id: h.fo, holdIds: h.hold ? [h.hold] : null });
+      userErrors(res.fulfillmentOrderReleaseHold, 'Could not release the shipment');
+    } catch (first) {
+      const current = await shopifyGraphql(store, HOLDS_OF, { id: h.fo }).catch(() => null);
+      const open = current?.fulfillmentOrder?.fulfillmentHolds || [];
+      if (current?.fulfillmentOrder && open.length === 0) continue; // already released
+      if (open.length !== 1) throw first;
+      const res = await shopifyGraphql(store, RELEASE_ALL, { id: h.fo });
+      userErrors(res.fulfillmentOrderReleaseHold, 'Could not release the shipment');
+    }
   }
 };
 
@@ -372,8 +389,13 @@ export const productsStitchEnabled = async (store, productIds) => {
   const enabled = new Set();
   if (!ids.length) return enabled;
   const data = await shopifyGraphql(store, PRODUCTS_ENABLED, { ids: ids.map((id) => `gid://shopify/Product/${id}`) });
+  // what Shopify answered for each product (the value, or null when the box was never touched / the product is gone), for the log
+  enabled.metafieldValues = new Map(ids.map((id) => [id, null]));
   for (const node of data?.nodes || []) {
-    if (node?.id && node.metafield?.value === 'true') enabled.add(String(node.id).split('/').pop());
+    if (!node?.id) continue;
+    const id = String(node.id).split('/').pop();
+    enabled.metafieldValues.set(id, node.metafield?.value ?? null);
+    if (node.metafield?.value === 'true') enabled.add(id);
   }
   return enabled;
 };

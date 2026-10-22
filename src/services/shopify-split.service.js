@@ -286,10 +286,10 @@ export const buildChildOrder = ({ payload, alloc, pay, atelier, ref, transaction
   let txs;
   if (pay.payment_verified && p.payment_status === 'paid' && g.total > 0) {
     financialStatus = 'PAID';
-    txs = [{ kind: 'SALE', status: 'SUCCESS', gateway: `Paid on order ${payload.name}`, amountSet: bag(g.total, cur), receiptJson: JSON.stringify(receipt), processedAt: payload.created_at, test: payload.test === true }];
+    txs = [{ kind: 'SALE', status: 'SUCCESS', gateway: `Paid on order ${payload.name}`, amountSet: bag(g.total, cur), receiptJson: receipt, processedAt: payload.created_at, test: payload.test === true }];
   } else if (pay.payment_verified && p.payment_status === 'partially_paid' && Number(p.amount_paid) > 0) {
     financialStatus = 'PARTIALLY_PAID';
-    txs = [{ kind: 'SALE', status: 'SUCCESS', gateway: `Paid on order ${payload.name}`, amountSet: bag(p.amount_paid, cur), receiptJson: JSON.stringify(receipt), processedAt: payload.created_at, test: payload.test === true }];
+    txs = [{ kind: 'SALE', status: 'SUCCESS', gateway: `Paid on order ${payload.name}`, amountSet: bag(p.amount_paid, cur), receiptJson: receipt, processedAt: payload.created_at, test: payload.test === true }];
   }
   const ship = payload.shipping_address || {};
   const customerId = payload.customer?.id;

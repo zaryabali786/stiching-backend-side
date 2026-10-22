@@ -59,7 +59,11 @@ before(async () => {
         if (behave.tagFails) throw new Error('no write access');
         calls.tags.push({ gid, tag });
       },
-      updateShippingAddress: async (store, gid, address) => calls.addressUpdates.push({ gid, address }),
+      updateShippingAddress: async (store, gid, address) => {
+        if (behave.addressRefused) throw Object.assign(new Error(behave.addressRefused), { status: 422 });
+        if (behave.addressDown) throw new Error('Shopify is down');
+        calls.addressUpdates.push({ gid, address });
+      },
       fetchLineItemDetails: async () => new Map([['111', { image_url: 'https://cdn.example/a.png', url: 'https://brand.example/products/suit' }]]),
       // Shopify's own payment record of the order (the transactions), the collection of the clothing products, and who belongs to it
       fetchOrderFinancials: async (store, gid) => {
@@ -92,7 +96,9 @@ before(async () => {
       productsStitchEnabled: async (store, ids) => {
         calls.enabledChecks.push(ids.map(String));
         if (behave.enabledFails) throw new Error('Shopify is down');
-        return new Set(ids.filter(Boolean).map(String).filter((id) => !behave.enabled || behave.enabled.includes(id)));
+        const set = new Set(ids.filter(Boolean).map(String).filter((id) => !behave.enabled || behave.enabled.includes(id)));
+        set.metafieldValues = new Map(ids.filter(Boolean).map((id) => [String(id), set.has(String(id)) ? 'true' : null]));
+        return set;
       },
     },
   });
@@ -130,7 +136,7 @@ before(async () => {
 const beforeEachReset = () => {
   calls = { holds: [], releases: [], tags: [], addressUpdates: [], emails: [], admins: [], users: [], sms: [], financialReads: [], enabledChecks: [], createdOrders: [], madeOrders: [], sourceLookups: [], edits: [], tagNotes: [] };
   behave = {};
-  STORE.settings = {};
+  STORE.settings = { stitch_mode: 'customer' }; // these tests are about the customer's tick; the product-box mode has its own tests below
   db = createFakeDb(
     {
       shopify_stores: [{ ...STORE }],
@@ -850,7 +856,7 @@ const tenProducts = (ticked, extra = {}) =>
 /** What the original order should total once k lines are off it: the other lines with their tax, and all the shipping. */
 const normalCents = (k) => (10 - k) * 1100 + 2000;
 const splitStore = () => {
-  STORE.settings = { auto_split: true };
+  STORE.settings = { auto_split: true, stitch_mode: 'customer' };
   db.table('shopify_stores')[0].settings = STORE.settings; // "Try again" reads the store from the database
   behave.originalAfter = undefined;
 };
@@ -918,7 +924,7 @@ test('10 products, none Stitch&Ship: nothing is split, nothing is stored', async
 });
 
 test('a store that has not switched splitting on keeps the old behaviour: no new order, no edit', async () => {
-  STORE.settings = {};
+  STORE.settings = { stitch_mode: 'customer' }; // these tests are about the customer's tick; the product-box mode has its own tests below
   behave.financials = paidFinancials(130);
   const result = await orders.processOrderCreate(STORE, tenProducts(4));
   assert.equal(result.status, 'processed');
@@ -937,7 +943,8 @@ test('prepaid: the new order records the payment as "paid on the original order"
   assert.equal(child.transactions[0].kind, 'SALE');
   assert.equal(child.transactions[0].status, 'SUCCESS');
   assert.match(child.transactions[0].gateway, /Paid on order #1001/);
-  const receipt = JSON.parse(child.transactions[0].receiptJson);
+  const receipt = child.transactions[0].receiptJson;
+  assert.equal(typeof receipt, 'object', 'Shopify wants the receipt as an object, not as text');
   assert.equal(receipt.split_from_order, '#1001');
   assert.equal(receipt.original_transactions[0].id, '4001', 'the original payment stays traceable');
   assert.match(receipt.note, /No new charge/);
@@ -1190,4 +1197,165 @@ test('a COD split: the customer is asked for the Stitch&Ship total only, when th
   assert.equal(order().payment_type, 'COD');
   assert.equal(order().cod_amount, 44);
   assert.equal(order().cod_payment_status, 'UNPAID');
+});
+
+// ───────────── the product's own box decides (default): the reported test, two products, one enabled ─────────────
+
+/** The store in its default mode: splitting on, and a product with "Stitch&Ship available" ticked is Stitch&Ship whatever the page showed. */
+const enabledMode = (k) => {
+  STORE.settings = { auto_split: true };
+  db.table('shopify_stores')[0].settings = STORE.settings;
+  behave.originalAfter = normalCents(k);
+  behave.financials = paidFinancials(130);
+};
+const noTick = (n, extra = {}) => tenProducts(0, extra);
+const enable = (...numbers) => {
+  behave.enabled = numbers.map((n) => String(900 + n));
+};
+const logged = async (fn) => {
+  const real = console.info;
+  const lines = [];
+  console.info = (...a) => lines.push(a.join(' '));
+  try {
+    return { result: await fn(), lines };
+  } finally {
+    console.info = real;
+  }
+};
+
+test('two products, the first enabled in Shopify and nothing ticked by the customer: the order is split (the reported case)', async () => {
+  enabledMode(1);
+  enable(1);
+  const o = shopifyOrder({ note_attributes: [], taxes_included: false, financial_status: 'paid', total_price: '130.00', shipping_address: HOME, line_items: [mkLine(1, '100.00', 1, { tax_lines: [{ title: 'GST', rate: 0.1, price: '10.00' }] }), mkLine(2, '10.00', 1, { tax_lines: [{ title: 'GST', rate: 0.1, price: '1.00' }] })], shipping_lines: [{ title: 'Standard', price: '9.00', discounted_price: '9.00', tax_lines: [] }] });
+  behave.originalAfter = 1100 + 900;
+  const result = await orders.processOrderCreate(STORE, o);
+  assert.equal(result.status, 'split');
+  assert.equal(calls.createdOrders.length, 1);
+  assert.deepEqual(calls.createdOrders[0].lineItems.map((l) => l.title), ['Product 1'], 'only the enabled product');
+  assert.equal(calls.createdOrders[0].shippingAddress.address1, 'House 12 Street 4 Gulberg', 'the Stitch&Ship address');
+  assert.equal(calls.edits[0].targets.length, 1);
+  assert.equal(splitOf('normal').line_ids.length, 1);
+  assert.equal(splitOf('normal').ship_to.address1, '5 Canal Road', 'the customer\'s own address stays with the normal order');
+  assert.equal(calls.addressUpdates.length, 0);
+  assert.equal(row().state, 'split');
+});
+
+test('several enabled products and several normal ones: ONE new order with all the enabled products', async () => {
+  enabledMode(4);
+  enable(2, 4, 6, 8);
+  behave.originalAfter = normalCents(4);
+  const result = await orders.processOrderCreate(STORE, noTick(10));
+  assert.equal(result.status, 'split');
+  assert.equal(calls.createdOrders.length, 1);
+  assert.deepEqual(calls.createdOrders[0].lineItems.map((l) => l.title), ['Product 2', 'Product 4', 'Product 6', 'Product 8']);
+  assert.deepEqual(splitOf('normal').line_ids, ['1', '3', '5', '7', '9', '10']);
+});
+
+test('every product enabled: only the Stitch&Ship order, the order itself goes to the Stitch&Ship address', async () => {
+  enabledMode(10);
+  enable(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+  const result = await orders.processOrderCreate(STORE, noTick(10));
+  assert.equal(result.status, 'processed');
+  assert.equal(calls.createdOrders.length, 0);
+  assert.equal(calls.addressUpdates.length, 1);
+  assert.equal(calls.addressUpdates[0].address.address1, 'House 12 Street 4 Gulberg');
+  assert.equal(splits().filter((r) => r.kind === 'normal').length, 0);
+});
+
+test('no product enabled: not split, not stored, a normal order', async () => {
+  enabledMode(0);
+  enable();
+  behave.enabled = [];
+  const { result, lines } = await logged(() => orders.processOrderCreate(STORE, noTick(10)));
+  assert.equal(result.status, 'ignored');
+  assert.equal(db.table('shopify_orders').length, 0);
+  assert.equal(calls.createdOrders.length, 0);
+  assert.ok(lines.some((l) => /ignored, none of its 10 line\(s\) is on a product with "Stitch&Ship available" ticked/.test(l)), 'the reason is logged, not silent');
+});
+
+test('the log says, per line, the product, the metafield value Shopify gave and the decision', async () => {
+  enabledMode(1);
+  enable(1);
+  behave.originalAfter = normalCents(1);
+  const { lines } = await logged(() => orders.processOrderCreate(STORE, noTick(10)));
+  assert.ok(lines.some((l) => /line 1 "Product 1" product 901 metafield \$app:stitchship\.enabled=true -> Stitch&Ship/.test(l)));
+  assert.ok(lines.some((l) => /line 2 "Product 2" product 902 metafield \$app:stitchship\.enabled=not set -> normal/.test(l)));
+  assert.ok(lines.some((l) => /1 of 10 line\(s\) are Stitch&Ship \(splitting is on\)/.test(l)));
+});
+
+test('with splitting off an enabled product is still Stitch&Ship: the customer\'s order in the app has only that product', async () => {
+  STORE.settings = {};
+  behave.financials = paidFinancials(130);
+  enable(3);
+  const result = await orders.processOrderCreate(STORE, noTick(10));
+  assert.equal(result.status, 'processed');
+  assert.equal(calls.createdOrders.length, 0, 'no Shopify order is made while splitting is off');
+  assert.deepEqual(unitsOf(), ['Product 3 · M']);
+});
+
+test('a Shopify failure while asking which products are enabled is not silently treated as "all normal"', async () => {
+  enabledMode(1);
+  behave.enabledFails = true;
+  await assert.rejects(() => orders.processOrderCreate(STORE, noTick(10)), /Shopify is down/);
+  assert.equal(db.table('shopify_orders').length, 0);
+  assert.equal(calls.createdOrders.length, 0);
+});
+
+test('without the Stitch&Ship address in the settings nothing is touched: a clear error, and Try again works once it is set', async () => {
+  enabledMode(1);
+  enable(1);
+  behave.originalAfter = normalCents(1);
+  const saved = db.table('platform_settings').splice(0);
+  const result = await orders.processOrderCreate(STORE, noTick(10));
+  assert.equal(result.status, 'failed');
+  assert.equal(calls.createdOrders.length, 0);
+  assert.equal(calls.holds.length, 0, 'not even held');
+  assert.equal(row().state, 'split_failed');
+  assert.match(row().last_error, /Stitch&Ship shipping address is not set/);
+  assert.ok(calls.admins.some((a) => /could not be split/.test(a.title)));
+  db.table('platform_settings').push(...saved);
+  const retry = await orders.retryShopifyOrder(row().id);
+  assert.equal(retry.status, 'split');
+  assert.equal(calls.createdOrders.length, 1);
+});
+
+test('the same enabled-product order delivered twice (a webhook retry) makes one new order', async () => {
+  enabledMode(2);
+  enable(1, 2);
+  behave.originalAfter = normalCents(2);
+  await orders.processOrderCreate(STORE, noTick(10));
+  const again = await orders.processOrderCreate(STORE, noTick(10));
+  assert.equal(again.status, 'duplicate');
+  assert.equal(calls.createdOrders.length, 1);
+  assert.equal(calls.edits.length, 1);
+});
+
+test('when Shopify refuses the atelier address (the store does not ship to that country) the order is marked failed with the reason, and Try again works once it is fixed', async () => {
+  enabledMode(10);
+  enable(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+  behave.addressRefused = 'Could not change the shipping address: Country/region not supported';
+  const result = await orders.processOrderCreate(STORE, noTick(10));
+  assert.equal(result.status, 'failed');
+  assert.equal(row().state, 'failed');
+  assert.match(row().last_error, /Country\/region not supported/);
+  assert.match(row().last_error, /shipping zones/, 'the way to fix it is said');
+  assert.equal(calls.holds.length, 0, 'nothing was held or changed');
+  assert.equal(db.table('orders').length, 0);
+  assert.ok(calls.admins.some((a) => /could not go to the Stitch&Ship address/.test(a.title)));
+  behave.addressRefused = null;
+  const retry = await orders.retryShopifyOrder(row().id);
+  assert.equal(retry.status, 'processed');
+  assert.equal(calls.addressUpdates.length, 1);
+  assert.equal(db.table('orders').length, 1);
+});
+
+test('a Shopify outage while setting the atelier address is retried, not turned into a failure', async () => {
+  enabledMode(10);
+  enable(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+  behave.addressDown = true;
+  await assert.rejects(() => orders.processOrderCreate(STORE, noTick(10)), /Shopify is down/);
+  assert.notEqual(row().state, 'failed');
+  behave.addressDown = false;
+  const again = await orders.processOrderCreate(STORE, noTick(10));
+  assert.equal(again.status, 'processed');
 });

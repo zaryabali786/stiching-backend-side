@@ -82,7 +82,14 @@ export const pickCustomerPhone = (payload, atelier) => {
 };
 
 /**
- * The marked lines whose product has "Stitch&Ship available" ticked in the Shopify admin (Shopify answers, never the page). A marked line
+ * The lines that could be Stitch&Ship. By default (stitch_mode "enabled") every line is a candidate and the product's own "Stitch&Ship
+ * available" box decides: a product the brand enabled is stitched, any other is a normal product, whatever the customer saw on the page.
+ * With stitch_mode "customer" only the lines the customer ticked on the product page (the marker) are candidates.
+ */
+export const candidateLines = (store, payload) => (store.settings?.stitch_mode === 'customer' ? stitchingLines(payload) : payload?.line_items || []);
+
+/**
+ * The candidate lines whose product has "Stitch&Ship available" ticked in the Shopify admin (Shopify answers, never the page). A marked line
  * on a product that is not ticked follows the normal flow and an administrator is told. Throws when Shopify cannot be reached, so the
  * order is retried and nothing is half done.
  */
@@ -90,7 +97,12 @@ export const eligibleLines = async (store, candidates) => {
   if (!candidates.length) return candidates;
   const enabled = await productsStitchEnabled(store, candidates.map((l) => l.product_id));
   const kept = candidates.filter((l) => l.product_id && enabled.has(String(l.product_id)));
-  if (kept.length < candidates.length) {
+  // one line per product line: what Shopify said and what was decided (never silent)
+  for (const l of candidates) {
+    const value = l.product_id ? enabled.metafieldValues?.get(String(l.product_id)) : undefined;
+    console.info(`[Shopify] ${store.shop_domain} line ${l.id} "${l.title}" product ${l.product_id ?? 'none'} metafield $app:stitchship.enabled=${value === undefined ? 'no product (custom item)' : value === null ? 'not set' : value} -> ${kept.includes(l) ? 'Stitch&Ship' : 'normal'}`);
+  }
+  if (kept.length < candidates.length && store.settings?.stitch_mode === 'customer') {
     await alert(`Shopify: ${candidates.length - kept.length} marked item(s) are not enabled for Stitch&Ship`, `${store.shop_domain}: ${candidates.filter((l) => !kept.includes(l)).map((l) => l.title).join(', ')} carried the Stitch&Ship marker but "Stitch&Ship available" is not ticked on the product, so it follows the normal flow.`);
   }
   return kept;
@@ -358,6 +370,11 @@ export const autoSplitOn = (store) => store.settings?.auto_split === true;
 /** An order this app made when it split another one: it is a plain Stitch&Ship order, never split again. */
 export const isSplitChild = (payload) => !!attr(payload, 'stitchship_split_from');
 
+/** The Stitch&Ship address from the settings must be there before anything is split or moved: a clear error, never a silent skip. */
+const assertAtelierAddress = (atelier) => {
+  if (!atelier?.shipToAddress || !atelier?.shipToCity) throw new ConflictError('The Stitch&Ship shipping address is not set (Admin > Settings > Stitch&Ship address: street and city), so the order was not split.');
+};
+
 const shipSummary = (a) => (a ? { name: [a.first_name, a.last_name].filter(Boolean).join(' ') || a.name || null, company: a.company || null, address1: a.address1 || null, address2: a.address2 || null, city: a.city || null, province: a.province || null, zip: a.zip || null, country: a.country || null, phone: a.phone || null } : null);
 
 /**
@@ -367,7 +384,8 @@ const shipSummary = (a) => (a ? { name: [a.first_name, a.last_name].filter(Boole
 const moveWholeOrderToAtelier = async (store, payload, ref) => {
   const atelier = await loadShipTo().catch(() => ({}));
   const ship = payload.shipping_address;
-  if (!atelier?.shipToAddress || addressMatchesAtelier({ shipping: ship, atelier, ref })) return { payload, ref };
+  assertAtelierAddress(atelier);
+  if (addressMatchesAtelier({ shipping: ship, atelier, ref })) return { payload, ref };
   const useRef = ref || makeRef();
   const countryCode = store.settings?.atelier_country_code || 'PK';
   await updateShippingAddress(store, payload.admin_graphql_api_id, { firstName: ship?.first_name || undefined, lastName: ship?.last_name || undefined, company: atelier.shipToName || 'Stitch&Ship Atelier', address1: atelier.shipToAddress, address2: useRef, city: atelier.shipToCity, countryCode, phone: atelier.shipToPhone || undefined });
@@ -398,6 +416,14 @@ export const splitOriginalOrder = async ({ store, row, payload, lines }) => {
   const prior = (await loadSplit(row.id)).find((r) => r.kind === 'stitchship');
   const atelier = { ...(await loadShipTo().catch(() => ({}))), countryCode: store.settings?.atelier_country_code || 'PK' };
   const ref = stitchingRef(payload) || makeRef();
+  try {
+    assertAtelierAddress(atelier);
+  } catch (err) {
+    // before anything is held, made or changed: say so loudly (the order stays as it is) and let "Try again" run once the address is set
+    await patchRow(row, { state: 'split_failed', last_error: err.message });
+    if (!locked.last_error) await alert(`Shopify: ${payload.name} could not be split`, `${store.shop_domain}: ${err.message}`);
+    return { status: 'failed' };
+  }
   const fetched = await fetchOrderFinancials(store, orderGid).catch((err) => {
     console.warn('[Shopify] could not read the payment of', payload.name, err.message);
     return null;
@@ -484,8 +510,11 @@ const linkChildToSplit = async (store, payload, order) => {
 
 /** A new Shopify order. Returns what happened; throws only for problems worth retrying. */
 export const processOrderCreate = async (store, payload) => {
-  const marked = stitchingLines(payload);
-  if (!marked.length) return { status: 'ignored' };
+  const marked = candidateLines(store, payload);
+  if (!marked.length) {
+    console.info(`[Shopify] ${store.shop_domain} order ${payload?.name}: ignored, ${store.settings?.stitch_mode === 'customer' ? 'no line carries the Stitch&Ship marker' : 'the order has no lines'}`);
+    return { status: 'ignored' };
+  }
   const shopifyId = String(payload.id);
   const email = normaliseEmail(payload.email || payload.contact_email || payload.customer?.email);
   let ref = stitchingRef(payload);
@@ -495,7 +524,11 @@ export const processOrderCreate = async (store, payload) => {
   if (row && ((row.state === 'draft_created' && row.notified_at) || row.state === 'split')) return { status: 'duplicate' };
   // only products with "Stitch&Ship available" ticked are stitched; asked of Shopify before anything is stored (a failure retries cleanly)
   const lines = await eligibleLines(store, marked);
-  if (!lines.length) return { status: 'ignored' };
+  if (!lines.length) {
+    console.info(`[Shopify] ${store.shop_domain} order ${payload.name}: ignored, none of its ${marked.length} line(s) is on a product with "Stitch&Ship available" ticked (a normal order)`);
+    return { status: 'ignored' };
+  }
+  console.info(`[Shopify] ${store.shop_domain} order ${payload.name}: ${lines.length} of ${(payload.line_items || []).length} line(s) are Stitch&Ship${autoSplitOn(store) ? ' (splitting is on)' : ' (splitting is off for this store)'}`);
   if (!row) {
     const ins = await supabaseAdmin
       .from('shopify_orders')
@@ -526,7 +559,15 @@ export const processOrderCreate = async (store, payload) => {
       payload = moved.payload;
       ref = moved.ref;
     } catch (err) {
-      await patchRow(row, { last_error: `Could not set the atelier address: ${err.message}`.slice(0, 500) });
+      const hint = /country|region/i.test(err.message || '') ? ' Shopify only accepts an address in a country the store ships to: add the country of the Stitch&Ship address to the shipping zones (Shopify admin > Settings > Shipping and delivery).' : '';
+      const message = `Could not set the atelier address: ${err.message}.${hint}`.slice(0, 500);
+      // a refusal by Shopify (or a missing address in our settings) will not change by itself: say so, stop, and let "Try again" run once it is fixed
+      if (err instanceof ConflictError || err.status === 422) {
+        await patchRow(row, { state: 'failed', last_error: message });
+        await alert(`Shopify: ${payload.name} could not go to the Stitch&Ship address`, `${store.shop_domain}: ${message}`);
+        return { status: 'failed' };
+      }
+      await patchRow(row, { last_error: message });
       throw err;
     }
   }

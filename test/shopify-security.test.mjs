@@ -342,3 +342,55 @@ test('an earlier new order is found by its source identifier', async () => {
     assert.equal(await sh.findOrderBySourceIdentifier(aStore(), 'stitchship-split-1'), null);
   });
 });
+
+// ───────────── letting go of our hold ─────────────
+
+const hold = [{ fo: 'gid://shopify/FulfillmentOrder/1', hold: 'gid://shopify/FulfillmentHold/9' }];
+
+test('a hold is released by its own id', async () => {
+  await withShopify(() => ({ data: { fulfillmentOrderReleaseHold: { userErrors: [] } } }), async (asked) => {
+    await sh.releaseFulfillment(aStore(), hold);
+    assert.equal(asked.length, 1);
+    assert.deepEqual(asked[0].body.variables.holdIds, ['gid://shopify/FulfillmentHold/9']);
+  });
+});
+
+test('when Shopify fails on the named hold, our only hold on the shipment is released without naming it', async () => {
+  let n = 0;
+  const answer = (body) => {
+    n += 1;
+    if (n === 1) return { errors: [{ message: 'Internal error. Looks like something went wrong on our end.' }] };
+    if (/fulfillmentHolds/.test(body.query)) return { data: { fulfillmentOrder: { id: 'x', status: 'ON_HOLD', fulfillmentHolds: [{ id: 'gid://shopify/FulfillmentHold/9' }] } } };
+    return { data: { fulfillmentOrderReleaseHold: { userErrors: [] } } };
+  };
+  await withShopify(answer, async (asked) => {
+    await sh.releaseFulfillment(aStore(), hold);
+    assert.equal(asked.length, 3, 'the failed call, a look at the holds, the release');
+    assert.equal(asked[2].body.variables.holdIds, undefined);
+  });
+});
+
+test('if the shipment carries another hold too, nothing is released blindly and the failure is reported', async () => {
+  let n = 0;
+  const answer = () => {
+    n += 1;
+    if (n === 1) return { errors: [{ message: 'Internal error.' }] };
+    return { data: { fulfillmentOrder: { id: 'x', status: 'ON_HOLD', fulfillmentHolds: [{ id: 'a' }, { id: 'b' }] } } };
+  };
+  await withShopify(answer, async (asked) => {
+    await assert.rejects(() => sh.releaseFulfillment(aStore(), hold), /Internal error/);
+    assert.equal(asked.length, 2, 'no blind release');
+  });
+});
+
+test('a hold that is already gone counts as released', async () => {
+  let n = 0;
+  const answer = () => {
+    n += 1;
+    if (n === 1) return { errors: [{ message: 'Hold not found' }] };
+    return { data: { fulfillmentOrder: { id: 'x', status: 'OPEN', fulfillmentHolds: [] } } };
+  };
+  await withShopify(answer, async () => {
+    await sh.releaseFulfillment(aStore(), hold);
+  });
+});
