@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { AppError, BadRequestError } from '../utils/error.helper.js';
+import { loadShipTo } from './ship-to.service.js';
 
 /**
  * Talking to Shopify: the keys, the signatures Shopify puts on what it sends us, the install (OAuth) steps, and the few Admin API
@@ -196,9 +197,32 @@ export const ensureProductMetafield = async (store) => {
   }
 };
 
+/**
+ * The atelier address as a shop metafield (app-owned, publicly readable) so the checkout extension can fill it in without any network access.
+ * Written again whenever the tick box is (re)created and whenever a Stitch&Ship order is processed, so an edited address follows.
+ */
+export const syncAtelierMetafield = async (store, atelier) => {
+  try {
+    await shopifyGraphql(store, METAFIELD_CREATE, {
+      definition: { name: 'Stitch&Ship atelier address', namespace: '$app:stitchship', key: 'atelier', type: 'json', ownerType: 'SHOP', access: { admin: 'MERCHANT_READ', storefront: 'PUBLIC_READ' } },
+    }).catch(() => undefined); // already there is fine
+    const shop = await shopifyGraphql(store, 'query { shop { id } }');
+    const value = JSON.stringify({ name: atelier.shipToName || 'Stitch&Ship Atelier', address: atelier.shipToAddress || '', city: atelier.shipToCity || '', phone: atelier.shipToPhone || '', countryCode: store.settings?.atelier_country_code || 'PK' });
+    const res = await shopifyGraphql(store, 'mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }', {
+      m: [{ ownerId: shop.shop.id, namespace: '$app:stitchship', key: 'atelier', type: 'json', value }],
+    });
+    const errs = res?.metafieldsSet?.userErrors || [];
+    return errs.length ? { ok: false, error: errs.map((e) => e.message).join('; ') } : { ok: true, error: null };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+};
+
 /** Creates the tick box and writes the result on the store (settings.tick_box), so the admin page can show it. Never throws. */
 export const connectProductMetafield = async (store) => {
   const result = await ensureProductMetafield(store);
+  const atelier = await loadShipTo().catch(() => null);
+  if (atelier) await syncAtelierMetafield(store, atelier);
   const settings = { ...(store.settings || {}), tick_box: { ok: result.ok, at: new Date().toISOString(), error: result.error } };
   await supabaseAdmin.from('shopify_stores').update({ settings, updated_at: new Date().toISOString() }).eq('id', store.id);
   store.settings = settings;
