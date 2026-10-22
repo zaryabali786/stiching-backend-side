@@ -230,7 +230,7 @@ export const getClientOverview = catchAsync(async (req, res) => {
 
 // ─────────────────────────────── Orders ───────────────────────────────
 
-const LIST_COLS = 'id, reference, brand, brand_order_number, tracking_number, status, has_issue, import_source, created_at, destination_city, destination_country';
+const LIST_COLS = 'id, reference, brand, brand_order_number, external_source, tracking_number, status, has_issue, import_source, created_at, destination_city, destination_country';
 const LIST_SELECT = `${LIST_COLS}, order_kind, units:order_units!order_units_order_id_fkey(review_status, return_status, return_to, return_courier, return_tracking, held_at, hold_resolved_at)`;
 const LIST_SELECT_LEGACY = `${LIST_COLS}, units:order_units!order_units_order_id_fkey(id)`;
 

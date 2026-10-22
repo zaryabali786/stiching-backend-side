@@ -2,7 +2,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { buildInstallUrl, completeInstall, connectProductMetafield, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
-import { confirmAtelierAddress, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
+import { confirmAtelierAddress, importShopifyOrder, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
 import { processWebhookEvent, recordWebhookEvent } from '../services/shopify-events.service.js';
 import { loadShipTo } from '../services/ship-to.service.js';
 import { smsEnabled } from '../services/sms.service.js';
@@ -161,3 +161,10 @@ export const resendShopifyEmailRequest = catchAsync(async (req, res) => {
 
 /** POST /api/admin/shopify/events/:id/retry — run a stuck delivery again right now. */
 export const retryShopifyEvent = catchAsync(async (req, res) => ApiResponse.success(res, await processWebhookEvent(req.params.id), 'Tried again.'));
+
+/** POST /api/admin/shopify/stores/:id/import { order: "#1015", force? } — bring an existing Shopify order into the app (no new Shopify order is made). */
+export const importShopifyOrderRequest = catchAsync(async (req, res) => {
+  const order = String(req.body?.order || '').trim();
+  if (!order) throw new BadRequestError('Enter the Shopify order number.');
+  return ApiResponse.success(res, await importShopifyOrder(req.params.id, order, { force: req.body?.force === true }), 'Imported.');
+});

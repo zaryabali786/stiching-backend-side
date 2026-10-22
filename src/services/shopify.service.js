@@ -382,3 +382,13 @@ export const tagAndNoteOrder = async (store, orderGid, tag, line) => {
   const res = await shopifyGraphql(store, ORDER_UPDATE, { input: { id: orderGid, note: [note, line].filter(Boolean).join('\n') } });
   userErrors(res.orderUpdate, 'Could not write the order note');
 };
+
+/** An order as the REST API (and so the orders/create webhook) shapes it, found by its number ("#1015" or "1015"); null when there is none. */
+export const fetchRestOrder = async (store, orderName) => {
+  const name = `#${String(orderName).trim().replace(/^#/, '')}`;
+  const url = `https://${store.shop_domain}/admin/api/${config.shopify.apiVersion}/orders.json?status=any&name=${encodeURIComponent(name)}`;
+  const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': decryptToken(store.access_token_enc) } });
+  if (!res.ok) throw new ShopifyError(`Shopify answered ${res.status}.`, res.status);
+  const json = await res.json();
+  return (json.orders || []).find((o) => o.name === name) || null;
+};

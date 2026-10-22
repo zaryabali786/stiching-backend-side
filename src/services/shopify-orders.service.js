@@ -1,8 +1,8 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
-import { ConflictError } from '../utils/error.helper.js';
+import { ConflictError, NotFoundError } from '../utils/error.helper.js';
 import { loadShipTo } from './ship-to.service.js';
-import { addOrderTag, fetchLineItemDetails, getActiveStore, holdFulfillment, productsStitchEnabled, releaseFulfillment, tagAndNoteOrder, updateShippingAddress } from './shopify.service.js';
+import { addOrderTag, fetchLineItemDetails, fetchRestOrder, getActiveStore, holdFulfillment, productsStitchEnabled, releaseFulfillment, tagAndNoteOrder, updateShippingAddress } from './shopify.service.js';
 import { randomBytes } from 'node:crypto';
 import { findOrCreateCustomerByEmail } from './customer-accounts.service.js';
 import { issueLoginCode, normaliseEmail } from './login-code.service.js';
@@ -362,8 +362,9 @@ const moveWholeOrderToAtelier = async (store, payload, ref) => {
 };
 
 /** A new Shopify order. Returns what happened; throws only for problems worth retrying. */
-export const processOrderCreate = async (store, payload) => {
-  const candidates = candidateLines(store, payload);
+export const processOrderCreate = async (store, payload, { force = false } = {}) => {
+  // force: an administrator imports an order the customer's tick never reached (the product's own box in Shopify is still checked)
+  const candidates = force ? payload?.line_items || [] : candidateLines(store, payload);
   if (!candidates.length) {
     console.info(`[Shopify] ${store.shop_domain} order ${payload?.name}: ignored, ${store.settings?.stitch_mode === 'enabled' ? 'the order has no lines' : 'the customer did not tick Stitch&Ship on any line'}`);
     return { status: 'ignored' };
@@ -648,3 +649,16 @@ export const shopifyQueue = async () => {
 };
 
 export { getActiveStore };
+
+/**
+ * An administrator imports an order that already exists in Shopify and never became an app order (its webhook was ignored or lost). Nothing is
+ * created in Shopify; the same idempotent path as the webhook runs, so repeating it never duplicates anything. With `force` the customer's tick
+ * is not required (the product must still have "Stitch&Ship available" ticked in Shopify).
+ */
+export const importShopifyOrder = async (storeId, orderName, { force = false } = {}) => {
+  const { data: store } = await supabaseAdmin.from('shopify_stores').select('*').eq('id', storeId).maybeSingle();
+  if (!store || store.status === 'uninstalled') throw new NotFoundError('Store not found.');
+  const payload = await fetchRestOrder(store, orderName);
+  if (!payload) throw new NotFoundError(`Shopify has no order ${orderName} in ${store.shop_domain}.`);
+  return { order: payload.name, ...(await processOrderCreate(store, payload, { force })) };
+};

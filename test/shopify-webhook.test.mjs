@@ -37,6 +37,7 @@ before(async () => {
       processOrderCancelled: async (store, payload) => (calls.cancelled.push(payload.id), { status: 'cancelled' }),
       confirmAtelierAddress: async () => ({ changed: true }),
       resendCustomerEmail: async () => ({}),
+      importShopifyOrder: async () => ({}),
       retryShopifyOrder: async () => ({}),
       shopifyQueue: async () => [],
     },

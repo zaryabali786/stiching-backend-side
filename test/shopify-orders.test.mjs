@@ -76,6 +76,7 @@ before(async () => {
         if (behave.tagNoteFails) throw new Error('no write access');
         calls.tagNotes.push({ gid, tag, line });
       },
+      fetchRestOrder: async () => null,
       productsStitchEnabled: async (store, ids) => {
         calls.enabledChecks.push(ids.map(String));
         if (behave.enabledFails) throw new Error('Shopify is down');
@@ -640,6 +641,17 @@ test('the customer must have ticked Stitch&Ship AND the product must be enabled;
   assert.equal(result.status, 'processed', 'product box only');
   assert.equal(db.table('orders').length, 1);
   assert.equal(unitsOf().length, 2, 'still every line');
+});
+
+test('an administrator can import an order the tick never reached (force): processed once, the product box is still required, a repeat adds nothing', async () => {
+  behave.enabled = ['901'];
+  const payload = checkout([[1, '100.00', 1, false], [2, '10.00', 1, false]]);
+  assert.equal((await orders.processOrderCreate(STORE, payload)).status, 'ignored', 'the webhook alone ignores it');
+  assert.equal((await orders.processOrderCreate(STORE, payload, { force: true })).status, 'processed');
+  assert.equal(db.table('orders').length, 1);
+  assert.equal(calls.tags.length, 1);
+  assert.equal((await orders.processOrderCreate(STORE, payload, { force: true })).status, 'duplicate');
+  assert.equal(db.table('orders').length, 1, 'no second order');
 });
 
 test('the same order delivered twice: one order, one tag, one address change, one email', async () => {
