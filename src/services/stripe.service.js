@@ -142,6 +142,28 @@ export const createCodPaymentIntent = async ({ order, customer, amount, currency
   }
 };
 
+/** A PaymentIntent for one Shop order (the platform collects the customer's payment once; brands are settled later). Amount from the database. */
+export const createShopPaymentIntent = async ({ order, customer, idempotencyKey }) => {
+  const minor = toMinorUnits(order.total, order.currency);
+  if (!(minor > 0)) throw new BadRequestError('This order has no amount to pay.');
+  try {
+    const intent = await stripe().paymentIntents.create(
+      {
+        amount: minor,
+        currency: String(order.currency).toLowerCase(),
+        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+        description: `Shop order ${order.reference}`,
+        receipt_email: customer?.email || undefined,
+        metadata: { kind: 'shop', shop_order_id: order.id, order_reference: order.reference, customer_id: order.customer_id },
+      },
+      idempotencyKey ? { idempotencyKey } : undefined
+    );
+    return { intent, minor };
+  } catch (err) {
+    throw new BadRequestError(err?.raw?.message || err.message || 'The payment could not be started.');
+  }
+};
+
 /** Verify a webhook delivery. `rawBody` must be the exact bytes Stripe sent. */
 export const constructWebhookEvent = (rawBody, signature) => {
   if (!config.stripe.webhookSecret) throw new AppError('Stripe webhook is not configured (STRIPE_WEBHOOK_SECRET).', 503);

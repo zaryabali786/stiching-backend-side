@@ -34,6 +34,7 @@ before(async () => {
         stripeState.canceled.push(id);
         if (stripeState.intents[id] && !['succeeded', 'canceled'].includes(stripeState.intents[id].status)) stripeState.intents[id].status = 'canceled';
       },
+      createShopPaymentIntent: async () => ({}),
       createCodPaymentIntent: async (args) => {
         stripeState.intentCreated.push(args);
         const existing = stripeState.intentByKey[args.idempotencyKey];

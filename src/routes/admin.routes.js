@@ -2,6 +2,7 @@ import { addShopifyStore, createShopifyTickBox, getShopifyQueue, importShopifyOr
 import { checkStaffCodPayment, getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
+import { adminCancelOrder, adminCommissionCsv, adminCommissions, adminCreateSettlement, adminDispute, adminPatchBrand, adminPatchProduct, adminRetryBrandOrder, adminSettlements, adminShopBrands, adminShopOrder, adminShopOrders, adminShopProducts, adminSyncBrand, adminSyncBrandOrder } from '../controllers/shop.controller.js';
 import { getAdminModules, createAdminUser, setAdminUserAccess, resetAdminUserPassword, listAdminRoles, createAdminRole, updateAdminRole, deleteAdminRole } from '../controllers/admin-users.controller.js';
 import {
   getAdminOverview,
@@ -102,6 +103,23 @@ router.post('/shopify/stores/:id/webhooks', reconnectShopifyWebhooks);
 router.post('/shopify/stores/:id/tick-box', createShopifyTickBox);
 router.post('/shopify/stores/:id/import', importShopifyOrderRequest);
 router.get('/shopify/queue', getShopifyQueue);
+
+// Ecommerce (the Shop): brands, catalog, orders, commission. Full admins only (the module gate closes unknown prefixes to restricted admins).
+router.get('/shop/brands', adminShopBrands);
+router.patch('/shop/brands/:storeId', adminPatchBrand);
+router.post('/shop/brands/:storeId/sync', adminSyncBrand);
+router.get('/shop/products', adminShopProducts);
+router.patch('/shop/products/:id', adminPatchProduct);
+router.get('/shop/orders', adminShopOrders);
+router.get('/shop/orders/:id', adminShopOrder);
+router.post('/shop/orders/:id/cancel', adminCancelOrder);
+router.post('/shop/brand-orders/:id/retry', adminRetryBrandOrder);
+router.post('/shop/brand-orders/:id/sync', adminSyncBrandOrder);
+router.get('/shop/commissions/export.csv', adminCommissionCsv);
+router.get('/shop/commissions', adminCommissions);
+router.post('/shop/commissions/dispute', adminDispute);
+router.post('/shop/settlements', adminCreateSettlement);
+router.get('/shop/settlements', adminSettlements);
 router.post('/shopify/orders/:id/retry', retryShopifyOrderRequest);
 router.post('/shopify/orders/:id/resend', resendShopifyEmailRequest);
 router.post('/shopify/events/:id/retry', retryShopifyEvent);

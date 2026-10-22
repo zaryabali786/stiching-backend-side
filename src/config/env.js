@@ -106,6 +106,10 @@ export const config = {
     // 32 bytes as base64 or 64 hex characters: encrypts the stores' access tokens in the database
     tokenKey: (process.env.SHOPIFY_TOKEN_KEY || '').trim(),
   },
+  // The Shop (dropshipping): the tag put on the order created in a brand's Shopify store (not the stitching tag)
+  shop: {
+    dropshipTag: (process.env.SHOP_DROPSHIP_TAG || 'stitchship-shop').trim(),
+  },
   // Text messages (optional): Twilio's REST API. Off until the account details are set; each Shopify store also has its own switch.
   sms: {
     accountSid: (process.env.SMS_TWILIO_ACCOUNT_SID || '').trim(),

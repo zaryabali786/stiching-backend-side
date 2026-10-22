@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { ConflictError, NotFoundError } from '../utils/error.helper.js';
-import { loadShipTo } from './ship-to.service.js';
+import { atelierCountryName, atelierMailingAddress, loadShipTo } from './ship-to.service.js';
 import { addOrderTag, fetchLineItemDetails, fetchRestOrder, getActiveStore, holdFulfillment, productsStitchEnabled, releaseFulfillment, tagAndNoteOrder, updateShippingAddress } from './shopify.service.js';
 import { randomBytes } from 'node:crypto';
 import { findOrCreateCustomerByEmail } from './customer-accounts.service.js';
@@ -354,11 +354,10 @@ const moveWholeOrderToAtelier = async (store, payload, ref) => {
   assertAtelierAddress(atelier);
   if (addressMatchesAtelier({ shipping: ship, atelier, ref })) return { payload, ref };
   const useRef = ref || makeRef();
-  const countryCode = store.settings?.atelier_country_code || 'PK';
-  await updateShippingAddress(store, payload.admin_graphql_api_id, { firstName: ship?.first_name || undefined, lastName: ship?.last_name || undefined, company: atelier.shipToName || 'Stitch&Ship Atelier', address1: atelier.shipToAddress, address2: useRef, city: atelier.shipToCity, countryCode, phone: atelier.shipToPhone || undefined });
+  await updateShippingAddress(store, payload.admin_graphql_api_id, atelierMailingAddress(atelier, store, { firstName: ship?.first_name || undefined, lastName: ship?.last_name || undefined, address2: useRef }));
   const own = [ship?.address1, ship?.address2, ship?.city, ship?.country].filter(Boolean).join(', ');
   await tagAndNoteOrder(store, payload.admin_graphql_api_id, null, `The customer's own delivery address: ${own}. Every item of this order is for Stitch&Ship, so its delivery address is now the atelier's.`).catch(() => undefined);
-  return { payload: { ...payload, shipping_address: { ...ship, company: atelier.shipToName || 'Stitch&Ship Atelier', address1: atelier.shipToAddress, address2: useRef, city: atelier.shipToCity, country: 'Pakistan', phone: atelier.shipToPhone || ship?.phone } }, ref: useRef };
+  return { payload: { ...payload, shipping_address: { ...ship, company: atelier.shipToName || 'Stitch&Ship Atelier', address1: atelier.shipToAddress, address2: useRef, city: atelier.shipToCity, province: atelier.shipToState || undefined, province_code: atelier.shipToProvinceCode || undefined, zip: atelier.shipToZip || undefined, country: atelierCountryName(atelier), country_code: atelier.shipToCountryCode || undefined, phone: atelier.shipToPhone || ship?.phone } }, ref: useRef };
 };
 
 /** A new Shopify order. Returns what happened; throws only for problems worth retrying. */
@@ -588,16 +587,7 @@ export const confirmAtelierAddress = async ({ order, actorId }) => {
   if (!store || store.status !== 'active') throw new ConflictError('The brand store is not connected any more. Please contact us.');
   const atelier = await loadShipTo();
   const ship = row.payload?.shipping_address || {};
-  await updateShippingAddress(store, row.payload?.admin_graphql_api_id || `gid://shopify/Order/${row.shopify_order_id}`, {
-    firstName: ship.first_name || undefined,
-    lastName: ship.last_name || undefined,
-    company: atelier.shipToName || 'Stitch&Ship Atelier',
-    address1: atelier.shipToAddress,
-    address2: row.ref_code || undefined,
-    city: atelier.shipToCity,
-    countryCode: store.settings?.atelier_country_code || 'PK',
-    phone: atelier.shipToPhone || undefined,
-  });
+  await updateShippingAddress(store, row.payload?.admin_graphql_api_id || `gid://shopify/Order/${row.shopify_order_id}`, atelierMailingAddress(atelier, store, { firstName: ship.first_name || undefined, lastName: ship.last_name || undefined, address2: row.ref_code || undefined }));
   await patchRow(row, { address_state: 'address_ok' });
   await releaseHold(store, row);
   await addEvent(order.id, order.status, 'The customer confirmed that the order goes to the atelier', actorId);

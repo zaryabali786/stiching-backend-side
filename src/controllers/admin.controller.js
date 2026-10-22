@@ -15,7 +15,8 @@ import { logUnitEvent } from '../services/order.service.js';
 import { unreadConversationCount } from '../services/chat.service.js';
 import { activePartnerOf, inActivePartner } from '../services/access.service.js';
 import { routedUnitIds, adjustUnitCounts } from '../services/return-order.service.js';
-import { loadShipTo, saveShipTo } from '../services/ship-to.service.js';
+import { loadShipTo, saveShipTo, shipToView } from '../services/ship-to.service.js';
+import { syncAtelierEverywhere } from '../services/shopify.service.js';
 import { postexSettingsView, savePostexSettings, getOperationalCities, listMerchantAddresses } from '../services/postex.service.js';
 import { loadExpressStitching, saveExpressStitching } from '../services/express-stitching.service.js';
 import { loadExpressShipping, saveExpressShipping } from '../services/express-shipping.service.js';
@@ -541,18 +542,21 @@ export const getAdminBadges = catchAsync(async (req, res) => {
 /** GET /api/admin/settings/ship-to — the address customers ship parcels to */
 export const getShipTo = catchAsync(async (req, res) => {
   const a = await loadShipTo();
-  return ApiResponse.success(res, { name: a.shipToName, address: a.shipToAddress, city: a.shipToCity, phone: a.shipToPhone });
+  return ApiResponse.success(res, shipToView(a));
 });
 
-/** PUT /api/admin/settings/ship-to  body: { name, address, city, phone } */
+/** PUT /api/admin/settings/ship-to  body: { name, address, city, phone, country, country_code, state, province_code, zip } */
 export const setShipTo = catchAsync(async (req, res) => {
   const b = req.body || {};
   if (!String(b.address ?? '').trim()) throw new BadRequestError('Enter the street address.');
   if (!String(b.city ?? '').trim()) throw new BadRequestError('Enter the city.');
+  if (!String(b.country ?? '').trim() || !/^[A-Za-z]{2}$/.test(String(b.country_code ?? '').trim())) throw new BadRequestError('Choose the country.');
   const a = await saveShipTo(b, req.userId).catch(() => {
     throw new BadRequestError('Could not save. Run the latest database update (0008) first.');
   });
-  return ApiResponse.success(res, { name: a.shipToName, address: a.shipToAddress, city: a.shipToCity, phone: a.shipToPhone }, 'Address saved. Customers now see it.');
+  // every connected Shopify store gets the new address for its checkout (best effort, in the background)
+  syncAtelierEverywhere().catch((err) => console.warn('[Shopify] atelier address sync failed:', err.message));
+  return ApiResponse.success(res, shipToView(a), 'Address saved. Customers now see it, and the Shopify checkout uses it.');
 });
 
 

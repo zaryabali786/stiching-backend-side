@@ -137,7 +137,7 @@ const withFetch = async (fake, fn) => {
   }
 };
 
-test('the install keeps the token encrypted, registers the four order webhooks and records the result', async () => {
+test('the install keeps the token encrypted, registers the order, refund and product webhooks and records the result', async () => {
   db = createFakeDb({ shopify_stores: [{ shop_domain: 'my-brand.myshopify.com', status: 'pending' }] });
   const seen = [];
   const store = await withFetch(async (url, init) => {
@@ -150,7 +150,7 @@ test('the install keeps the token encrypted, registers the four order webhooks a
   assert.equal(store.status, 'active');
   assert.equal(store.access_token_enc.includes('shpat_live_token'), false, 'the token is stored encrypted');
   assert.equal(sh.decryptToken(store.access_token_enc), 'shpat_live_token');
-  assert.deepEqual(seen.map((s) => s.topic), ['ORDERS_CREATE', 'ORDERS_UPDATED', 'ORDERS_CANCELLED', 'APP_UNINSTALLED']);
+  assert.deepEqual(seen.map((s) => s.topic), ['ORDERS_CREATE', 'ORDERS_UPDATED', 'ORDERS_CANCELLED', 'APP_UNINSTALLED', 'REFUNDS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE']);
   assert.ok(seen.every((s) => s.callback === 'https://api.example.test/api/webhooks/shopify' && s.format === 'JSON' && s.token === 'shpat_live_token'));
   assert.ok(seen.every((s) => s.url.startsWith('https://my-brand.myshopify.com/admin/api/')));
   const saved = db.table('shopify_stores')[0];

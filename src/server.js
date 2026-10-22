@@ -4,6 +4,8 @@ import { initSocket } from './realtime/socket.js';
 import { loadPostexSettings, applyPostexSettings, onPostexSettingsChange } from './services/postex.service.js';
 import { startPostexPolling } from './services/postex-tracking.service.js';
 import { startShopifyRetry } from './services/shopify-events.service.js';
+import { startShopCatalogTimer } from './services/shop-catalog.service.js';
+import { startShopOrderTimer } from './services/shop-orders.service.js';
 
 const server = app.listen(config.port, () => {
   console.log(`=========================================`);
@@ -23,6 +25,8 @@ loadPostexSettings().catch(() => ({})).finally(applyPostexSettings);
 
 // Shopify deliveries that failed are tried again every few minutes
 startShopifyRetry();
+startShopCatalogTimer();
+startShopOrderTimer();
 
 // Real-time order conversations share the HTTP server (same port, path /socket.io)
 initSocket(server);

@@ -555,6 +555,22 @@ const checkout = (lines, extra = {}) => {
 };
 const unitsOf = () => db.table('order_units').map((u) => u.unit_title);
 
+test('the atelier own country, state and postal code (chosen in the admin) are what Shopify receives, not a fixed country', async () => {
+  const setting = db.table('platform_settings').find((r) => r.key === 'ship_to');
+  setting.value = { ...setting.value, shipToCountry: 'United Kingdom', shipToCountryCode: 'GB', shipToState: 'England', shipToProvinceCode: 'ENG', shipToZip: 'M1 1AE' };
+  await orders.processOrderCreate(STORE, checkout([[1, '749.95', 1, true]]));
+  const a = calls.addressUpdates[0].address;
+  assert.deepEqual([a.countryCode, a.provinceCode, a.zip, a.city], ['GB', 'ENG', 'M1 1AE', 'Lahore']);
+});
+
+test('an atelier saved before the country existed still goes to Pakistan (nothing that worked stops working)', async () => {
+  await orders.processOrderCreate(STORE, checkout([[1, '749.95', 1, true]]));
+  const a = calls.addressUpdates[0].address;
+  assert.equal(a.countryCode, 'PK');
+  assert.equal('provinceCode' in a, false);
+  assert.equal('zip' in a, false);
+});
+
 test('one product with Stitch&Ship ticked: one order, tagged, the whole order goes to the atelier, one order in the app', async () => {
   const result = await orders.processOrderCreate(STORE, checkout([[1, '749.95', 1, true]]));
   assert.equal(result.status, 'processed');

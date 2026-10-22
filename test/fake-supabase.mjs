@@ -21,7 +21,7 @@ export const createFakeDb = (seed = {}, { uniques = {} } = {}) => {
         return api;
       },
       insert(rows) { state.op = 'insert'; state.rows = Array.isArray(rows) ? rows : [rows]; return api; },
-      upsert(rows, opts = {}) { state.op = 'upsert'; state.rows = Array.isArray(rows) ? rows : [rows]; state.conflict = opts.onConflict || 'key'; return api; },
+      upsert(rows, opts = {}) { state.op = 'upsert'; state.rows = Array.isArray(rows) ? rows : [rows]; state.conflict = opts.onConflict || 'key'; state.ignoreDuplicates = !!opts.ignoreDuplicates; return api; },
       update(patch) { state.op = 'update'; state.patch = patch; return api; },
       delete() { state.op = 'delete'; return api; },
       eq(c, v) { state.filters.push((r) => r[c] === v); return api; },
@@ -31,6 +31,7 @@ export const createFakeDb = (seed = {}, { uniques = {} } = {}) => {
       not(c, op, v) { if (op === 'is') state.filters.push((r) => (r[c] ?? null) !== v); return api; },
       ilike(c, v) { const re = new RegExp(`^${String(v).replace(/\\([\\%_])/g, '$1').replace(/[.*+?^${}()|[\]]/g, '\\$&')}$`, 'i'); state.filters.push((r) => re.test(String(r[c] ?? ''))); return api; },
       gte(c, v) { state.filters.push((r) => r[c] !== undefined && r[c] !== null && String(r[c]) >= String(v)); return api; },
+      lte(c, v) { state.filters.push((r) => r[c] !== undefined && r[c] !== null && String(r[c]) <= String(v)); return api; },
       lt(c, v) { state.filters.push((r) => r[c] !== undefined && r[c] !== null && String(r[c]) < String(v)); return api; },
       // simple "col.is.null,col.neq.X" lists are applied; anything with and(...) / not(...) stays a no-op as before
       or(expr) {
@@ -69,7 +70,9 @@ export const createFakeDb = (seed = {}, { uniques = {} } = {}) => {
       } else if (state.op === 'upsert') {
         out = [];
         for (const r of state.rows) {
-          const found = rows.find((o) => o[state.conflict] === r[state.conflict]);
+          const keys = String(state.conflict).split(',');
+          const found = rows.find((o) => keys.every((k) => o[k] === r[k]));
+          if (found && state.ignoreDuplicates) continue;
           if (found) { Object.assign(found, r); out.push({ ...found }); } else { const row = { id: uuid(), created_at: new Date().toISOString(), ...r }; rows.push(row); out.push({ ...row }); }
         }
       } else if (state.op === 'update') {

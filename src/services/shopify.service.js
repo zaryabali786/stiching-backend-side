@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { AppError, BadRequestError } from '../utils/error.helper.js';
-import { loadShipTo } from './ship-to.service.js';
+import { atelierCountryCode, loadShipTo } from './ship-to.service.js';
 
 /**
  * Talking to Shopify: the keys, the signatures Shopify puts on what it sends us, the install (OAuth) steps, and the few Admin API
@@ -123,7 +123,7 @@ export const completeInstall = async ({ shop, code }) => {
 // ───────────── webhooks of one store ─────────────
 
 /** The notifications we want from every store. With the classic install flow they are registered per store, through the API. */
-export const WEBHOOK_TOPICS = ['ORDERS_CREATE', 'ORDERS_UPDATED', 'ORDERS_CANCELLED', 'APP_UNINSTALLED'];
+export const WEBHOOK_TOPICS = ['ORDERS_CREATE', 'ORDERS_UPDATED', 'ORDERS_CANCELLED', 'APP_UNINSTALLED', 'REFUNDS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE'];
 
 const WEBHOOK_CREATE = `mutation($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) { webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) { webhookSubscription { id } userErrors { field message } } }`;
 
@@ -207,7 +207,7 @@ export const syncAtelierMetafield = async (store, atelier) => {
       definition: { name: 'Stitch&Ship atelier address', namespace: '$app:stitchship', key: 'atelier', type: 'json', ownerType: 'SHOP', access: { admin: 'MERCHANT_READ', storefront: 'PUBLIC_READ' } },
     }).catch(() => undefined); // already there is fine
     const shop = await shopifyGraphql(store, 'query { shop { id } }');
-    const value = JSON.stringify({ name: atelier.shipToName || 'Stitch&Ship Atelier', address: atelier.shipToAddress || '', city: atelier.shipToCity || '', phone: atelier.shipToPhone || '', countryCode: store.settings?.atelier_country_code || 'PK' });
+    const value = JSON.stringify({ name: atelier.shipToName || 'Stitch&Ship Atelier', address: atelier.shipToAddress || '', city: atelier.shipToCity || '', phone: atelier.shipToPhone || '', country: atelier.shipToCountry || '', countryCode: atelierCountryCode(atelier, store), state: atelier.shipToState || '', provinceCode: atelier.shipToProvinceCode || '', zip: atelier.shipToZip || '' });
     const res = await shopifyGraphql(store, 'mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }', {
       m: [{ ownerId: shop.shop.id, namespace: '$app:stitchship', key: 'atelier', type: 'json', value }],
     });
@@ -216,6 +216,15 @@ export const syncAtelierMetafield = async (store, atelier) => {
   } catch (err) {
     return { ok: false, error: err.message };
   }
+};
+
+/** The admin changed the atelier address: every active store gets it for its checkout (one failing store never stops the others). */
+export const syncAtelierEverywhere = async () => {
+  const atelier = await loadShipTo();
+  const { data: stores } = await supabaseAdmin.from('shopify_stores').select('*').eq('status', 'active');
+  const results = [];
+  for (const store of stores || []) results.push({ shop: store.shop_domain, ...(await syncAtelierMetafield(store, atelier)) });
+  return results;
 };
 
 /** Creates the tick box and writes the result on the store (settings.tick_box), so the admin page can show it. Never throws. */

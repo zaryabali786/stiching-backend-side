@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../config/supabase.js';
+import { recordFailedShopIntent, settleShopIntent } from '../services/shop-orders.service.js';
 import { config } from '../config/env.js';
 import { catchAsync, ApiResponse, BadRequestError, NotFoundError } from '../utils/error.helper.js';
 import { unwrap } from '../utils/db.js';
@@ -93,7 +94,10 @@ export const stripeWebhook = async (req, res) => {
 
   try {
     // a cash on delivery payment (kind 'cod') settles the order; any other intent is an invoice payment
-    if (event.type === 'payment_intent.succeeded') await (event.data.object.metadata?.kind === 'cod' ? settleCodIntent(event.data.object) : settleSucceededIntent(event.data.object));
+    if (event.data?.object?.metadata?.kind === 'shop' && ['payment_intent.succeeded', 'payment_intent.payment_failed'].includes(event.type)) {
+      // a Shop (multi-brand ecommerce) payment
+      await (event.type === 'payment_intent.succeeded' ? settleShopIntent(event.data.object) : recordFailedShopIntent(event.data.object));
+    } else if (event.type === 'payment_intent.succeeded') await (event.data.object.metadata?.kind === 'cod' ? settleCodIntent(event.data.object) : settleSucceededIntent(event.data.object));
     else if (event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') await (event.data.object.metadata?.kind === 'cod' ? releaseCodIntent(event.data.object) : event.type === 'payment_intent.payment_failed' ? recordFailedIntent(event.data.object) : undefined);
     // cash on delivery orders pay through Stripe Checkout: only a paid session marks the order paid
     else if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') await settleCodSession(event.data.object);

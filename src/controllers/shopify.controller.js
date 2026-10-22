@@ -4,7 +4,7 @@ import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError
 import { buildInstallUrl, completeInstall, connectProductMetafield, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
 import { confirmAtelierAddress, importShopifyOrder, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
 import { processWebhookEvent, recordWebhookEvent } from '../services/shopify-events.service.js';
-import { loadShipTo } from '../services/ship-to.service.js';
+import { atelierCountryName, loadShipTo, shipToView } from '../services/ship-to.service.js';
 import { smsEnabled } from '../services/sms.service.js';
 
 // ───────────── what the brand's browser and Shopify call (no login) ─────────────
@@ -35,7 +35,8 @@ export const shopifyInstallCallback = catchAsync(async (req, res) => {
 export const getAtelierAddress = catchAsync(async (req, res) => {
   const a = await loadShipTo();
   res.set('Cache-Control', 'public, max-age=300');
-  return ApiResponse.success(res, { name: a.shipToName || '', address: a.shipToAddress || '', city: a.shipToCity || '', phone: a.shipToPhone || '', country: 'Pakistan', countryCode: 'PK' });
+  const v = shipToView(a);
+  return ApiResponse.success(res, { name: v.name, address: v.address, city: v.city, phone: v.phone, country: v.country || atelierCountryName(a), countryCode: v.country_code || 'PK', state: v.state, provinceCode: v.province_code, zip: v.zip });
 });
 
 /**

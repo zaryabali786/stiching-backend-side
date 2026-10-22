@@ -2,6 +2,8 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { normaliseShop } from './shopify.service.js';
 import { getActiveStore, processOrderCancelled, processOrderCreate, processOrderUpdated } from './shopify-orders.service.js';
 import { notifyAdmins } from './notification.service.js';
+import { handleShopOrderWebhook, handleShopRefundWebhook } from './shop-orders.service.js';
+import { markProductGone, syncOneProduct } from './shop-catalog.service.js';
 
 /**
  * Shopify's webhook deliveries. A delivery is written down first (Shopify's own delivery id is unique, so a repeat is ignored), the
@@ -36,15 +38,34 @@ const handle = async (topic, shop, payload) => {
   switch (topic) {
     case 'orders/create': {
       const store = await getActiveStore(shop);
-      return store ? processOrderCreate(store, payload) : { status: 'no_store' };
+      if (!store) return { status: 'no_store' };
+      // an order WE created for the Shop (dropshipping) is never a stitching order
+      const shopOrder = await handleShopOrderWebhook(store, payload);
+      return shopOrder.handled ? shopOrder : processOrderCreate(store, payload);
     }
     case 'orders/updated': {
       const store = await getActiveStore(shop);
-      return store ? processOrderUpdated(store, payload) : { status: 'no_store' };
+      if (!store) return { status: 'no_store' };
+      const shopOrder = await handleShopOrderWebhook(store, payload);
+      return shopOrder.handled ? shopOrder : processOrderUpdated(store, payload);
     }
     case 'orders/cancelled': {
       const store = await getActiveStore(shop);
-      return store ? processOrderCancelled(store, payload) : { status: 'no_store' };
+      if (!store) return { status: 'no_store' };
+      const shopOrder = await handleShopOrderWebhook(store, payload);
+      return shopOrder.handled ? shopOrder : processOrderCancelled(store, payload);
+    }
+    case 'refunds/create': {
+      const store = await getActiveStore(shop);
+      return store ? handleShopRefundWebhook(store, payload) : { status: 'no_store' };
+    }
+    case 'products/update': {
+      const store = await getActiveStore(shop);
+      return store ? syncOneProduct(store, payload.id) : { status: 'no_store' };
+    }
+    case 'products/delete': {
+      const store = await getActiveStore(shop);
+      return store ? markProductGone(store, payload.id) : { status: 'no_store' };
     }
     case 'app/uninstalled':
       await uninstall(shop);

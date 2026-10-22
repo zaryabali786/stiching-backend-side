@@ -159,10 +159,11 @@ test('an order for a store that is not connected does nothing', async () => {
 });
 
 test('the atelier address endpoint shows only the address, no secrets', async () => {
-  db = createFakeDb({ platform_settings: [{ key: 'ship_to', value: { shipToName: 'Stitch&Ship Atelier', shipToAddress: 'House 12', shipToCity: 'Lahore', shipToPhone: '042' } }] });
+  db = createFakeDb({ platform_settings: [{ key: 'ship_to', value: { shipToName: 'Stitch&Ship Atelier', shipToAddress: 'House 12', shipToCity: 'Lahore', shipToPhone: '042', shipToCountry: 'Pakistan', shipToCountryCode: 'PK', shipToState: 'Punjab', shipToProvinceCode: 'PB', shipToZip: '54000' } }] });
   const out = { headers: {}, body: null, set(k, v) { this.headers[k] = v; }, status() { return this; }, json(b) { this.body = b; return this; } };
   ctl.getAtelierAddress({}, out, (e) => { throw e; });
   for (let i = 0; i < 5 && !out.body; i++) await new Promise((r) => setImmediate(r));
-  assert.deepEqual(Object.keys(out.body.data).sort(), ['address', 'city', 'country', 'countryCode', 'name', 'phone']);
+  assert.deepEqual(Object.keys(out.body.data).sort(), ['address', 'city', 'country', 'countryCode', 'name', 'phone', 'provinceCode', 'state', 'zip']);
   assert.equal(out.body.data.city, 'Lahore');
+  assert.deepEqual([out.body.data.country, out.body.data.countryCode, out.body.data.state, out.body.data.provinceCode, out.body.data.zip], ['Pakistan', 'PK', 'Punjab', 'PB', '54000']);
 });

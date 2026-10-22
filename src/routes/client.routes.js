@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { deleteShopCartItem, getShopCart, getShopFilters, getShopOrder, getShopOrders, getShopProduct, getShopProducts, postShopCheckout, postShopConfirmPayment, postShopRetryPayment, putShopCartItem } from '../controllers/shop.controller.js';
 import {
   getClientOverview,
   getClientOrders,
@@ -129,5 +130,18 @@ router.get('/sizes', getClientSizes);
 router.post('/sizes', createClientSize);
 router.patch('/sizes/:id', updateClientSize);
 router.delete('/sizes/:id', deleteClientSize);
+
+// The Shop (multi-brand ecommerce): kept apart from stitching orders
+router.get('/shop/filters', getShopFilters);
+router.get('/shop/products', getShopProducts);
+router.get('/shop/products/:id', getShopProduct);
+router.get('/shop/cart', getShopCart);
+router.put('/shop/cart/items', putShopCartItem);
+router.delete('/shop/cart/items/:variantId', deleteShopCartItem);
+router.post('/shop/checkout', postShopCheckout);
+router.get('/shop/orders', getShopOrders);
+router.get('/shop/orders/:id', getShopOrder);
+router.post('/shop/orders/:id/confirm-payment', postShopConfirmPayment);
+router.post('/shop/orders/:id/retry-payment', postShopRetryPayment);
 
 export default router;
