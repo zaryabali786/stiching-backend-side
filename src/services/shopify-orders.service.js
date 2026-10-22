@@ -375,6 +375,11 @@ const assertAtelierAddress = (atelier) => {
   if (!atelier?.shipToAddress || !atelier?.shipToCity) throw new ConflictError('The Stitch&Ship shipping address is not set (Admin > Settings > Stitch&Ship address: street and city), so the order was not split.');
 };
 
+const atelierAddressMessage = (err) => {
+  const hint = /country|region/i.test(err.message || '') ? ' Shopify only accepts an address in a country the store ships to: add the country of the Stitch&Ship address to the shipping zones (Shopify admin > Settings > Shipping and delivery).' : '';
+  return `Could not set the atelier address: ${err.message}.${hint}`.slice(0, 500);
+};
+
 const shipSummary = (a) => (a ? { name: [a.first_name, a.last_name].filter(Boolean).join(' ') || a.name || null, company: a.company || null, address1: a.address1 || null, address2: a.address2 || null, city: a.city || null, province: a.province || null, zip: a.zip || null, country: a.country || null, phone: a.phone || null } : null);
 
 /**
@@ -549,6 +554,8 @@ export const processOrderCreate = async (store, payload) => {
     return { status: 'failed' };
   }
 
+  // things that went wrong but must not stop the order from being recognised as Stitch&Ship: they are kept, shown to an administrator, and can be retried
+  let addressWarning = null;
   // Splitting in Shopify (only for stores that switched it on, and never for an order this app made itself)
   if (!isSplitChild(payload) && autoSplitOn(store)) {
     // a marked product that is not enabled counts as a normal line
@@ -559,16 +566,16 @@ export const processOrderCreate = async (store, payload) => {
       payload = moved.payload;
       ref = moved.ref;
     } catch (err) {
-      const hint = /country|region/i.test(err.message || '') ? ' Shopify only accepts an address in a country the store ships to: add the country of the Stitch&Ship address to the shipping zones (Shopify admin > Settings > Shipping and delivery).' : '';
-      const message = `Could not set the atelier address: ${err.message}.${hint}`.slice(0, 500);
-      // a refusal by Shopify (or a missing address in our settings) will not change by itself: say so, stop, and let "Try again" run once it is fixed
+      const message = atelierAddressMessage(err);
+      // a refusal by Shopify (or a missing address in our settings) will not change by itself: keep going (tag, internal order, email: the
+      // shipment stays on hold because the address is not the atelier's), remember the warning, and let "Try again" redo the address
       if (err instanceof ConflictError || err.status === 422) {
-        await patchRow(row, { state: 'failed', last_error: message });
-        await alert(`Shopify: ${payload.name} could not go to the Stitch&Ship address`, `${store.shop_domain}: ${message}`);
-        return { status: 'failed' };
+        addressWarning = message;
+        if (!row.order_id) await alert(`Shopify: ${payload.name} could not go to the Stitch&Ship address`, `${store.shop_domain}: ${message}`);
+      } else {
+        await patchRow(row, { last_error: message });
+        throw err;
       }
-      await patchRow(row, { last_error: message });
-      throw err;
     }
   }
 
@@ -618,9 +625,13 @@ export const processOrderCreate = async (store, payload) => {
 
     // 5. tag in Shopify (for the brand's own view), then email the customer
     const tag = alloc.mixed ? STITCH_MIXED_TAG : STITCH_TAG;
-    await addOrderTag(store, payload.admin_graphql_api_id, tag).catch((err) => patchRow(row, { last_error: `Could not tag the order: ${err.message}` }));
+    let tagWarning = null;
+    await addOrderTag(store, payload.admin_graphql_api_id, tag).catch((err) => {
+      tagWarning = `Could not tag the order: ${err.message}`.slice(0, 300);
+    });
+    const warnings = [addressWarning, tagWarning].filter(Boolean);
     // the price split of this order (idempotent: one row per original order and group), with the address each group uses
-    const saved = await saveSplit({ row, store, payload, alloc, pay, orderId: row.order_id, addresses: groupAddresses(payload, alloc, ok), tags: { stitchship: STITCH_TAG, normal: null } });
+    const saved = await saveSplit({ row, store, payload, alloc, pay, orderId: row.order_id, addresses: groupAddresses(payload, alloc, ok), tags: { stitchship: STITCH_TAG, normal: null }, extra: warnings.length ? { stitchship: { split_error: warnings.join(' | ').slice(0, 500) } } : {} });
     const splitFailed = !saved.saved && !/does not exist|schema cache|could not find the table/i.test(saved.error || '');
     if (order && !row.notified_at) await sendCustomerEmail({ row, order, email, mismatch: !ok, store });
 
@@ -628,9 +639,14 @@ export const processOrderCreate = async (store, payload) => {
       await patchRow(row, { last_error: `Could not save the price split: ${saved.error}`.slice(0, 500) });
       await alert(`Shopify: the price split of ${payload.name} was not saved`, `${store.shop_domain}: ${saved.error}. Use "Try again" on the order.`);
     }
-    // the Shopify copy holds personal data: keep it only while something is still open (an unsaved split is still open)
-    if (ok && row.notified_at && row.hold_state !== 'failed' && !splitFailed) await patchRow(row, { payload: null });
-    return { status: 'processed', addressOk: ok, orderId: row.order_id };
+    // the warnings are written after the email (which clears the error line) so the administrator sees them
+    if (warnings.length) {
+      await patchRow(row, { last_error: warnings.join(' | ').slice(0, 500) });
+      if (tagWarning) await alert(`Shopify: ${payload.name} could not be tagged`, `${store.shop_domain}: ${tagWarning}. Use "Try again" on the order.`);
+    }
+    // the Shopify copy holds personal data: keep it only while something is still open (an unsaved split or a warning is still open)
+    if (ok && row.notified_at && row.hold_state !== 'failed' && !splitFailed && !warnings.length) await patchRow(row, { payload: null });
+    return { status: 'processed', addressOk: ok, orderId: row.order_id, warnings };
   } catch (err) {
     if (err instanceof ConflictError) {
       await patchRow(row, { state: 'failed', last_error: err.message });
@@ -697,6 +713,43 @@ export const refreshSplit = async (store, row, payload = null) => {
   const saved = await saveSplit({ row, store, payload: order, alloc, pay, addresses, tags, orderId: row.order_id });
   if (!saved.saved) throw new Error(saved.error);
   return { refreshed: true };
+};
+
+/**
+ * Finish what an order that was taken in could not finish: tag it again (a tag already there is fine), and for an order whose every item is
+ * Stitch&Ship, set the atelier address again (and let the shipment go once it is the atelier's). Warnings that are gone are cleared, the
+ * ones that remain are kept. Idempotent: nothing is made twice.
+ */
+export const repairStitchOrder = async (store, row) => {
+  const gid = `gid://shopify/Order/${row.shopify_order_id}`;
+  const rows = await loadSplit(row.id);
+  const mixed = rows.some((r) => r.kind === 'normal');
+  const warnings = [];
+  try {
+    await addOrderTag(store, gid, mixed ? STITCH_MIXED_TAG : STITCH_TAG);
+  } catch (err) {
+    warnings.push(`Could not tag the order: ${err.message}`.slice(0, 300));
+  }
+  const needsAddress = rows.some((r) => /atelier address/i.test(r.split_error || '')) || /atelier address/i.test(row.last_error || '');
+  if (needsAddress && row.payload) {
+    try {
+      await moveWholeOrderToAtelier(store, row.payload, row.ref_code);
+      await patchRow(row, { address_state: 'address_ok' });
+      await releaseHold(store, row);
+    } catch (err) {
+      warnings.push(atelierAddressMessage(err));
+    }
+  } else if (needsAddress) {
+    warnings.push('Could not set the atelier address: the order copy is gone, set the address in Shopify by hand.');
+  }
+  try {
+    await supabaseAdmin.from('shopify_order_splits').update({ split_error: warnings.length ? warnings.join(' | ').slice(0, 500) : null, updated_at: new Date().toISOString() }).eq('shopify_order_row_id', row.id).eq('kind', 'stitchship');
+  } catch {
+    /* the line below still tells the administrator */
+  }
+  await patchRow(row, { last_error: warnings.length ? warnings.join(' | ').slice(0, 500) : null });
+  if (!warnings.length && row.address_state === 'address_ok' && row.notified_at && row.hold_state !== 'failed') await patchRow(row, { payload: null });
+  return { status: warnings.length ? 'repaired_with_warnings' : 'repaired', warnings };
 };
 
 /** The split of an order that was taken in but whose split was not saved: worked out again from the kept Shopify copy. Idempotent. */
@@ -773,6 +826,11 @@ export const retryShopifyOrder = async (rowId) => {
   const { data: store } = await supabaseAdmin.from('shopify_stores').select('*').eq('id', row.store_id).maybeSingle();
   const active = store?.status === 'active' ? store : null;
   if (!active) throw new ConflictError('The brand store is not connected.');
+  // an order that was taken in with a warning (the address or the tag): finished again
+  if (row.state === 'draft_created') {
+    const open = await loadSplit(row.id);
+    if (open.some((r) => r.split_error) || /Could not (tag|set the atelier)/i.test(row.last_error || '')) return repairStitchOrder(active, row);
+  }
   // an order that was taken in, whose price split was not saved: worked out again from the kept Shopify copy
   if (row.payload && row.state === 'draft_created' && row.order_id) {
     const existing = await loadSplit(row.id);
@@ -821,7 +879,7 @@ export const shopifyQueue = async () => {
   if (error) throw error;
   const rowIds = (data || []).map((r) => r.id);
   const splits = await loadSplits(rowIds);
-  const splitAttention = (list) => (list || []).some((x) => ['verification_pending', 'paid_unverified'].includes(x.payment_status) || x.reconciled === false || x.address?.needs_separate_delivery);
+  const splitAttention = (list) => (list || []).some((x) => ['verification_pending', 'paid_unverified'].includes(x.payment_status) || x.reconciled === false || x.address?.needs_separate_delivery || x.split_error);
   const attention = (r) => r.state === 'failed' || r.state === 'split_failed' || r.state === 'split_pending' || (r.address_state === 'address_mismatch' && r.hold_state === 'held') || r.hold_state === 'failed' || (r.state === 'draft_created' && !r.notified_at);
   return (data || []).map((r) => ({ ...r, store: Array.isArray(r.store) ? r.store[0] : r.store, order: Array.isArray(r.order) ? r.order[0] : r.order, split: (splits.get(r.id) || []).sort((a, b) => (a.kind < b.kind ? 1 : -1)), needs_attention: attention(r) || splitAttention(splits.get(r.id)) }));
 };

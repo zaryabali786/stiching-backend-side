@@ -1330,23 +1330,122 @@ test('the same enabled-product order delivered twice (a webhook retry) makes one
   assert.equal(calls.edits.length, 1);
 });
 
-test('when Shopify refuses the atelier address (the store does not ship to that country) the order is marked failed with the reason, and Try again works once it is fixed', async () => {
-  enabledMode(10);
-  enable(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+const oneProduct = (extra = {}) =>
+  shopifyOrder({ note_attributes: [], taxes_included: false, financial_status: 'paid', total_price: '749.95', shipping_address: HOME, line_items: [mkLine(1, '749.95', 1, { tax_lines: [] })], shipping_lines: [], ...extra });
+
+test('one enabled product, everything works: tagged stitchship, the order is the Stitch&Ship order at the atelier address, an internal order exists', async () => {
+  enabledMode(0);
+  enable(1);
+  const result = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(result.status, 'processed');
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship']);
+  assert.equal(calls.createdOrders.length, 0, 'no second Shopify order: nothing to split');
+  assert.equal(calls.addressUpdates.length, 1);
+  assert.equal(calls.addressUpdates[0].address.address1, 'House 12 Street 4 Gulberg');
+  assert.equal(db.table('orders').length, 1);
+  assert.equal(order().external_source, 'shopify');
+  assert.equal(order().order_source, 'email', 'the app\'s own classification of an order that came from a brand');
+  assert.equal(order().brand_order_total, 749.95);
+  assert.equal(calls.emails.length, 1);
+  assert.equal(row().last_error, null);
+  assert.equal(row().state, 'draft_created');
+  assert.equal(splitOf('stitchship').line_ids.length, 1);
+  assert.equal(splits().filter((r) => r.kind === 'normal').length, 0);
+});
+
+test('one enabled product but the store does not ship to the atelier\'s country: it is STILL a Stitch&Ship order (tag, internal order, email), the shipment stays on hold, and the problem is shown, not hidden', async () => {
+  enabledMode(0);
+  enable(1);
   behave.addressRefused = 'Could not change the shipping address: Country/region not supported';
-  const result = await orders.processOrderCreate(STORE, noTick(10));
-  assert.equal(result.status, 'failed');
-  assert.equal(row().state, 'failed');
+  const result = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(result.status, 'processed');
+  assert.equal(result.warnings.length, 1);
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship'], 'tagged all the same');
+  assert.equal(db.table('orders').length, 1, 'the internal order exists');
+  assert.equal(calls.emails.length, 1);
+  assert.equal(calls.addressUpdates.length, 0);
+  assert.equal(calls.releases.length, 0, 'the address is not the atelier\'s: the shipment is not released');
+  assert.equal(row().hold_state, 'held');
   assert.match(row().last_error, /Country\/region not supported/);
   assert.match(row().last_error, /shipping zones/, 'the way to fix it is said');
-  assert.equal(calls.holds.length, 0, 'nothing was held or changed');
-  assert.equal(db.table('orders').length, 0);
+  assert.match(splitOf('stitchship').split_error, /shipping zones/);
   assert.ok(calls.admins.some((a) => /could not go to the Stitch&Ship address/.test(a.title)));
+  const queue = await orders.shopifyQueue();
+  assert.equal(queue[0].needs_attention, true, 'an administrator is shown it');
+  // the same delivery again changes nothing
+  const again = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(again.status, 'duplicate');
+  assert.equal(db.table('orders').length, 1);
+  assert.equal(calls.tags.length, 1);
+  // once the zone is added, Try again sets the address, lets the shipment go and clears the warning
   behave.addressRefused = null;
   const retry = await orders.retryShopifyOrder(row().id);
-  assert.equal(retry.status, 'processed');
+  assert.equal(retry.status, 'repaired');
   assert.equal(calls.addressUpdates.length, 1);
+  assert.equal(calls.releases.length, 1);
+  assert.equal(row().hold_state, 'released');
+  assert.equal(row().address_state, 'address_ok');
+  assert.equal(row().last_error, null);
+  assert.equal(splitOf('stitchship').split_error, null);
+  assert.equal(db.table('orders').length, 1, 'still one internal order');
+  assert.equal(calls.emails.length, 1, 'the customer is not emailed again');
+});
+
+test('if the tag cannot be set the failure is kept (the customer email must not wipe it), shown, and Try again tags the order', async () => {
+  enabledMode(0);
+  enable(1);
+  behave.tagFails = true;
+  const result = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(result.status, 'processed');
+  assert.match(row().last_error, /Could not tag the order/);
+  assert.match(splitOf('stitchship').split_error, /Could not tag the order/);
   assert.equal(db.table('orders').length, 1);
+  assert.ok(calls.admins.some((a) => /could not be tagged/.test(a.title)));
+  assert.equal((await orders.shopifyQueue())[0].needs_attention, true);
+  assert.ok(row().payload, 'the order copy is kept until everything is done');
+  behave.tagFails = false;
+  const retry = await orders.retryShopifyOrder(row().id);
+  assert.equal(retry.status, 'repaired');
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship']);
+  assert.equal(row().last_error, null);
+  assert.equal(splitOf('stitchship').split_error, null);
+  assert.equal(db.table('orders').length, 1);
+  const twice = await orders.retryShopifyOrder(row().id).catch(() => null);
+  assert.equal(db.table('orders').length, 1, 'nothing is made twice');
+  assert.ok(calls.tags.length <= 2, 'at most the same tag again, which Shopify treats as already there');
+  void twice;
+});
+
+test('one normal product (not enabled): not Stitch&Ship at all: no tag, no record', async () => {
+  enabledMode(0);
+  behave.enabled = [];
+  const result = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(result.status, 'ignored');
+  assert.equal(calls.tags.length + calls.tagNotes.length, 0);
+  assert.equal(db.table('shopify_orders').length, 0);
+});
+
+test('one enabled product with splitting switched off for the store: still recognised, tagged and an internal order made', async () => {
+  STORE.settings = {};
+  behave.financials = paidFinancials(130);
+  enable(1);
+  const result = await orders.processOrderCreate(STORE, oneProduct());
+  assert.equal(result.status, 'processed');
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship']);
+  assert.equal(db.table('orders').length, 1);
+  assert.equal(calls.addressUpdates.length, 0, 'the order\'s address is not touched while splitting is off');
+});
+
+test('a COD one-enabled-product order: still tagged and recorded, and it stays unpaid (nothing is marked paid)', async () => {
+  enabledMode(0);
+  enable(1);
+  behave.financials = () => ({ financial_status: 'pending', total_received: 0, total_refunded: 0, outstanding: 749.95, transactions_ok: true, refunds: [], transactions: [] });
+  await orders.processOrderCreate(STORE, oneProduct({ financial_status: 'pending' }));
+  assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship']);
+  assert.equal(order().payment_type, 'COD');
+  assert.equal(order().cod_payment_status, 'UNPAID');
+  assert.equal(order().cod_amount, 749.95);
 });
 
 test('a Shopify outage while setting the atelier address is retried, not turned into a failure', async () => {
