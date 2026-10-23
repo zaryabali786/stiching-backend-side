@@ -265,31 +265,32 @@ test('a store that has not approved write_payment_customizations is told what to
 
 // ───────────── the shipping method "Ship to Stitch & Ship" ─────────────
 
-const PK_PROFILES = (methods) => ({
-  data: {
-    deliveryProfiles: {
-      nodes: [
-        {
-          id: 'gid://shopify/DeliveryProfile/1',
-          default: true,
-          profileLocationGroups: [
-            {
-              locationGroup: { id: 'gid://shopify/DeliveryLocationGroup/9' },
-              locationGroupZones: {
-                nodes: [
-                  { zone: { id: 'gid://shopify/DeliveryZone/5', name: 'International', countries: [{ code: { countryCode: 'US', restOfWorld: false } }] }, methodDefinitions: { nodes: [] } },
-                  { zone: { id: 'gid://shopify/DeliveryZone/6', name: 'Pakistan', countries: [{ code: { countryCode: 'PK', restOfWorld: false } }] }, methodDefinitions: { nodes: methods } },
-                ],
-              },
-            },
-          ],
-        },
-      ],
+const ONE_PK_PROFILE = (methods) => ({
+  id: 'gid://shopify/DeliveryProfile/1',
+  name: 'General profile',
+  default: true,
+  profileLocationGroups: [
+    {
+      locationGroup: { id: 'gid://shopify/DeliveryLocationGroup/9' },
+      locationGroupZones: {
+        nodes: [
+          { zone: { id: 'gid://shopify/DeliveryZone/5', name: 'International', countries: [{ code: { countryCode: 'US', restOfWorld: false } }] }, methodDefinitions: { nodes: [] } },
+          { zone: { id: 'gid://shopify/DeliveryZone/6', name: 'Pakistan', countries: [{ code: { countryCode: 'PK', restOfWorld: false } }] }, methodDefinitions: { nodes: methods } },
+        ],
+      },
     },
-  },
+  ],
 });
 const rate = (name, amount, extra = {}) => ({ id: `gid://shopify/DeliveryMethodDefinition/${name}${amount}`, name, description: null, active: true, rateProvider: { __typename: 'DeliveryRateDefinition', price: { amount, currencyCode: 'PKR' } }, methodConditions: [], ...extra });
 const ATELIER_ROW = { shipToName: 'Stitch&Ship Atelier', shipToCompany: 'Atelier Co', shipToAddress: 'House 12 Street 4', shipToAddress2: 'Unit 4', shipToCity: 'Lahore', shipToState: 'Punjab', shipToZip: '54000', shipToCountry: 'Pakistan' };
+const UPDATED = { data: { deliveryProfileUpdate: { profile: { id: 'x' }, userErrors: [] } } };
+/** Shopify as the server asks it: the list of profiles, then each profile with its zones and rates, then the update. */
+const profilesAnswer = (nodes, update = UPDATED) => (b) => {
+  if (/deliveryProfiles\(/.test(b.query)) return { data: { deliveryProfiles: { nodes: nodes.map((n) => ({ id: n.id, name: n.name, default: n.default })) } } };
+  if (/deliveryProfile\(/.test(b.query)) return { data: { deliveryProfile: nodes.find((n) => n.id === b.variables.id) } };
+  return update;
+};
+const updatesOf = (asked) => asked.filter((a) => a.body.variables?.profile);
 
 test('the shipping method copies the Pakistan rates (cheapest named rate, all its steps), named and described with the atelier address', async () => {
   const weight = (op, value) => ({ field: 'TOTAL_WEIGHT', operator: op, conditionCriteria: { __typename: 'Weight', value, unit: 'KILOGRAMS' } });
@@ -299,11 +300,12 @@ test('the shipping method copies the Pakistan rates (cheapest named rate, all it
     rate('Standard', '400.0', { methodConditions: [weight('GREATER_THAN_OR_EQUAL_TO', 5.0001)] }),
     rate('Old', '50.0', { active: false }),
   ];
-  const answer = (b) => (/deliveryProfiles/.test(b.query) ? PK_PROFILES(methods) : { data: { deliveryProfileUpdate: { profile: { id: 'x' }, userErrors: [] } } });
-  await withShopify(answer, async (asked) => {
+  await withShopify(profilesAnswer([ONE_PK_PROFILE(methods)]), async (asked) => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
     assert.deepEqual(r, { ok: true, error: null, created: 2, updated: 0 });
-    const v = asked[1].body.variables;
+    // the profiles are read one at a time (a single big query is refused by Shopify for its cost)
+    assert.ok(/deliveryProfiles\(/.test(asked[0].body.query) && /deliveryProfile\(/.test(asked[1].body.query));
+    const v = updatesOf(asked)[0].body.variables;
     assert.equal(v.id, 'gid://shopify/DeliveryProfile/1');
     const group = v.profile.locationGroupsToUpdate[0];
     assert.equal(group.id, 'gid://shopify/DeliveryLocationGroup/9');
@@ -323,31 +325,32 @@ test('the shipping method copies the Pakistan rates (cheapest named rate, all it
 test('an existing method is not created again; only its description follows a new address; nothing to do when it is current', async () => {
   const desc = sh.shippingDescription(ATELIER_ROW);
   const old = rate('Ship to Stitch & Ship', '250.0', { description: 'old address' });
-  await withShopify((b) => (/deliveryProfiles/.test(b.query) ? PK_PROFILES([rate('Standard', '250.0'), old]) : { data: { deliveryProfileUpdate: { profile: { id: 'x' }, userErrors: [] } } }), async (asked) => {
+  await withShopify(profilesAnswer([ONE_PK_PROFILE([rate('Standard', '250.0'), old])]), async (asked) => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
     assert.deepEqual(r, { ok: true, error: null, created: 0, updated: 1 });
-    const zone = asked[1].body.variables.profile.locationGroupsToUpdate[0].zonesToUpdate[0];
+    const zone = updatesOf(asked)[0].body.variables.profile.locationGroupsToUpdate[0].zonesToUpdate[0];
     assert.equal(zone.methodDefinitionsToCreate, undefined);
     assert.deepEqual(zone.methodDefinitionsToUpdate, [{ id: old.id, description: desc }]);
   });
-  await withShopify(() => PK_PROFILES([rate('Standard', '250.0'), { ...old, description: desc }]), async (asked) => {
+  await withShopify(profilesAnswer([ONE_PK_PROFILE([rate('Standard', '250.0'), { ...old, description: desc }])]), async (asked) => {
     assert.deepEqual(await sh.ensureShippingMethod(aStore(), ATELIER_ROW), { ok: true, error: null, created: 0, updated: 0 });
-    assert.equal(asked.length, 1);
+    assert.equal(updatesOf(asked).length, 0);
   });
 });
 
 test('no Pakistan zone, no Pakistan rate, or a missing permission: a clear message and nothing is created', async () => {
-  await withShopify(() => ({ data: { deliveryProfiles: { nodes: [{ id: 'p', default: true, profileLocationGroups: [{ locationGroup: { id: 'g' }, locationGroupZones: { nodes: [{ zone: { id: 'z', name: 'US', countries: [{ code: { countryCode: 'US' } }] }, methodDefinitions: { nodes: [] } }] } }] }] } } }), async (asked) => {
+  const us = { id: 'p', name: 'General profile', default: true, profileLocationGroups: [{ locationGroup: { id: 'g' }, locationGroupZones: { nodes: [{ zone: { id: 'z', name: 'US', countries: [{ code: { countryCode: 'US', restOfWorld: false } }] }, methodDefinitions: { nodes: [] } }] } }] };
+  await withShopify(profilesAnswer([us]), async (asked) => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
     assert.equal(r.ok, false);
     assert.match(r.error, /Pakistan/);
-    assert.equal(asked.length, 1);
+    assert.equal(updatesOf(asked).length, 0);
   });
-  await withShopify(() => PK_PROFILES([rate('Off', '10.0', { active: false })]), async (asked) => {
+  await withShopify(profilesAnswer([ONE_PK_PROFILE([rate('Off', '10.0', { active: false })])]), async (asked) => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
     assert.equal(r.ok, false);
     assert.match(r.error, /no active rate/);
-    assert.equal(asked.length, 1);
+    assert.equal(updatesOf(asked).length, 0);
   });
   await withShopify(() => ({ errors: [{ message: 'Access denied for deliveryProfiles field. Required access: `read_shipping` access scope.' }] }), async () => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
@@ -367,19 +370,41 @@ test('Pakistan covered only by "Rest of world", or by another profile: the metho
     profile('p1', 'General profile', true, [zone('z1', 'Domestic', [us], [rate('Standard', '5.0')]), zone('z2', 'Rest of world', [world], [rate('Flat', '12.0')])]),
     profile('p2', 'Heavy goods', false, [zone('z3', 'Pakistan', [pk], [rate('Cargo', '30.0')])]),
   ];
-  await withShopify((b) => (/deliveryProfiles\(/.test(b.query) ? { data: { deliveryProfiles: { nodes } } } : { data: { deliveryProfileUpdate: { profile: { id: 'x' }, userErrors: [] } } }), async (asked) => {
+  await withShopify(profilesAnswer(nodes), async (asked) => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
     assert.deepEqual(r, { ok: true, error: null, created: 2, updated: 0 });
-    const updates = asked.filter((a) => a.body.variables?.profile);
+    const updates = updatesOf(asked);
     assert.deepEqual(updates.map((u) => [u.body.variables.id, u.body.variables.profile.locationGroupsToUpdate[0].zonesToUpdate[0].id]), [['p1', 'z2'], ['p2', 'z3']]);
     assert.deepEqual(updates.map((u) => u.body.variables.profile.locationGroupsToUpdate[0].zonesToUpdate[0].methodDefinitionsToCreate[0].rateDefinition.price.amount), ['12.0', '30.0']);
   });
   const onlyUs = [profile('p1', 'General profile', true, [zone('z1', 'Domestic', [us], [rate('Standard', '5.0')])])];
-  await withShopify(() => ({ data: { deliveryProfiles: { nodes: onlyUs } } }), async () => {
+  await withShopify(profilesAnswer(onlyUs), async () => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
     assert.equal(r.ok, false);
     assert.match(r.error, /General profile: Domestic \(US\)/);
   });
+});
+
+test('when Shopify says a profile query costs too much, the same profile is asked again for fewer zones and rates at a time', async () => {
+  const methods = [rate('Standard', '250.0')];
+  const answer = profilesAnswer([ONE_PK_PROFILE(methods)]);
+  const real = globalThis.fetch;
+  const sizes = [];
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (/deliveryProfile\(/.test(body.query)) {
+      sizes.push(/locationGroupZones\(first: (\d+)\)/.exec(body.query)[1]);
+      if (sizes.length < 3) return { ok: true, status: 200, json: async () => ({ errors: [{ message: 'Query cost is 1217, which exceeds the single query max cost limit (1000).' }] }) };
+    }
+    return { ok: true, status: 200, json: async () => answer(body) };
+  };
+  try {
+    const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
+    assert.equal(r.ok, true);
+    assert.deepEqual(sizes, ['25', '10', '4']);
+  } finally {
+    globalThis.fetch = real;
+  }
 });
 
 test('the delivery rule is created from the app function, switched on again when off, and left alone when on', async () => {

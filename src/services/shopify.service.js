@@ -300,10 +300,27 @@ export const shippingDescription = (atelier) => {
   return `This order includes a Stitch&Ship product, which needs to be delivered to our stitching atelier${address ? `: ${address}` : ''}. 2-5 working days.`.slice(0, 500);
 };
 
-const PROFILES_QUERY = `query { deliveryProfiles(first: 20) { nodes { id name default profileLocationGroups { locationGroup { id } locationGroupZones(first: 50) { nodes {
+// Shopify refuses a query whose cost is over 1000, so the profiles are read one at a time: first the list, then each profile with its zones and rates.
+const PROFILE_LIST_QUERY = `query { deliveryProfiles(first: 25) { nodes { id name default } } }`;
+const profileQuery = (zones, methods) => `query($id: ID!) { deliveryProfile(id: $id) { id name default profileLocationGroups { locationGroup { id } locationGroupZones(first: ${zones}) { nodes {
   zone { id name countries { code { countryCode restOfWorld } } }
-  methodDefinitions(first: 50) { nodes { id name description active rateProvider { __typename ... on DeliveryRateDefinition { price { amount currencyCode } } } methodConditions { field operator conditionCriteria { __typename ... on MoneyV2 { amount currencyCode } ... on Weight { value unit } } } } }
-} } } } } }`;
+  methodDefinitions(first: ${methods}) { nodes { id name description active rateProvider { __typename ... on DeliveryRateDefinition { price { amount currencyCode } } } methodConditions { field operator conditionCriteria { __typename ... on MoneyV2 { amount currencyCode } ... on Weight { value unit } } } } }
+} } } } }`;
+
+/** One profile with its zones and rates; asks for less (fewer zones and rates at once) when Shopify says the query costs too much. */
+const readProfile = async (store, id) => {
+  let last = null;
+  for (const [zones, methods] of [[25, 25], [10, 10], [4, 4]]) {
+    try {
+      const res = await shopifyGraphql(store, profileQuery(zones, methods), { id });
+      return res?.deliveryProfile || null;
+    } catch (err) {
+      if (!/max cost|exceeds the single query/i.test(err.message || '')) throw err;
+      last = err;
+    }
+  }
+  throw last;
+};
 
 const PROFILE_UPDATE = `mutation($id: ID!, $profile: DeliveryProfileInput!) { deliveryProfileUpdate(id: $id, profile: $profile) { profile { id } userErrors { field message } } }`;
 
@@ -370,8 +387,12 @@ const describeZones = (profiles) =>
  */
 export const ensureShippingMethod = async (store, atelier) => {
   try {
-    const found = await shopifyGraphql(store, PROFILES_QUERY);
-    const profiles = found?.deliveryProfiles?.nodes || [];
+    const list = await shopifyGraphql(store, PROFILE_LIST_QUERY);
+    const profiles = [];
+    for (const p of list?.deliveryProfiles?.nodes || []) {
+      const full = await readProfile(store, p.id);
+      if (full) profiles.push(full);
+    }
     if (!profiles.length) return { ok: false, error: 'The store has no shipping profile.' };
     const description = shippingDescription(atelier);
     const results = [];
