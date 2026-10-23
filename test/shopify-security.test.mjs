@@ -304,7 +304,8 @@ test('the shipping method copies the Pakistan rates (cheapest named rate, all it
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
     assert.deepEqual(r, { ok: true, error: null, created: 2, updated: 0 });
     // the profiles are read one at a time (a single big query is refused by Shopify for its cost)
-    assert.ok(/deliveryProfiles\(/.test(asked[0].body.query) && /deliveryProfile\(/.test(asked[1].body.query));
+    const kinds = asked.map((a) => (/markets\(/.test(a.body.query) ? 'markets' : /deliveryProfiles\(/.test(a.body.query) ? 'list' : /deliveryProfile\(/.test(a.body.query) ? 'profile' : 'update'));
+    assert.deepEqual(kinds, ['markets', 'list', 'profile', 'update']);
     const v = updatesOf(asked)[0].body.variables;
     assert.equal(v.id, 'gid://shopify/DeliveryProfile/1');
     const group = v.profile.locationGroupsToUpdate[0];
@@ -405,6 +406,59 @@ test('when Shopify says a profile query costs too much, the same profile is aske
   } finally {
     globalThis.fetch = real;
   }
+});
+
+const marketsAnswer = ({ markets, detail, update = { data: { marketUpdate: { market: { id: 'm' }, userErrors: [] } } } }) => (b) => {
+  if (/markets\(/.test(b.query)) return { data: { markets: { nodes: markets } } };
+  if (/market\(id/.test(b.query)) return { data: { market: detail } };
+  if (/marketUpdate/.test(b.query)) return update;
+  return { data: {} };
+};
+const PK_MARKET = { id: 'gid://shopify/Market/7', name: 'pakistan', status: 'ACTIVE', conditions: { regionsCondition: { regions: { nodes: [{ code: 'PK' }] } } } };
+const flatOption = (name, amount, extra = {}) => ({ __typename: 'DeliveryFlatRateOptionDefinition', id: `gid://shopify/DeliveryFlatRateOptionDefinition/${name}`, currency: 'PKR', isActive: true, freeDeliveryMinimumValue: null, name, description: null, rateGroups: { nodes: [{ rate: { price: { amount, currencyCode: 'PKR' }, transitTimeMinSeconds: null, transitTimeMaxSeconds: null } }] }, ...extra });
+const marketDetail = (options, shipping = {}) => ({ id: PK_MARKET.id, name: 'pakistan', delivery: { shipping: { isEnabled: true, optionDefinitions: { nodes: options }, ...shipping } } });
+
+test('market-driven shipping: the method is added to the Pakistan market as a copy of its flat-rate option, 2-5 days, with the atelier address', async () => {
+  const detail = marketDetail([flatOption('flat shipping', '300.0', { freeDeliveryMinimumValue: { amount: '5000.0', currencyCode: 'PKR' } }), flatOption('Pricey', '900.0')]);
+  await withShopify(marketsAnswer({ markets: [{ id: 'gid://shopify/Market/1', name: 'Canada', status: 'ACTIVE', conditions: { regionsCondition: { regions: { nodes: [{ code: 'CA' }] } } } }, PK_MARKET], detail }), async (asked) => {
+    const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
+    assert.deepEqual(r, { ok: true, error: null, created: 1, updated: 0 });
+    const upd = asked.find((a) => /marketUpdate/.test(a.body.query)).body.variables;
+    assert.equal(upd.id, PK_MARKET.id);
+    const flat = upd.input.delivery.shipping.optionDefinitionsToCreate[0].flatRate;
+    assert.equal(flat.name, 'Ship to Stitch & Ship');
+    assert.equal(flat.currency, 'PKR');
+    assert.deepEqual(flat.freeDeliveryMinimumValue, { amount: '5000.0', currencyCode: 'PKR' });
+    assert.deepEqual(flat.rateGroups, [{ rate: { price: { amount: '300.0', currencyCode: 'PKR' }, transitTimeMinSeconds: 172800, transitTimeMaxSeconds: 432000 } }]);
+    assert.match(flat.description, /includes a Stitch&Ship product/);
+    assert.match(flat.description, /House 12 Street 4, Unit 4, Lahore/);
+    assert.ok(!asked.some((a) => /deliveryProfiles\(/.test(a.body.query)), 'the profile way is not needed');
+  });
+});
+
+test('market-driven shipping: an existing method only gets its description refreshed; a market with nothing to copy says so; no Pakistan market falls back to profiles', async () => {
+  const desc = sh.shippingDescription(ATELIER_ROW);
+  const old = flatOption('Ship to Stitch & Ship', '300.0', { description: 'old address' });
+  await withShopify(marketsAnswer({ markets: [PK_MARKET], detail: marketDetail([flatOption('flat shipping', '300.0'), old]) }), async (asked) => {
+    assert.deepEqual(await sh.ensureShippingMethod(aStore(), ATELIER_ROW), { ok: true, error: null, created: 0, updated: 1 });
+    const input = asked.find((a) => /marketUpdate/.test(a.body.query)).body.variables.input.delivery.shipping;
+    assert.deepEqual(input.optionDefinitionsToUpdate, [{ flatRate: { id: old.id, description: desc } }]);
+  });
+  await withShopify(marketsAnswer({ markets: [PK_MARKET], detail: marketDetail([{ ...flatOption('Weighty', '1.0'), __typename: 'DeliveryWeightBasedOptionDefinition' }]) }), async () => {
+    const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
+    assert.equal(r.ok, false);
+    assert.match(r.error, /no active flat-rate shipping option/);
+  });
+  await withShopify(marketsAnswer({ markets: [PK_MARKET], detail: { id: PK_MARKET.id, name: 'pakistan', delivery: { shipping: null } } }), async () => {
+    const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
+    assert.equal(r.ok, false);
+    assert.match(r.error, /takes its shipping from its parent/);
+  });
+  await withShopify(profilesAnswer([ONE_PK_PROFILE([rate('Standard', '250.0')])]), async (asked) => {
+    const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
+    assert.equal(r.ok, true, 'no market answers: the profiles are used');
+    assert.equal(updatesOf(asked).length, 1);
+  });
 });
 
 test('the delivery rule is created from the app function, switched on again when off, and left alone when on', async () => {

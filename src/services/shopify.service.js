@@ -379,13 +379,10 @@ const describeZones = (profiles) =>
     .join(' | ');
 
 /**
- * Create the method "Ship to Stitch & Ship" where the store ships to Pakistan, with the same rates and rules as the Pakistan market. Shipping
- * rates live in shipping PROFILES (Settings > Shipping and delivery), in zones; a Market does not carry rates. In every profile (a product ships
- * with the rates of its own profile) the zone that holds Pakistan is used, else the "Rest of world" zone, which is what covers Pakistan then.
- * Needs the write_shipping permission.
- * @returns {Promise<{ ok: boolean, error: string|null, created?: number, updated?: number }>}
+ * The older way a store keeps its shipping: shipping PROFILES with zones (Settings > Shipping and delivery). In every profile the zone that
+ * holds Pakistan is used, else the "Rest of world" zone, which is what covers Pakistan then. Needs the write_shipping permission.
  */
-export const ensureShippingMethod = async (store, atelier) => {
+const ensureShippingViaProfiles = async (store, description) => {
   try {
     const list = await shopifyGraphql(store, PROFILE_LIST_QUERY);
     const profiles = [];
@@ -394,7 +391,6 @@ export const ensureShippingMethod = async (store, atelier) => {
       if (full) profiles.push(full);
     }
     if (!profiles.length) return { ok: false, error: 'The store has no shipping profile.' };
-    const description = shippingDescription(atelier);
     const results = [];
     for (const profile of profiles) {
       let pk = null;
@@ -417,6 +413,94 @@ export const ensureShippingMethod = async (store, atelier) => {
     const denied = /access denied|shipping|scope|permission/i.test(err.message || '');
     return { ok: false, error: denied ? 'Needs the write_shipping permission: the brand must open the install link again and approve it.' : err.message };
   }
+};
+
+// ───── market-driven shipping: the shipping options live in the Markets of the store (Settings > Markets) ─────
+
+const MARKETS_QUERY = `query { markets(first: 50) { nodes { id name status conditions { regionsCondition { regions(first: 25) { nodes { ... on MarketRegionCountry { code } } } } } } } }`;
+const MARKET_SHIPPING_QUERY = `query($id: ID!) { market(id: $id) { id name delivery { shipping { isEnabled optionDefinitions(first: 25) { nodes { __typename id currency isActive freeDeliveryMinimumValue { amount currencyCode }
+  ... on DeliveryFlatRateOptionDefinition { name description rateGroups(first: 10) { nodes { rate { price { amount currencyCode } transitTimeMinSeconds transitTimeMaxSeconds } } } } } } } } } }`;
+const MARKET_UPDATE = `mutation($id: ID!, $input: MarketUpdateInput!) { marketUpdate(id: $id, input: $input) { market { id } userErrors { field message } } }`;
+const TRANSIT_MIN_SECONDS = 2 * 24 * 3600; // 2-5 working days
+const TRANSIT_MAX_SECONDS = 5 * 24 * 3600;
+
+/** Add the method to one market, a copy of its cheapest active flat-rate option (price, free-delivery threshold), or refresh its description. */
+const addMethodToMarket = async (store, market, description) => {
+  const shipping = market.delivery?.shipping;
+  if (!shipping) return { ok: false, error: `The market "${market.name}" takes its shipping from its parent market. Add a shipping option to the "${market.name}" market itself, then try again.` };
+  if (shipping.isEnabled === false) return { ok: false, error: `Shipping is switched off for the market "${market.name}".` };
+  const options = shipping.optionDefinitions?.nodes || [];
+  const ours = options.filter((o) => o.name === SHIP_METHOD_NAME);
+  let shippingInput;
+  if (ours.length) {
+    const stale = ours.filter((o) => o.description !== description);
+    if (!stale.length) return { ok: true, error: null, created: 0, updated: 0 };
+    shippingInput = { optionDefinitionsToUpdate: stale.map((o) => ({ flatRate: { id: o.id, description } })) };
+  } else {
+    const flat = options.filter((o) => o.__typename === 'DeliveryFlatRateOptionDefinition' && o.isActive && (o.rateGroups?.nodes || []).length);
+    if (!flat.length) return { ok: false, error: `The market "${market.name}" has no active flat-rate shipping option to copy (weight and order-value options cannot be copied automatically).` };
+    const low = (o) => Math.min(...o.rateGroups.nodes.map((g) => Number(g.rate.price.amount)));
+    const src = flat.reduce((a, c) => (low(c) < low(a) ? c : a));
+    shippingInput = {
+      optionDefinitionsToCreate: [
+        {
+          flatRate: {
+            name: SHIP_METHOD_NAME,
+            description,
+            currency: src.currency,
+            isActive: true,
+            ...(src.freeDeliveryMinimumValue ? { freeDeliveryMinimumValue: { amount: src.freeDeliveryMinimumValue.amount, currencyCode: src.freeDeliveryMinimumValue.currencyCode } } : {}),
+            rateGroups: src.rateGroups.nodes.map((g) => ({ rate: { price: { amount: g.rate.price.amount, currencyCode: g.rate.price.currencyCode }, transitTimeMinSeconds: TRANSIT_MIN_SECONDS, transitTimeMaxSeconds: TRANSIT_MAX_SECONDS } })),
+          },
+        },
+      ],
+    };
+  }
+  const res = await shopifyGraphql(store, MARKET_UPDATE, { id: market.id, input: { delivery: { shipping: shippingInput } } });
+  const errs = res?.marketUpdate?.userErrors || [];
+  if (errs.length) return { ok: false, error: errs.map((e) => e.message).join('; ') };
+  return { ok: true, error: null, created: shippingInput.optionDefinitionsToCreate?.length || 0, updated: shippingInput.optionDefinitionsToUpdate?.length || 0 };
+};
+
+/**
+ * A store on market-driven shipping keeps its shipping options in Markets (the profile API no longer shows them). The market that covers
+ * Pakistan (a country region of PK, or a market named Pakistan) gets the method. `handled` is false when there is no such market (or Markets
+ * cannot be read), so the profile way is tried next; `note` says why.
+ */
+const ensureShippingViaMarkets = async (store, description) => {
+  try {
+    const list = await shopifyGraphql(store, MARKETS_QUERY);
+    const markets = list?.markets?.nodes || [];
+    const covers = (m) => (m.conditions?.regionsCondition?.regions?.nodes || []).some((r) => r.code === 'PK') || /pakistan/i.test(m.name || '');
+    const pk = markets.filter((m) => covers(m) && m.status !== 'DRAFT');
+    if (!pk.length) return { handled: false, note: 'No market of the store covers Pakistan.' };
+    const results = [];
+    for (const m of pk) {
+      const detail = await shopifyGraphql(store, MARKET_SHIPPING_QUERY, { id: m.id });
+      if (detail?.market) results.push(await addMethodToMarket(store, detail.market, description));
+    }
+    if (!results.length) return { handled: false, note: 'The Pakistan market could not be read.' };
+    const done = results.filter((r) => r.ok);
+    if (done.length) return { handled: true, res: { ok: true, error: null, created: done.reduce((n, r) => n + (r.created || 0), 0), updated: done.reduce((n, r) => n + (r.updated || 0), 0) } };
+    return { handled: true, res: { ok: false, error: results.map((r) => r.error).join(' ').slice(0, 700) } };
+  } catch (err) {
+    const denied = /access denied|markets|scope|permission/i.test(err.message || '');
+    return { handled: false, note: denied ? 'Needs the write_markets permission: the brand must open the install link again and approve it.' : `Markets: ${err.message}` };
+  }
+};
+
+/**
+ * Create the method "Ship to Stitch & Ship" where the store ships to Pakistan, with the same rates and rules as the Pakistan market: in the
+ * Pakistan market when the store uses market-driven shipping, else in its shipping profiles. Its description carries the atelier address.
+ * @returns {Promise<{ ok: boolean, error: string|null, created?: number, updated?: number }>}
+ */
+export const ensureShippingMethod = async (store, atelier) => {
+  const description = shippingDescription(atelier);
+  const viaMarkets = await ensureShippingViaMarkets(store, description);
+  if (viaMarkets.handled) return viaMarkets.res;
+  const viaProfiles = await ensureShippingViaProfiles(store, description);
+  if (viaProfiles.ok) return viaProfiles;
+  return { ok: false, error: `${viaMarkets.note} ${viaProfiles.error}`.slice(0, 900) };
 };
 
 /**
