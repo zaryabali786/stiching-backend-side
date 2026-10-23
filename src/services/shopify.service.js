@@ -118,6 +118,7 @@ export const completeInstall = async ({ shop, code }) => {
   await connectWebhooks(store);
   await connectProductMetafield(store);
   await connectPaymentRule(store);
+  await connectShipping(store);
   return store;
 };
 
@@ -224,7 +225,11 @@ export const syncAtelierEverywhere = async () => {
   const atelier = await loadShipTo();
   const { data: stores } = await supabaseAdmin.from('shopify_stores').select('*').eq('status', 'active');
   const results = [];
-  for (const store of stores || []) results.push({ shop: store.shop_domain, ...(await syncAtelierMetafield(store, atelier)) });
+  for (const store of stores || []) {
+    results.push({ shop: store.shop_domain, ...(await syncAtelierMetafield(store, atelier)) });
+    // the shipping method's description carries the address: an existing method follows the new address (it is never created here)
+    if (store.settings?.shipping?.method?.ok) await ensureShippingMethod(store, atelier).catch(() => undefined);
+  }
   return results;
 };
 
@@ -280,6 +285,126 @@ export const connectPaymentRule = async (store) => {
   store.settings = settings;
   if (!result.ok) console.warn(`[Shopify] the payment rule of ${store.shop_domain} could not be switched on:`, result.error);
   return settings.payment_rule;
+};
+
+// ───────────── the shipping method "Ship to Stitch & Ship" ─────────────
+
+export const SHIP_METHOD_NAME = 'Ship to Stitch & Ship';
+const DELIVERY_RULE_TITLE = 'Stitch&Ship: only the Stitch&Ship shipping method';
+const DELIVERY_FUNCTION_HANDLE = 'stitchship-delivery';
+
+/** The text under the method at the checkout: why it is the only choice, where the parcel goes, and how long it takes. */
+export const shippingDescription = (atelier) => {
+  const place = [atelier?.shipToCity, atelier?.shipToState, atelier?.shipToZip].filter(Boolean).join(', ');
+  const address = [atelier?.shipToName, atelier?.shipToCompany, atelier?.shipToAddress, atelier?.shipToAddress2, place, atelier?.shipToCountry].filter(Boolean).join(', ');
+  return `This order includes a Stitch&Ship product, which needs to be delivered to our stitching atelier${address ? `: ${address}` : ''}. 2-5 working days.`.slice(0, 500);
+};
+
+const PROFILES_QUERY = `query { deliveryProfiles(first: 10) { nodes { id default profileLocationGroups { locationGroup { id } locationGroupZones(first: 50) { nodes {
+  zone { id name countries { code { countryCode restOfWorld } } }
+  methodDefinitions(first: 50) { nodes { id name description active rateProvider { __typename ... on DeliveryRateDefinition { price { amount currencyCode } } } methodConditions { field operator conditionCriteria { __typename ... on MoneyV2 { amount currencyCode } ... on Weight { value unit } } } } }
+} } } } } }`;
+
+const PROFILE_UPDATE = `mutation($id: ID!, $profile: DeliveryProfileInput!) { deliveryProfileUpdate(id: $id, profile: $profile) { profile { id } userErrors { field message } } }`;
+
+/** One rate of the Pakistan zone as the input for a new method (same price, same price / weight conditions). */
+const copyOfRate = (m, description) => {
+  const priceConditions = [];
+  const weightConditions = [];
+  for (const c of m.methodConditions || []) {
+    const crit = c.conditionCriteria || {};
+    if (c.field === 'TOTAL_PRICE' && crit.amount != null) priceConditions.push({ operator: c.operator, criteria: { amount: crit.amount, currencyCode: crit.currencyCode } });
+    if (c.field === 'TOTAL_WEIGHT' && crit.value != null) weightConditions.push({ operator: c.operator, criteria: { value: crit.value, unit: crit.unit } });
+  }
+  return {
+    name: SHIP_METHOD_NAME,
+    description,
+    active: true,
+    rateDefinition: { price: { amount: m.rateProvider.price.amount, currencyCode: m.rateProvider.price.currencyCode } },
+    ...(priceConditions.length ? { priceConditionsToCreate: priceConditions } : {}),
+    ...(weightConditions.length ? { weightConditionsToCreate: weightConditions } : {}),
+  };
+};
+
+/**
+ * Create the method "Ship to Stitch & Ship" in the store's Pakistan zone, with the same rates and rules as the Pakistan market: the store's own
+ * Pakistan rates are copied (the cheapest named rate, with all its price / weight steps), so nothing is invented. Already there: its description
+ * (the atelier address) is brought up to date. Needs the write_shipping permission.
+ * @returns {Promise<{ ok: boolean, error: string|null, created?: number, updated?: number }>}
+ */
+export const ensureShippingMethod = async (store, atelier) => {
+  try {
+    const found = await shopifyGraphql(store, PROFILES_QUERY);
+    const profile = (found?.deliveryProfiles?.nodes || []).find((p) => p.default) || found?.deliveryProfiles?.nodes?.[0];
+    if (!profile) return { ok: false, error: 'The store has no shipping profile.' };
+    let target = null;
+    for (const group of profile.profileLocationGroups || []) {
+      for (const z of group.locationGroupZones?.nodes || []) {
+        if ((z.zone?.countries || []).some((c) => c.code?.countryCode === 'PK')) target = target || { groupId: group.locationGroup.id, zone: z };
+      }
+    }
+    if (!target) return { ok: false, error: 'The store has no shipping zone for Pakistan yet. Add Pakistan in Settings > Shipping and delivery, then try again.' };
+    const description = shippingDescription(atelier);
+    const methods = (target.zone.methodDefinitions?.nodes || []).filter((m) => m.rateProvider?.__typename === 'DeliveryRateDefinition');
+    const ours = methods.filter((m) => m.name === SHIP_METHOD_NAME);
+    const zoneInput = { id: target.zone.zone.id };
+    if (ours.length) {
+      const stale = ours.filter((m) => m.description !== description);
+      if (!stale.length) return { ok: true, error: null, created: 0, updated: 0 };
+      zoneInput.methodDefinitionsToUpdate = stale.map((m) => ({ id: m.id, description }));
+    } else {
+      const own = methods.filter((m) => m.active);
+      if (!own.length) return { ok: false, error: 'The Pakistan zone has no active rate to copy. Add a Pakistan shipping rate first, then try again.' };
+      const price = (m) => Number(m.rateProvider.price.amount);
+      const cheapest = own.reduce((a, b) => (price(b) < price(a) ? b : a));
+      zoneInput.methodDefinitionsToCreate = own.filter((m) => m.name === cheapest.name).map((m) => copyOfRate(m, description));
+    }
+    const res = await shopifyGraphql(store, PROFILE_UPDATE, { id: profile.id, profile: { locationGroupsToUpdate: [{ id: target.groupId, zonesToUpdate: [zoneInput] }] } });
+    const errs = res?.deliveryProfileUpdate?.userErrors || [];
+    if (errs.length) return { ok: false, error: errs.map((e) => e.message).join('; ') };
+    return { ok: true, error: null, created: zoneInput.methodDefinitionsToCreate?.length || 0, updated: zoneInput.methodDefinitionsToUpdate?.length || 0 };
+  } catch (err) {
+    const denied = /access denied|shipping|scope|permission/i.test(err.message || '');
+    return { ok: false, error: denied ? 'Needs the write_shipping permission: the brand must open the install link again and approve it.' : err.message };
+  }
+};
+
+/**
+ * Switch on the app's delivery customization (extensions/stitchship-delivery): in a Stitch&Ship cart only the "Ship to Stitch & Ship" method is
+ * offered, in any other cart that method is hidden. Shopify runs it on a development store or Shopify Plus; on other plans it is created but idle.
+ */
+export const ensureDeliveryRule = async (store) => {
+  try {
+    const found = await shopifyGraphql(store, 'query { deliveryCustomizations(first: 50) { nodes { id title enabled } } }');
+    const rule = (found?.deliveryCustomizations?.nodes || []).find((n) => n.title === DELIVERY_RULE_TITLE);
+    if (rule) {
+      if (rule.enabled) return { ok: true, error: null };
+      const res = await shopifyGraphql(store, 'mutation($ids: [ID!]!) { deliveryCustomizationActivation(ids: $ids, enabled: true) { userErrors { message } } }', { ids: [rule.id] });
+      const errs = res?.deliveryCustomizationActivation?.userErrors || [];
+      return errs.length ? { ok: false, error: errs.map((e) => e.message).join('; ') } : { ok: true, error: null };
+    }
+    const res = await shopifyGraphql(store, 'mutation($input: DeliveryCustomizationInput!) { deliveryCustomizationCreate(deliveryCustomization: $input) { deliveryCustomization { id } userErrors { message } } }', {
+      input: { title: DELIVERY_RULE_TITLE, enabled: true, functionHandle: DELIVERY_FUNCTION_HANDLE },
+    });
+    const errs = res?.deliveryCustomizationCreate?.userErrors || [];
+    return errs.length ? { ok: false, error: errs.map((e) => e.message).join('; ') } : { ok: true, error: null };
+  } catch (err) {
+    const denied = /access denied|delivery_customizations|scope|permission/i.test(err.message || '');
+    return { ok: false, error: denied ? 'Needs the write_delivery_customizations permission: the brand must open the install link again and approve it.' : err.message };
+  }
+};
+
+/** Creates the shipping method and switches on the delivery rule; writes the result on the store (settings.shipping). Never throws. */
+export const connectShipping = async (store) => {
+  const atelier = await loadShipTo().catch(() => null);
+  const method = await ensureShippingMethod(store, atelier);
+  const rule = await ensureDeliveryRule(store);
+  const settings = { ...(store.settings || {}), shipping: { method, rule, at: new Date().toISOString() } };
+  await supabaseAdmin.from('shopify_stores').update({ settings, updated_at: new Date().toISOString() }).eq('id', store.id);
+  store.settings = settings;
+  if (!method.ok) console.warn(`[Shopify] the shipping method of ${store.shop_domain} could not be created:`, method.error);
+  if (!rule.ok) console.warn(`[Shopify] the delivery rule of ${store.shop_domain} could not be switched on:`, rule.error);
+  return settings.shipping;
 };
 
 export const getActiveStore = async (shopDomain) => {

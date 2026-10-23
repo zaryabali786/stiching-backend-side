@@ -219,7 +219,8 @@ test('a correct order: shipment held then released, customer found or made, draf
 
   assert.equal(calls.emails.length, 1);
   assert.equal(calls.emails[0].to, 'ali@example.com');
-  assert.match(calls.emails[0].text, /Add your sizes/);
+  assert.match(calls.emails[0].text, /is confirmed/);
+  assert.match(calls.emails[0].text, /Here is what you ordered/);
   assert.match(calls.emails[0].text, /sign-in\?email=ali%40example\.com&token=[0-9a-f]{48}&next=%2Fapp%2Forders%2F/);
   assert.equal(db.table('login_codes').length, 1, 'one link token was issued');
 

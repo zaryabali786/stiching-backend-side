@@ -266,6 +266,23 @@ const signInLink = async (email, orderId) => {
   }
 };
 
+/** The products of the order for the email: one row per product (pieces of the same product and price counted together). Never throws. */
+const emailItems = async (orderId) => {
+  try {
+    const { data } = await supabaseAdmin.from('order_units').select('unit_title, quantity, unit_price, product_image_url, line_no').eq('order_id', orderId).order('line_no', { ascending: true });
+    const rows = [];
+    for (const u of data || []) {
+      const price = Number(u.unit_price) || 0;
+      const hit = rows.find((r) => r.title === u.unit_title && r.price === price);
+      if (hit) hit.quantity += Number(u.quantity) || 1;
+      else rows.push({ title: u.unit_title || 'Item', quantity: Number(u.quantity) || 1, price, image_url: u.product_image_url || null });
+    }
+    return rows;
+  } catch {
+    return [];
+  }
+};
+
 /**
  * The messages that bring the customer to the portal: an email (add sizes, or confirm a changed address) and, when the store has
  * switched it on and the customer's own number is known, a text with the same link. One link is made for both.
@@ -285,11 +302,15 @@ export const sendCustomerEmail = async ({ row, order, email, mismatch, store = n
         footer: `Sign in with this email address: ${email}`,
       })
     : renderEmail({
-        heading: subject,
+        heading: `Your order ${name} is confirmed`,
+        brand: order.brand,
         paragraphs: [
-          'We received your order for customised stitching.',
+          'We received your order for customised stitching. Here is what you ordered:',
           'Please add your sizes and choices so we can start as soon as your parcel arrives. It takes about 3 minutes.',
         ],
+        items: await emailItems(order.id),
+        currency: order.brand_order_currency || '',
+        total: order.brand_order_total,
         button: { label: 'Add my sizes', url },
         footer: `Sign in with this email address: ${email}`,
       });
