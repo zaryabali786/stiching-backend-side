@@ -162,6 +162,17 @@ export const createShopifyTickBox = catchAsync(async (req, res) => {
   return ApiResponse.success(res, status, status.ok ? 'The tick box is ready on the products of the store.' : status.error);
 });
 
+/** POST /api/admin/shopify/stores/:id/shipping — create the "Ship to Stitch & Ship" method and switch on the payment and delivery rules (again, after the brand approved the new permissions). */
+export const setupShopifyShipping = catchAsync(async (req, res) => {
+  const { data: store } = await supabaseAdmin.from('shopify_stores').select('*').eq('id', req.params.id).maybeSingle();
+  if (!store) throw new NotFoundError('Store not found');
+  if (store.status !== 'active' || !store.access_token_enc) throw new ConflictError('The store has not installed the app yet.');
+  await connectPaymentRule(store);
+  const shipping = await connectShipping(store);
+  const problem = !shipping.method.ok ? shipping.method.error : !shipping.rule.ok ? shipping.rule.error : null;
+  return ApiResponse.success(res, { ok: !problem, error: problem, shipping }, problem || 'The shipping method is set up.');
+});
+
 /** GET /api/admin/shopify/queue — failed orders, held addresses, customers who were not emailed. */
 export const getShopifyQueue = catchAsync(async (req, res) => ApiResponse.success(res, await shopifyQueue()));
 

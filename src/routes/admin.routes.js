@@ -1,4 +1,4 @@
-import { addShopifyStore, createShopifyTickBox, getShopifyQueue, importShopifyOrderRequest, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, reconnectShopifyWebhooks, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
+import { addShopifyStore, createShopifyTickBox, setupShopifyShipping, getShopifyQueue, importShopifyOrderRequest, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, reconnectShopifyWebhooks, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
 import { checkStaffCodPayment, getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
@@ -101,6 +101,7 @@ router.post('/shopify/stores', addShopifyStore);
 router.patch('/shopify/stores/:id', updateShopifyStore);
 router.post('/shopify/stores/:id/webhooks', reconnectShopifyWebhooks);
 router.post('/shopify/stores/:id/tick-box', createShopifyTickBox);
+router.post('/shopify/stores/:id/shipping', setupShopifyShipping);
 router.post('/shopify/stores/:id/import', importShopifyOrderRequest);
 router.get('/shopify/queue', getShopifyQueue);
 
