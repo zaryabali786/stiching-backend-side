@@ -36,7 +36,7 @@ export const getAtelierAddress = catchAsync(async (req, res) => {
   const a = await loadShipTo();
   res.set('Cache-Control', 'public, max-age=300');
   const v = shipToView(a);
-  return ApiResponse.success(res, { name: v.name, address: v.address, city: v.city, phone: v.phone, country: v.country || atelierCountryName(a), countryCode: v.country_code || 'PK', state: v.state, provinceCode: v.province_code, zip: v.zip });
+  return ApiResponse.success(res, { name: v.name, company: v.company, address: v.address, address2: v.address2, city: v.city, phone: v.phone, country: v.country || atelierCountryName(a), countryCode: v.country_code || 'PK', state: v.state, provinceCode: v.province_code, zip: v.zip });
 });
 
 /**

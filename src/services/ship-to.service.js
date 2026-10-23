@@ -5,7 +5,7 @@ import { config } from '../config/env.js';
  * The central receiving address customers ship parcels to (until the admin assigns an order to a partner).
  * The admin edits it in Settings > Ship-to address (platform_settings 'ship_to'); the SHIP_TO_* environment values are only the fallback.
  */
-const KEYS = ['shipToName', 'shipToAddress', 'shipToCity', 'shipToPhone', 'shipToCountry', 'shipToCountryCode', 'shipToState', 'shipToProvinceCode', 'shipToZip'];
+const KEYS = ['shipToName', 'shipToCompany', 'shipToAddress', 'shipToAddress2', 'shipToCity', 'shipToPhone', 'shipToCountry', 'shipToCountryCode', 'shipToState', 'shipToProvinceCode', 'shipToZip'];
 const clean = (v, max) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 const unset = (v) => !v || v.startsWith('[');
 
@@ -20,7 +20,9 @@ export const loadShipTo = async () => {
 export const saveShipTo = async (body, userId) => {
   const value = {
     shipToName: clean(body.name, 120),
+    shipToCompany: clean(body.company, 120),
     shipToAddress: clean(body.address, 300),
+    shipToAddress2: clean(body.address2, 200),
     shipToCity: clean(body.city, 80),
     shipToPhone: clean(body.phone, 40),
     shipToCountry: clean(body.country, 80),
@@ -37,7 +39,9 @@ export const saveShipTo = async (body, userId) => {
 /** The address as the admin, the client app and the Shopify extension all see it (one shape). */
 export const shipToView = (a) => ({
   name: a.shipToName || '',
+  company: a.shipToCompany || '',
   address: a.shipToAddress || '',
+  address2: a.shipToAddress2 || '',
   city: a.shipToCity || '',
   phone: a.shipToPhone || '',
   country: a.shipToCountry || '',
@@ -56,8 +60,9 @@ export const atelierCountryName = (atelier) => atelier?.shipToCountry || (atelie
 
 /** The atelier as the fields of a Shopify mailing address (province and zip only when they are set). */
 export const atelierMailingAddress = (atelier, store, extra = {}) => ({
-  company: atelier.shipToName || 'Stitch&Ship Atelier',
+  company: atelier.shipToCompany || atelier.shipToName || 'Stitch&Ship Atelier',
   address1: atelier.shipToAddress,
+  ...(atelier.shipToAddress2 ? { address2: atelier.shipToAddress2 } : {}),
   city: atelier.shipToCity,
   countryCode: atelierCountryCode(atelier, store),
   ...(atelier.shipToProvinceCode ? { provinceCode: atelier.shipToProvinceCode } : {}),

@@ -14,7 +14,7 @@ let behave;
 const dbProxy = new Proxy({}, { get: (_, key) => db[key] });
 
 const STORE = { id: 'st1', shop_domain: 'my-brand.myshopify.com', status: 'active', brand_id: null, settings: {}, access_token_enc: 'x' };
-const ATELIER = { key: 'ship_to', value: { shipToName: 'Stitch&Ship Atelier', shipToAddress: 'House 12 Street 4 Gulberg', shipToCity: 'Lahore', shipToPhone: '042 111 2222' } };
+const ATELIER = { key: 'ship_to', value: { shipToName: 'Stitch&Ship Atelier', shipToAddress: 'House 12 Street 4 Gulberg', shipToAddress2: 'Unit 4, 2nd floor', shipToCity: 'Lahore', shipToPhone: '042 111 2222' } };
 
 before(async () => {
   process.env.LOGIN_CODE_SECRET = 'test-login-secret';
@@ -170,16 +170,16 @@ test('only orders with the stitching marker are ours; the reference code must lo
   assert.equal(orders.stitchingRef(shopifyOrder({ note_attributes: [{ name: 'stitchship', value: 'yes' }, { name: 'stitchship_ref', value: 'hello' }] })), null);
 });
 
-test('the address must be the atelier: street and city match and the reference code is still there', () => {
+test('the address must be the atelier: street and city match (the reference code is not part of the address)', () => {
   const atelier = { shipToAddress: 'House 12 Street 4 Gulberg', shipToCity: 'Lahore' };
   const ok = (shipping, ref = 'SS-AB12CD') => orders.addressMatchesAtelier({ shipping, atelier, ref });
   assert.equal(ok(atelierAddress()), true);
   assert.equal(ok(atelierAddress({ address1: 'house 12 street 4, gulberg' })), true, 'case and punctuation do not matter');
-  assert.equal(ok(atelierAddress({ address2: '' })), false, 'the reference code was removed');
+  assert.equal(ok(atelierAddress({ address2: '' })), true, 'the apartment line does not decide: the reference code travels as an order property');
   assert.equal(ok(atelierAddress({ city: 'Karachi' })), false);
   assert.equal(ok(atelierAddress({ address1: '5 Canal Road' })), false, 'the customer typed their own street');
   assert.equal(ok(null), false);
-  assert.equal(ok(atelierAddress({ address2: '' }), null), true, 'without a code (another entry path) the street and city decide');
+  assert.equal(ok(atelierAddress({ address2: '' }), null), true);
 });
 
 test('orders without the marker are ignored and nothing is stored', async () => {
@@ -276,7 +276,7 @@ test('when the customer confirms, the atelier address is put on the brand order 
     lastName: 'Khan',
     company: 'Stitch&Ship Atelier',
     address1: 'House 12 Street 4 Gulberg',
-    address2: 'SS-AB12CD',
+    address2: 'Unit 4, 2nd floor',
     city: 'Lahore',
     countryCode: 'PK',
     phone: '042 111 2222',
@@ -578,7 +578,7 @@ test('one product with Stitch&Ship ticked: one order, tagged, the whole order go
   assert.deepEqual(calls.tags.map((t) => t.tag), ['stitchship']);
   assert.equal(calls.addressUpdates.length, 1);
   assert.equal(calls.addressUpdates[0].address.address1, 'House 12 Street 4 Gulberg');
-  assert.match(calls.addressUpdates[0].address.address2, /^SS-AB12CD$/);
+  assert.equal(calls.addressUpdates[0].address.address2, 'Unit 4, 2nd floor');
   assert.equal(db.table('orders').length, 1);
   assert.equal(order().brand_order_total, 749.95);
   assert.equal(order().external_source, 'shopify');

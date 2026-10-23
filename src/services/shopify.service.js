@@ -208,7 +208,7 @@ export const syncAtelierMetafield = async (store, atelier) => {
       definition: { name: 'Stitch&Ship atelier address', namespace: '$app:stitchship', key: 'atelier', type: 'json', ownerType: 'SHOP', access: { admin: 'MERCHANT_READ', storefront: 'PUBLIC_READ' } },
     }).catch(() => undefined); // already there is fine
     const shop = await shopifyGraphql(store, 'query { shop { id } }');
-    const value = JSON.stringify({ name: atelier.shipToName || 'Stitch&Ship Atelier', address: atelier.shipToAddress || '', city: atelier.shipToCity || '', phone: atelier.shipToPhone || '', country: atelier.shipToCountry || '', countryCode: atelierCountryCode(atelier, store), state: atelier.shipToState || '', provinceCode: atelier.shipToProvinceCode || '', zip: atelier.shipToZip || '' });
+    const value = JSON.stringify({ name: atelier.shipToName || 'Stitch&Ship Atelier', company: atelier.shipToCompany || '', address: atelier.shipToAddress || '', address2: atelier.shipToAddress2 || '', city: atelier.shipToCity || '', phone: atelier.shipToPhone || '', country: atelier.shipToCountry || '', countryCode: atelierCountryCode(atelier, store), state: atelier.shipToState || '', provinceCode: atelier.shipToProvinceCode || '', zip: atelier.shipToZip || '' });
     const res = await shopifyGraphql(store, 'mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { message } } }', {
       m: [{ ownerId: shop.shop.id, namespace: '$app:stitchship', key: 'atelier', type: 'json', value }],
     });
