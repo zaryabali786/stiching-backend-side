@@ -117,6 +117,7 @@ export const completeInstall = async ({ shop, code }) => {
   if (error) throw error;
   await connectWebhooks(store);
   await connectProductMetafield(store);
+  await connectPaymentRule(store);
   return store;
 };
 
@@ -237,6 +238,48 @@ export const connectProductMetafield = async (store) => {
   store.settings = settings;
   if (!result.ok) console.warn(`[Shopify] the tick box of ${store.shop_domain} could not be created:`, result.error);
   return settings.tick_box;
+};
+
+// ───────────── the payment rule: no COD / bank transfer for a Stitch&Ship order ─────────────
+
+const RULE_TITLE = 'Stitch&Ship: online payment only';
+const RULE_FUNCTION_HANDLE = 'stitchship-payments';
+
+/**
+ * Switch on the app's payment customization (the function in extensions/stitchship-payments) in a store. Already there counts as done; one that
+ * was switched off is switched on again. Needs the write_payment_customizations permission (a store installed before it was asked for has to
+ * approve it), and Shopify only runs the function on a development store or Shopify Plus.
+ * @returns {Promise<{ ok: boolean, error: string|null }>}
+ */
+export const ensurePaymentRule = async (store) => {
+  try {
+    const found = await shopifyGraphql(store, 'query { paymentCustomizations(first: 50) { nodes { id title enabled } } }');
+    const rule = (found?.paymentCustomizations?.nodes || []).find((n) => n.title === RULE_TITLE);
+    if (rule) {
+      if (rule.enabled) return { ok: true, error: null };
+      const res = await shopifyGraphql(store, 'mutation($ids: [ID!]!) { paymentCustomizationActivation(ids: $ids, enabled: true) { userErrors { message } } }', { ids: [rule.id] });
+      const errs = res?.paymentCustomizationActivation?.userErrors || [];
+      return errs.length ? { ok: false, error: errs.map((e) => e.message).join('; ') } : { ok: true, error: null };
+    }
+    const res = await shopifyGraphql(store, 'mutation($input: PaymentCustomizationInput!) { paymentCustomizationCreate(paymentCustomization: $input) { paymentCustomization { id } userErrors { message } } }', {
+      input: { title: RULE_TITLE, enabled: true, functionHandle: RULE_FUNCTION_HANDLE },
+    });
+    const errs = res?.paymentCustomizationCreate?.userErrors || [];
+    return errs.length ? { ok: false, error: errs.map((e) => e.message).join('; ') } : { ok: true, error: null };
+  } catch (err) {
+    const denied = /access denied|payment_customizations|scope|permission/i.test(err.message || '');
+    return { ok: false, error: denied ? 'Needs the write_payment_customizations permission: the brand must open the install link again and approve it.' : err.message };
+  }
+};
+
+/** Switches the payment rule on and writes the result on the store (settings.payment_rule), so the admin page can show it. Never throws. */
+export const connectPaymentRule = async (store) => {
+  const result = await ensurePaymentRule(store);
+  const settings = { ...(store.settings || {}), payment_rule: { ok: result.ok, at: new Date().toISOString(), error: result.error } };
+  await supabaseAdmin.from('shopify_stores').update({ settings, updated_at: new Date().toISOString() }).eq('id', store.id);
+  store.settings = settings;
+  if (!result.ok) console.warn(`[Shopify] the payment rule of ${store.shop_domain} could not be switched on:`, result.error);
+  return settings.payment_rule;
 };
 
 export const getActiveStore = async (shopDomain) => {

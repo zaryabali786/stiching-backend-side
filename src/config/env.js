@@ -102,7 +102,7 @@ export const config = {
     apiVersion: (process.env.SHOPIFY_API_VERSION || '2026-07').trim(),
     // the public address of THIS server (Shopify redirects the brand back to <appUrl>/api/shopify/auth/callback)
     appUrl: (process.env.SHOPIFY_APP_URL || '').trim().replace(/\/$/, ''),
-    scopes: (process.env.SHOPIFY_SCOPES || 'read_orders,write_orders,read_products,write_products,read_customers,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders').trim(),
+    scopes: (process.env.SHOPIFY_SCOPES || 'read_orders,write_orders,read_products,write_products,read_customers,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,write_payment_customizations').trim(),
     // 32 bytes as base64 or 64 hex characters: encrypts the stores' access tokens in the database
     tokenKey: (process.env.SHOPIFY_TOKEN_KEY || '').trim(),
   },

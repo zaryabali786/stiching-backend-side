@@ -234,6 +234,35 @@ test('a store that has not approved write_products is told exactly what to do, a
   });
 });
 
+test('the payment rule (online payment only for a Stitch&Ship order) is switched on once, and again when it was switched off', async () => {
+  // not there yet: created from the app function, switched on
+  await withShopify((b) => (/paymentCustomizations/.test(b.query) ? { data: { paymentCustomizations: { nodes: [] } } } : { data: { paymentCustomizationCreate: { paymentCustomization: { id: 'gid://shopify/PaymentCustomization/1' }, userErrors: [] } } }), async (asked) => {
+    assert.deepEqual(await sh.ensurePaymentRule(aStore()), { ok: true, error: null });
+    const input = asked[1].body.variables.input;
+    assert.equal(input.functionHandle, 'stitchship-payments');
+    assert.equal(input.enabled, true);
+  });
+  // already there and on: nothing is created
+  await withShopify(() => ({ data: { paymentCustomizations: { nodes: [{ id: 'gid://shopify/PaymentCustomization/1', title: 'Stitch&Ship: online payment only', enabled: true }] } } }), async (asked) => {
+    assert.equal((await sh.ensurePaymentRule(aStore())).ok, true);
+    assert.equal(asked.length, 1);
+  });
+  // there but off: switched on again
+  await withShopify((b) => (/paymentCustomizations/.test(b.query) ? { data: { paymentCustomizations: { nodes: [{ id: 'gid://shopify/PaymentCustomization/1', title: 'Stitch&Ship: online payment only', enabled: false }] } } } : { data: { paymentCustomizationActivation: { userErrors: [] } } }), async (asked) => {
+    assert.equal((await sh.ensurePaymentRule(aStore())).ok, true);
+    assert.deepEqual(asked[1].body.variables, { ids: ['gid://shopify/PaymentCustomization/1'] });
+  });
+});
+
+test('a store that has not approved write_payment_customizations is told what to do, and nothing throws', async () => {
+  await withShopify(() => ({ errors: [{ message: 'Access denied for paymentCustomizations field. Required access: `read_payment_customizations` access scope.', extensions: { code: 'ACCESS_DENIED' } }] }), async () => {
+    const r = await sh.ensurePaymentRule(aStore());
+    assert.equal(r.ok, false);
+    assert.match(r.error, /write_payment_customizations/);
+    assert.match(r.error, /install link again/);
+  });
+});
+
 test('the store status records whether the tick box is ready', async () => {
   db = createFakeDb({ shopify_stores: [{ id: 'st1', shop_domain: 'my-brand.myshopify.com', settings: { webhooks: { ok: true } } }] });
   await withShopify(() => ({ data: { metafieldDefinitionCreate: { createdDefinition: { id: 'x' }, userErrors: [] } } }), async () => {

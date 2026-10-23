@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
-import { buildInstallUrl, completeInstall, connectProductMetafield, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
+import { buildInstallUrl, completeInstall, connectPaymentRule, connectProductMetafield, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
 import { confirmAtelierAddress, importShopifyOrder, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
 import { processWebhookEvent, recordWebhookEvent } from '../services/shopify-events.service.js';
 import { atelierCountryName, loadShipTo, shipToView } from '../services/ship-to.service.js';
@@ -157,6 +157,7 @@ export const createShopifyTickBox = catchAsync(async (req, res) => {
   if (!store) throw new NotFoundError('Store not found');
   if (store.status !== 'active' || !store.access_token_enc) throw new ConflictError('The store has not installed the app yet.');
   const status = await connectProductMetafield(store);
+  await connectPaymentRule(store);
   return ApiResponse.success(res, status, status.ok ? 'The tick box is ready on the products of the store.' : status.error);
 });
 
