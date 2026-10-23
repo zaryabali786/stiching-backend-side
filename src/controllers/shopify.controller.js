@@ -92,10 +92,23 @@ const publicStore = (s) => ({
 });
 
 /** GET /api/admin/shopify/stores */
+/** One-click links into the brand's Shopify admin for the theme / checkout setup of this app (Shopify's documented deep links). */
+const setupLinks = (shop) => {
+  const key = config.shopify.apiKey;
+  const handle = String(shop).replace(/\.myshopify\.com$/, '');
+  const editor = `https://${shop}/admin/themes/current/editor`;
+  return {
+    cart_badges: `${editor}?context=apps&activateAppId=${key}/stitchship-cart-badges`,
+    product_block: `${editor}?template=product&addAppBlockId=${key}/stitchship&target=mainSection`,
+    cart_notice: `${editor}?template=cart&addAppBlockId=${key}/stitchship-cart-notice&target=mainSection`,
+    checkout_editor: `https://admin.shopify.com/store/${handle}/settings/checkout/editor`,
+  };
+};
+
 export const listShopifyStores = catchAsync(async (req, res) => {
   const { data, error } = await supabaseAdmin.from('shopify_stores').select('*, brand:brands!shopify_stores_brand_id_fkey(id, name)').order('created_at', { ascending: false });
   if (error) throw error;
-  return ApiResponse.success(res, { configured: shopifyConfigured(), sms_configured: smsEnabled(), stores: (data || []).map((s) => ({ ...publicStore(s), brand: Array.isArray(s.brand) ? s.brand[0] : s.brand })) });
+  return ApiResponse.success(res, { configured: shopifyConfigured(), sms_configured: smsEnabled(), stores: (data || []).map((s) => ({ ...publicStore(s), setup_links: setupLinks(s.shop_domain), brand: Array.isArray(s.brand) ? s.brand[0] : s.brand })) });
 });
 
 /** POST /api/admin/shopify/stores  body: { shop, brand_id? } — register a store; the brand then installs the app with its link. */
