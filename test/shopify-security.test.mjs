@@ -357,6 +357,31 @@ test('no Pakistan zone, no Pakistan rate, or a missing permission: a clear messa
   });
 });
 
+test('Pakistan covered only by "Rest of world", or by another profile: the method goes there too; the error names what the store has', async () => {
+  const zone = (id, name, countries, methods) => ({ zone: { id, name, countries }, methodDefinitions: { nodes: methods } });
+  const profile = (id, name, isDefault, zones) => ({ id, name, default: isDefault, profileLocationGroups: [{ locationGroup: { id: `g-${id}` }, locationGroupZones: { nodes: zones } }] });
+  const pk = { code: { countryCode: 'PK', restOfWorld: false } };
+  const world = { code: { countryCode: null, restOfWorld: true } };
+  const us = { code: { countryCode: 'US', restOfWorld: false } };
+  const nodes = [
+    profile('p1', 'General profile', true, [zone('z1', 'Domestic', [us], [rate('Standard', '5.0')]), zone('z2', 'Rest of world', [world], [rate('Flat', '12.0')])]),
+    profile('p2', 'Heavy goods', false, [zone('z3', 'Pakistan', [pk], [rate('Cargo', '30.0')])]),
+  ];
+  await withShopify((b) => (/deliveryProfiles\(/.test(b.query) ? { data: { deliveryProfiles: { nodes } } } : { data: { deliveryProfileUpdate: { profile: { id: 'x' }, userErrors: [] } } }), async (asked) => {
+    const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
+    assert.deepEqual(r, { ok: true, error: null, created: 2, updated: 0 });
+    const updates = asked.filter((a) => a.body.variables?.profile);
+    assert.deepEqual(updates.map((u) => [u.body.variables.id, u.body.variables.profile.locationGroupsToUpdate[0].zonesToUpdate[0].id]), [['p1', 'z2'], ['p2', 'z3']]);
+    assert.deepEqual(updates.map((u) => u.body.variables.profile.locationGroupsToUpdate[0].zonesToUpdate[0].methodDefinitionsToCreate[0].rateDefinition.price.amount), ['12.0', '30.0']);
+  });
+  const onlyUs = [profile('p1', 'General profile', true, [zone('z1', 'Domestic', [us], [rate('Standard', '5.0')])])];
+  await withShopify(() => ({ data: { deliveryProfiles: { nodes: onlyUs } } }), async () => {
+    const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
+    assert.equal(r.ok, false);
+    assert.match(r.error, /General profile: Domestic \(US\)/);
+  });
+});
+
 test('the delivery rule is created from the app function, switched on again when off, and left alone when on', async () => {
   await withShopify((b) => (/deliveryCustomizations\(/.test(b.query) ? { data: { deliveryCustomizations: { nodes: [] } } } : { data: { deliveryCustomizationCreate: { deliveryCustomization: { id: 'gid://shopify/DeliveryCustomization/1' }, userErrors: [] } } }), async (asked) => {
     assert.deepEqual(await sh.ensureDeliveryRule(aStore()), { ok: true, error: null });

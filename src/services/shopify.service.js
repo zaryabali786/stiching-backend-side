@@ -300,7 +300,7 @@ export const shippingDescription = (atelier) => {
   return `This order includes a Stitch&Ship product, which needs to be delivered to our stitching atelier${address ? `: ${address}` : ''}. 2-5 working days.`.slice(0, 500);
 };
 
-const PROFILES_QUERY = `query { deliveryProfiles(first: 10) { nodes { id default profileLocationGroups { locationGroup { id } locationGroupZones(first: 50) { nodes {
+const PROFILES_QUERY = `query { deliveryProfiles(first: 20) { nodes { id name default profileLocationGroups { locationGroup { id } locationGroupZones(first: 50) { nodes {
   zone { id name countries { code { countryCode restOfWorld } } }
   methodDefinitions(first: 50) { nodes { id name description active rateProvider { __typename ... on DeliveryRateDefinition { price { amount currencyCode } } } methodConditions { field operator conditionCriteria { __typename ... on MoneyV2 { amount currencyCode } ... on Weight { value unit } } } } }
 } } } } } }`;
@@ -327,42 +327,71 @@ const copyOfRate = (m, description) => {
 };
 
 /**
- * Create the method "Ship to Stitch & Ship" in the store's Pakistan zone, with the same rates and rules as the Pakistan market: the store's own
- * Pakistan rates are copied (the cheapest named rate, with all its price / weight steps), so nothing is invented. Already there: its description
- * (the atelier address) is brought up to date. Needs the write_shipping permission.
+ * Put the method "Ship to Stitch & Ship" into ONE zone of ONE shipping profile with the same rates and rules as that zone's own: the cheapest
+ * named rate is copied with all its price / weight steps. The method already there only gets its description (the atelier address) refreshed.
+ */
+const addMethodToZone = async (store, profile, target, description) => {
+  const methods = (target.zone.methodDefinitions?.nodes || []).filter((m) => m.rateProvider?.__typename === 'DeliveryRateDefinition');
+  const ours = methods.filter((m) => m.name === SHIP_METHOD_NAME);
+  const zoneInput = { id: target.zone.zone.id };
+  if (ours.length) {
+    const stale = ours.filter((m) => m.description !== description);
+    if (!stale.length) return { ok: true, error: null, created: 0, updated: 0 };
+    zoneInput.methodDefinitionsToUpdate = stale.map((m) => ({ id: m.id, description }));
+  } else {
+    const own = methods.filter((m) => m.active);
+    if (!own.length) return { ok: false, error: `Zone "${target.zone.zone.name}" of the shipping profile "${profile.name}" has no active rate to copy.` };
+    const price = (m) => Number(m.rateProvider.price.amount);
+    const cheapest = own.reduce((a, b) => (price(b) < price(a) ? b : a));
+    zoneInput.methodDefinitionsToCreate = own.filter((m) => m.name === cheapest.name).map((m) => copyOfRate(m, description));
+  }
+  const res = await shopifyGraphql(store, PROFILE_UPDATE, { id: profile.id, profile: { locationGroupsToUpdate: [{ id: target.groupId, zonesToUpdate: [zoneInput] }] } });
+  const errs = res?.deliveryProfileUpdate?.userErrors || [];
+  if (errs.length) return { ok: false, error: errs.map((e) => e.message).join('; ') };
+  return { ok: true, error: null, created: zoneInput.methodDefinitionsToCreate?.length || 0, updated: zoneInput.methodDefinitionsToUpdate?.length || 0 };
+};
+
+/** What the store has, in a sentence: "General profile: Domestic (PK, AE), Rest of world (rest of world)". */
+const describeZones = (profiles) =>
+  profiles
+    .map((p) => {
+      const zones = (p.profileLocationGroups || []).flatMap((g) => g.locationGroupZones?.nodes || []);
+      const text = zones.map((z) => `${z.zone?.name} (${(z.zone?.countries || []).map((c) => (c.code?.restOfWorld ? 'rest of world' : c.code?.countryCode)).join(', ') || 'no countries'})`).join(', ');
+      return `${p.name || 'profile'}: ${text || 'no zones'}`;
+    })
+    .join(' | ');
+
+/**
+ * Create the method "Ship to Stitch & Ship" where the store ships to Pakistan, with the same rates and rules as the Pakistan market. Shipping
+ * rates live in shipping PROFILES (Settings > Shipping and delivery), in zones; a Market does not carry rates. In every profile (a product ships
+ * with the rates of its own profile) the zone that holds Pakistan is used, else the "Rest of world" zone, which is what covers Pakistan then.
+ * Needs the write_shipping permission.
  * @returns {Promise<{ ok: boolean, error: string|null, created?: number, updated?: number }>}
  */
 export const ensureShippingMethod = async (store, atelier) => {
   try {
     const found = await shopifyGraphql(store, PROFILES_QUERY);
-    const profile = (found?.deliveryProfiles?.nodes || []).find((p) => p.default) || found?.deliveryProfiles?.nodes?.[0];
-    if (!profile) return { ok: false, error: 'The store has no shipping profile.' };
-    let target = null;
-    for (const group of profile.profileLocationGroups || []) {
-      for (const z of group.locationGroupZones?.nodes || []) {
-        if ((z.zone?.countries || []).some((c) => c.code?.countryCode === 'PK')) target = target || { groupId: group.locationGroup.id, zone: z };
-      }
-    }
-    if (!target) return { ok: false, error: 'The store has no shipping zone for Pakistan yet. Add Pakistan in Settings > Shipping and delivery, then try again.' };
+    const profiles = found?.deliveryProfiles?.nodes || [];
+    if (!profiles.length) return { ok: false, error: 'The store has no shipping profile.' };
     const description = shippingDescription(atelier);
-    const methods = (target.zone.methodDefinitions?.nodes || []).filter((m) => m.rateProvider?.__typename === 'DeliveryRateDefinition');
-    const ours = methods.filter((m) => m.name === SHIP_METHOD_NAME);
-    const zoneInput = { id: target.zone.zone.id };
-    if (ours.length) {
-      const stale = ours.filter((m) => m.description !== description);
-      if (!stale.length) return { ok: true, error: null, created: 0, updated: 0 };
-      zoneInput.methodDefinitionsToUpdate = stale.map((m) => ({ id: m.id, description }));
-    } else {
-      const own = methods.filter((m) => m.active);
-      if (!own.length) return { ok: false, error: 'The Pakistan zone has no active rate to copy. Add a Pakistan shipping rate first, then try again.' };
-      const price = (m) => Number(m.rateProvider.price.amount);
-      const cheapest = own.reduce((a, b) => (price(b) < price(a) ? b : a));
-      zoneInput.methodDefinitionsToCreate = own.filter((m) => m.name === cheapest.name).map((m) => copyOfRate(m, description));
+    const results = [];
+    for (const profile of profiles) {
+      let pk = null;
+      let world = null;
+      for (const group of profile.profileLocationGroups || []) {
+        for (const z of group.locationGroupZones?.nodes || []) {
+          const countries = z.zone?.countries || [];
+          if (countries.some((c) => c.code?.countryCode === 'PK')) pk = pk || { groupId: group.locationGroup.id, zone: z };
+          else if (countries.some((c) => c.code?.restOfWorld)) world = world || { groupId: group.locationGroup.id, zone: z };
+        }
+      }
+      const target = pk || world;
+      if (target) results.push(await addMethodToZone(store, profile, target, description));
     }
-    const res = await shopifyGraphql(store, PROFILE_UPDATE, { id: profile.id, profile: { locationGroupsToUpdate: [{ id: target.groupId, zonesToUpdate: [zoneInput] }] } });
-    const errs = res?.deliveryProfileUpdate?.userErrors || [];
-    if (errs.length) return { ok: false, error: errs.map((e) => e.message).join('; ') };
-    return { ok: true, error: null, created: zoneInput.methodDefinitionsToCreate?.length || 0, updated: zoneInput.methodDefinitionsToUpdate?.length || 0 };
+    if (!results.length) return { ok: false, error: `No shipping zone of the store covers Pakistan (not even "Rest of world"). Add Pakistan to a zone in Settings > Shipping and delivery, then try again. The store has: ${describeZones(profiles)}.`.slice(0, 700) };
+    const done = results.filter((r) => r.ok);
+    if (!done.length) return { ok: false, error: results.map((r) => r.error).join(' ').slice(0, 700) };
+    return { ok: true, error: null, created: done.reduce((n, r) => n + (r.created || 0), 0), updated: done.reduce((n, r) => n + (r.updated || 0), 0) };
   } catch (err) {
     const denied = /access denied|shipping|scope|permission/i.test(err.message || '');
     return { ok: false, error: denied ? 'Needs the write_shipping permission: the brand must open the install link again and approve it.' : err.message };
