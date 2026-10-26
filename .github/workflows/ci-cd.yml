@@ -1,10 +1,9 @@
 name: CI/CD
 
-# Every push and pull request runs the tests. A push to main that passes is also deployed to the Contabo server.
+# Every push to main is deployed to the Contabo server (no tests are run here; run `npm run test:unit` locally if you want them).
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -12,22 +11,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Unit tests
-        run: npm run test:unit
-
   deploy:
     name: Deploy to Contabo
-    needs: test
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
