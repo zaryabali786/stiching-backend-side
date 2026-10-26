@@ -11,6 +11,7 @@ import { createFakeDb } from './fake-supabase.mjs';
 const SECRET = 'test-shopify-secret';
 const KEY = 'test-key';
 let emb;
+let sh;
 const db = createFakeDb({});
 
 before(async () => {
@@ -21,6 +22,7 @@ before(async () => {
   process.env.SHOPIFY_SCOPES = 'read_orders,write_orders,read_products,write_products,write_shipping';
   mock.module('../src/config/supabase.js', { namedExports: { supabaseAdmin: db, supabase: db } });
   emb = await import('../src/services/shopify-embedded.service.js');
+  sh = await import('../src/services/shopify.service.js');
 });
 
 const token = ({ secret = SECRET, aud = KEY, dest = 'https://my-brand.myshopify.com', iss = 'https://my-brand.myshopify.com/admin', exp = '2m' } = {}) =>
@@ -57,4 +59,11 @@ test('order statuses are in the brand\'s words', () => {
   assert.equal(emb.orderStatus({ state: 'draft_created', notified_at: 'x' }).label, "Waiting for the customer's sizes");
   assert.equal(emb.orderNeedsAttention({ state: 'failed' }), true);
   assert.equal(emb.orderNeedsAttention({ state: 'draft_created', notified_at: 'x' }), false);
+});
+
+test('the public install page reads a store address however the brand types it', () => {
+  for (const ok of ['my-brand', 'My-Brand', 'my-brand.myshopify.com', 'https://my-brand.myshopify.com/admin', 'https://admin.shopify.com/store/my-brand/apps/x', ' www.my-brand.myshopify.com ']) {
+    assert.equal(sh.shopFromInput(ok), 'my-brand.myshopify.com', ok);
+  }
+  for (const bad of ['', null, 'my brand', 'my-brand.com', 'evil.com/my-brand', 'my-brand.myshopify.com.evil.com', '-x']) assert.equal(sh.shopFromInput(bad), null, String(bad));
 });

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Add Stitch&amp;Ship to your Shopify store</title>
+  <meta name="robots" content="noindex" />
+  <style>
+    :root { --ink: #1a1c1a; --muted: #5c605a; --line: #e5dfd4; --bg: #f6f3ee; --green: #17362a; --green-2: #1c6b47; --gold: #c3994f; --gold-dark: #85601f; --red: #b42318; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink); font: 16px/1.5 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: grid; place-items: center; padding: 24px 16px; }
+    main { width: 100%; max-width: 520px; }
+    .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
+    .mark { width: 38px; height: 38px; border-radius: 11px; background: var(--green); color: #fff; display: grid; place-items: center; font-weight: 700; letter-spacing: 0.02em; }
+    .brand b { font-size: 18px; letter-spacing: 0.01em; }
+    .card { background: #fff; border: 1px solid var(--line); border-radius: 18px; padding: 28px 26px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 12px 32px rgba(23, 54, 42, 0.07); }
+    .eyebrow { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--gold-dark); }
+    h1 { margin: 0 0 8px; font: 600 28px/1.2 "Playfair Display", Georgia, serif; }
+    .lead { margin: 0 0 22px; color: var(--muted); }
+    label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 600; }
+    .row { display: flex; gap: 10px; }
+    input { flex: 1; min-width: 0; height: 48px; padding: 0 14px; border: 1px solid var(--line); border-radius: 12px; font: inherit; color: var(--ink); background: #fff; }
+    input:focus { outline: 2px solid var(--green-2); outline-offset: 1px; border-color: var(--green-2); }
+    button { height: 48px; padding: 0 22px; border: 0; border-radius: 12px; background: var(--green); color: #fff; font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    button:hover { background: #10261d; }
+    .hint { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
+    .error { margin: 0 0 14px; padding: 10px 12px; border-radius: 10px; background: #fef3f2; color: var(--red); font-size: 14px; }
+    ol { list-style: none; margin: 26px 0 0; padding: 22px 0 0; border-top: 1px solid var(--line); display: grid; gap: 14px; counter-reset: s; }
+    li { display: flex; gap: 12px; counter-increment: s; }
+    li::before { content: counter(s); flex: none; width: 26px; height: 26px; border-radius: 50%; background: var(--gold); color: #fff; font-size: 13px; font-weight: 700; display: grid; place-items: center; }
+    li b { display: block; font-size: 15px; }
+    li span { font-size: 14px; color: var(--muted); }
+    .foot { margin-top: 18px; text-align: center; font-size: 12.5px; color: var(--muted); }
+    @media (max-width: 420px) { .row { flex-direction: column; } button { width: 100%; } .card { padding: 22px 18px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand"><span class="mark" aria-hidden="true">S</span><b>Stitch&amp;Ship</b></div>
+    <div class="card">
+      <p class="eyebrow">For Shopify brands</p>
+      <h1>Add customised stitching to your store</h1>
+      <p class="lead">Enter your store address and approve the app in Shopify. Your store is connected automatically; nothing to send us first.</p>
+      <p class="error" role="alert" id="err" hidden>%%ERROR%%</p>
+      <form method="get" action="/api/shopify" autocomplete="off">
+        <label for="shop">Your store address</label>
+        <div class="row">
+          <input id="shop" name="shop" type="text" inputmode="url" placeholder="my-brand.myshopify.com" value="%%VALUE%%" required autofocus />
+          <button type="submit">Install app</button>
+        </div>
+        <p class="hint">Find it in Shopify admin → Settings → Domains. It ends in <b>.myshopify.com</b>. Typing only the first part (my-brand) works too.</p>
+      </form>
+      <ol>
+        <li><div><b>Approve the app</b><span>Shopify shows what Stitch&amp;Ship needs access to. Press Install.</span></div></li>
+        <li><div><b>Follow the setup guide</b><span>You land inside your Shopify admin on the Stitch&amp;Ship page: a few one-click steps.</span></div></li>
+        <li><div><b>Choose your products</b><span>Tick "Stitch&amp;Ship available" on the products customers can have stitched.</span></div></li>
+      </ol>
+    </div>
+    <p class="foot">Need help? Contact your Stitch&amp;Ship account manager.</p>
+  </main>
+  <script>
+    var err = document.getElementById('err');
+    err.hidden = !err.textContent.trim();
+  </script>
+</body>
+</html>

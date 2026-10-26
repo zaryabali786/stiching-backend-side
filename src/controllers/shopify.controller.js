@@ -1,7 +1,10 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
-import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
-import { buildInstallUrl, completeInstall, connectPaymentRule, connectProductMetafield, connectShipping, connectWebhooks, normaliseShop, readInstallState, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
+import { catchAsync, ApiResponse, BadRequestError, ConflictError, NotFoundError } from '../utils/error.helper.js';
+import { buildInstallUrl, completeInstall, connectPaymentRule, connectProductMetafield, connectShipping, connectWebhooks, normaliseShop, readInstallState, shopFromInput, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
 import { confirmAtelierAddress, importShopifyOrder, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
 import { processWebhookEvent, recordWebhookEvent } from '../services/shopify-events.service.js';
 import { atelierCountryName, loadShipTo, shipToView } from '../services/ship-to.service.js';
@@ -9,15 +12,33 @@ import { smsEnabled } from '../services/sms.service.js';
 
 // ───────────── what the brand's browser and Shopify call (no login) ─────────────
 
+const APP_ASSETS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public/shopify-app');
+const escapeHtml = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-/** GET /api/shopify/auth?shop=<store>.myshopify.com — starts the install. Only stores an admin registered can install. */
+
+/**
+ * GET /api/shopify/auth?shop=<store>.myshopify.com — starts the install. Any Shopify store may install: the store is added here by itself when the
+ * brand approves (completeInstall), so nobody has to add it first. An administrator can still add a store by hand and link it to a brand.
+ */
 export const shopifyInstall = catchAsync(async (req, res) => {
   if (!shopifyConfigured()) throw new BadRequestError('The Shopify connection is not set up on the server yet.');
-  const shop = normaliseShop(req.query.shop);
+  const shop = shopFromInput(req.query.shop);
   if (!shop) throw new BadRequestError('Enter the store address like my-brand.myshopify.com.');
-  const { data: store } = await supabaseAdmin.from('shopify_stores').select('id').eq('shop_domain', shop).maybeSingle();
-  if (!store) throw new ForbiddenError('This store is not registered with Stitch&Ship yet. Ask us to add it first.');
   return res.redirect(302, buildInstallUrl(shop));
+});
+
+let installPage = null;
+
+/** GET /api/shopify — the public install page: the one link to send to any brand. With ?shop= it goes straight to the install. */
+export const shopifyLanding = catchAsync(async (req, res) => {
+  if (!shopifyConfigured()) throw new BadRequestError('The Shopify connection is not set up on the server yet.');
+  const typed = String(req.query.shop ?? '').trim();
+  const shop = shopFromInput(typed);
+  if (shop) return res.redirect(302, `${config.shopify.appUrl}/api/shopify/auth?shop=${encodeURIComponent(shop)}`);
+  installPage = installPage || fs.readFileSync(path.join(APP_ASSETS_DIR, 'install.html'), 'utf8');
+  const error = typed ? 'We could not read that address. Use the one that ends in .myshopify.com (Shopify admin → Settings → Domains), or just the first part of it.' : '';
+  res.set('Cache-Control', 'no-store');
+  return res.status(200).type('html').send(installPage.replace('%%ERROR%%', escapeHtml(error)).replace('%%VALUE%%', escapeHtml(typed)));
 });
 
 /** GET /api/shopify/auth/callback — Shopify sends the brand back here after they approved the app. */
@@ -108,7 +129,7 @@ export const setupLinks = (shop) => {
 export const listShopifyStores = catchAsync(async (req, res) => {
   const { data, error } = await supabaseAdmin.from('shopify_stores').select('*, brand:brands!shopify_stores_brand_id_fkey(id, name)').order('created_at', { ascending: false });
   if (error) throw error;
-  return ApiResponse.success(res, { configured: shopifyConfigured(), sms_configured: smsEnabled(), stores: (data || []).map((s) => ({ ...publicStore(s), setup_links: setupLinks(s.shop_domain), brand: Array.isArray(s.brand) ? s.brand[0] : s.brand })) });
+  return ApiResponse.success(res, { configured: shopifyConfigured(), public_install_url: shopifyConfigured() ? `${config.shopify.appUrl}/api/shopify` : null, sms_configured: smsEnabled(), stores: (data || []).map((s) => ({ ...publicStore(s), setup_links: setupLinks(s.shop_domain), brand: Array.isArray(s.brand) ? s.brand[0] : s.brand })) });
 });
 
 /** POST /api/admin/shopify/stores  body: { shop, brand_id? } — register a store; the brand then installs the app with its link. */

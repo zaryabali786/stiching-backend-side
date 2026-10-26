@@ -12,6 +12,20 @@ import { atelierCountryCode, loadShipTo } from './ship-to.service.js';
 
 export const shopifyConfigured = () => !!(config.shopify.apiKey && config.shopify.apiSecret && config.shopify.tokenKey && config.shopify.appUrl);
 
+/**
+ * The store address from what a brand types on the public install page: "my-brand", "my-brand.myshopify.com", the address of its Shopify admin
+ * (admin.shopify.com/store/my-brand/...) or its myshopify.com web address. A custom domain cannot be turned into the myshopify.com address: null.
+ */
+export const shopFromInput = (value) => {
+  const raw = String(value ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '');
+  if (!raw) return null;
+  const admin = /^admin\.shopify\.com\/store\/([a-z0-9][a-z0-9-]*)/.exec(raw);
+  if (admin) return normaliseShop(`${admin[1]}.myshopify.com`);
+  const first = raw.replace(/[/?#].*$/, '');
+  if (/^[a-z0-9][a-z0-9-]*$/.test(first)) return normaliseShop(`${first}.myshopify.com`);
+  return normaliseShop(first);
+};
+
 /** "my-brand.myshopify.com" from anything a person might type, or null. */
 export const normaliseShop = (value) => {
   const s = String(value ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');

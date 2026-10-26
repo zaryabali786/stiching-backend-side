@@ -11,7 +11,7 @@ import { getRedisStatus } from '../config/redis.js';
 import { pushEnabled } from '../services/push.service.js';
 import { inboundEmailWebhook } from '../controllers/order-import.controller.js';
 import { courierTrackingWebhook } from '../controllers/courier-webhook.controller.js';
-import { getAtelierAddress, shopifyInstall, shopifyInstallCallback } from '../controllers/shopify.controller.js';
+import { getAtelierAddress, shopifyInstall, shopifyInstallCallback, shopifyLanding } from '../controllers/shopify.controller.js';
 import { APP_ASSETS_DIR, getAppState, listAppOrders, markSetupStep, requireShopifySession, runSetupStep, saveAppSettings, serveApp } from '../controllers/shopify-app.controller.js';
 
 const apiRouter = Router();
@@ -33,6 +33,7 @@ apiRouter.post('/inbound/email', inboundEmailWebhook);
 apiRouter.post('/webhooks/courier', courierTrackingWebhook);
 
 // Shopify: a brand installs the app here; the product-page block reads the atelier address
+apiRouter.get('/shopify', shopifyLanding);
 apiRouter.get('/shopify/auth', shopifyInstall);
 apiRouter.get('/shopify/auth/callback', shopifyInstallCallback);
 apiRouter.get('/shopify/atelier', getAtelierAddress);
