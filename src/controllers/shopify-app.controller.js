@@ -73,6 +73,9 @@ const STEPS = [
   { key: 'checkout_editor', title: 'Checkout badge below each product', text: 'Shows the Stitch&Ship badge at checkout. Needs Shopify Plus.', link: 'checkout_editor', plusOnly: true, optional: true },
 ];
 
+/** What the brand should know when the "show only this method" rule is not running (it needs a Shopify Plus store). */
+const shippingNote = (rule) => (rule && !rule.ok ? 'The "Ship to Stitch & Ship" option is in your store. Hiding your other shipping options at checkout needs Shopify Plus, so customers may still see them.' : null);
+
 const autoDone = (settings) => ({
   notifications: !!settings.webhooks?.ok,
   tick_box: !!settings.tick_box?.ok,
@@ -108,6 +111,7 @@ const buildState = async (store) => {
       locked,
       done: s.auto ? done[s.key] : !!acked[s.key],
       error: s.auto ? errors[s.key] : null,
+      note: s.key === 'shipping' && done.shipping ? shippingNote(settings.shipping?.rule) : null,
       url: s.link && !locked ? links[s.link] : null,
     };
   });
@@ -169,8 +173,8 @@ const SETUP_ACTIONS = {
   shipping: async (store) => {
     await connectPaymentRule(store);
     const r = await connectShipping(store);
-    const problem = !r.method.ok ? r.method.error : !r.rule.ok ? r.rule.error : null;
-    return { ok: !problem, error: problem };
+    // the method is what the customer sees at checkout; the rule that hides the OTHER methods only runs on Shopify Plus, so it is a note, not a failure
+    return { ok: r.method.ok, error: r.method.ok ? null : r.method.error, note: r.method.ok ? shippingNote(r.rule) : null };
   },
 };
 

@@ -55,6 +55,7 @@
         <div class="step-title">${esc(s.title)} ${badge(label, tone)}</div>
         <div class="step-text">${esc(s.text)}</div>
         ${s.error && !s.done ? `<div class="step-error">${esc(s.error)}</div>` : ''}
+        ${s.note ? `<div class="step-note">${esc(s.note)}</div>` : ''}
         ${actions ? `<div class="step-actions">${actions}</div>` : ''}
       </div>
     </li>`;
@@ -211,7 +212,7 @@
       withBusy(el, async () => {
         const r = await call('POST', `/setup/${el.dataset.step}`);
         state = r.state;
-        toast(r.ok ? 'Done.' : r.error || 'This step could not be completed.', !r.ok);
+        toast(r.ok ? 'Done. ' + (r.note ? 'See the note under the step.' : '') : r.error || 'This step could not be completed.', !r.ok);
         await draw();
       });
     }

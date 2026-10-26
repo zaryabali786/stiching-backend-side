@@ -41,6 +41,7 @@ body { margin: 0; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe 
 .step-title { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-weight: 600; font-size: 14px; }
 .step-text { color: var(--ss-muted); font-size: 13px; line-height: 1.45; }
 .step-error { color: #c70a24; font-size: 13px; line-height: 1.4; }
+.step-note { color: #8a6116; background: #fff8e6; border-radius: 8px; padding: 6px 10px; font-size: 13px; line-height: 1.4; }
 .step-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; align-items: center; }
 .step.is-locked .step-title, .step.is-locked .step-text { opacity: 0.65; }
 
