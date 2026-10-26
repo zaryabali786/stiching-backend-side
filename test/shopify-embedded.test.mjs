@@ -2,19 +2,24 @@
  * The Stitch&Ship page inside the brand's Shopify admin: the session token is the only proof of which store is asking, so it must
  * only be accepted when it is signed with the app's secret, made for this app and not expired. No network, no database.
  */
-import { test, before } from 'node:test';
+import { test, mock, before } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { SignJWT } from 'jose';
+import { createFakeDb } from './fake-supabase.mjs';
 
 const SECRET = 'test-shopify-secret';
 const KEY = 'test-key';
 let emb;
+const db = createFakeDb({});
 
 before(async () => {
   process.env.SHOPIFY_APP_API_KEY = KEY;
   process.env.SHOPIFY_APP_API_SECRET = SECRET;
   process.env.SHOPIFY_APP_URL = 'https://api.example.test';
+  process.env.SHOPIFY_TOKEN_KEY = crypto.randomBytes(32).toString('hex');
   process.env.SHOPIFY_SCOPES = 'read_orders,write_orders,read_products,write_products,write_shipping';
+  mock.module('../src/config/supabase.js', { namedExports: { supabaseAdmin: db, supabase: db } });
   emb = await import('../src/services/shopify-embedded.service.js');
 });
 
