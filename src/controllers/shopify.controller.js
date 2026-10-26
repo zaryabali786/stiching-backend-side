@@ -9,7 +9,6 @@ import { smsEnabled } from '../services/sms.service.js';
 
 // ───────────── what the brand's browser and Shopify call (no login) ─────────────
 
-const page = (title, text) => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:system-ui,sans-serif;max-width:480px;margin:15vh auto;padding:0 16px;text-align:center"><h1>${title}</h1><p>${text}</p></body>`;
 
 /** GET /api/shopify/auth?shop=<store>.myshopify.com — starts the install. Only stores an admin registered can install. */
 export const shopifyInstall = catchAsync(async (req, res) => {
@@ -28,7 +27,8 @@ export const shopifyInstallCallback = catchAsync(async (req, res) => {
   const state = readInstallState(req.query.state);
   if (!shop || !state || state.shop !== shop || !verifyOAuthHmac(req.query) || !req.query.code) throw new BadRequestError('This install link is not valid or has expired. Please start the install again.');
   await completeInstall({ shop, code: String(req.query.code) });
-  return res.status(200).type('html').send(page('Stitch&Ship is connected', 'You can close this window. Customers can now choose customised stitching on your store.'));
+  // the brand lands on the Stitch&Ship page inside its own Shopify admin (its setup guide), not on a plain "connected" page
+  return res.redirect(302, `https://admin.shopify.com/store/${shop.replace(/\.myshopify\.com$/, '')}/apps/${config.shopify.apiKey}`);
 });
 
 /** GET /api/shopify/atelier — the address the product-page block shows and pre-fills. Public: it is the address on our parcels. */
@@ -93,7 +93,7 @@ const publicStore = (s) => ({
 
 /** GET /api/admin/shopify/stores */
 /** One-click links into the brand's Shopify admin for the theme / checkout setup of this app (Shopify's documented deep links). */
-const setupLinks = (shop) => {
+export const setupLinks = (shop) => {
   const key = config.shopify.apiKey;
   const handle = String(shop).replace(/\.myshopify\.com$/, '');
   const editor = `https://${shop}/admin/themes/current/editor`;
@@ -120,21 +120,26 @@ export const addShopifyStore = catchAsync(async (req, res) => {
   return ApiResponse.created(res, publicStore(data), 'Store added. Send its install link to the brand.');
 });
 
+/** The settings a person may change (an administrator, or the brand on its own Shopify page), checked and merged onto what is stored. */
+export const mergeStoreSettings = (current, incoming) => {
+  const names = Array.isArray(incoming.cod_gateway_names) ? incoming.cod_gateway_names.map((n) => String(n).trim().slice(0, 80)).filter(Boolean).slice(0, 10) : undefined;
+  return {
+    ...(current || {}),
+    ...(names ? { cod_gateway_names: names } : {}),
+    ...(incoming.brand_name ? { brand_name: String(incoming.brand_name).slice(0, 80) } : {}),
+    ...(typeof incoming.sms_enabled === 'boolean' ? { sms_enabled: incoming.sms_enabled } : {}),
+    // when an order is a Stitch&Ship order: 'customer' (default) = the customer ticked it on the product page AND the product's box is ticked; 'enabled' = the product's box alone
+    ...(['enabled', 'customer'].includes(incoming.stitch_mode) ? { stitch_mode: incoming.stitch_mode } : {}),
+  };
+};
+
 /** PATCH /api/admin/shopify/stores/:id  body: { brand_id?, settings? } */
 export const updateShopifyStore = catchAsync(async (req, res) => {
   const patch = { updated_at: new Date().toISOString() };
   if (req.body?.brand_id !== undefined) patch.brand_id = req.body.brand_id || null;
   if (req.body?.settings && typeof req.body.settings === 'object') {
-    const names = Array.isArray(req.body.settings.cod_gateway_names) ? req.body.settings.cod_gateway_names.map((n) => String(n).trim().slice(0, 80)).filter(Boolean).slice(0, 10) : undefined;
     const { data: current } = await supabaseAdmin.from('shopify_stores').select('settings').eq('id', req.params.id).maybeSingle();
-    patch.settings = {
-      ...(current?.settings || {}),
-      ...(names ? { cod_gateway_names: names } : {}),
-      ...(req.body.settings.brand_name ? { brand_name: String(req.body.settings.brand_name).slice(0, 80) } : {}),
-      ...(typeof req.body.settings.sms_enabled === 'boolean' ? { sms_enabled: req.body.settings.sms_enabled } : {}),
-      // when an order is a Stitch&Ship order: 'customer' (default) = the customer ticked it on the product page AND the product's box is ticked; 'enabled' = the product's box alone
-      ...(['enabled', 'customer'].includes(req.body.settings.stitch_mode) ? { stitch_mode: req.body.settings.stitch_mode } : {}),
-    };
+    patch.settings = mergeStoreSettings(current?.settings, req.body.settings);
   }
   const { data, error } = await supabaseAdmin.from('shopify_stores').update(patch).eq('id', req.params.id).select('*').maybeSingle();
   if (error) throw error;

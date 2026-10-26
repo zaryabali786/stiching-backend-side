@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import authRoutes from './auth.routes.js';
 import adminRoutes from './admin.routes.js';
 import partnerRoutes from './partner.routes.js';
@@ -12,6 +12,7 @@ import { pushEnabled } from '../services/push.service.js';
 import { inboundEmailWebhook } from '../controllers/order-import.controller.js';
 import { courierTrackingWebhook } from '../controllers/courier-webhook.controller.js';
 import { getAtelierAddress, shopifyInstall, shopifyInstallCallback } from '../controllers/shopify.controller.js';
+import { APP_ASSETS_DIR, getAppState, listAppOrders, markSetupStep, requireShopifySession, runSetupStep, saveAppSettings, serveApp } from '../controllers/shopify-app.controller.js';
 
 const apiRouter = Router();
 
@@ -35,6 +36,14 @@ apiRouter.post('/webhooks/courier', courierTrackingWebhook);
 apiRouter.get('/shopify/auth', shopifyInstall);
 apiRouter.get('/shopify/auth/callback', shopifyInstallCallback);
 apiRouter.get('/shopify/atelier', getAtelierAddress);
+// Shopify: the Stitch&Ship page inside the brand's Shopify admin (the page, its files, and the calls it makes with Shopify's session token)
+apiRouter.use('/shopify/app/assets', express.static(APP_ASSETS_DIR, { index: false, maxAge: '5m' }));
+apiRouter.get(['/shopify/app', '/shopify/app/settings', '/shopify/app/orders', '/shopify/app/updates', '/shopify/app/help'], serveApp);
+apiRouter.get('/shopify/embedded/state', requireShopifySession, getAppState);
+apiRouter.put('/shopify/embedded/settings', requireShopifySession, saveAppSettings);
+apiRouter.post('/shopify/embedded/setup/:step', requireShopifySession, runSetupStep);
+apiRouter.put('/shopify/embedded/setup/:step/done', requireShopifySession, markSetupStep);
+apiRouter.get('/shopify/embedded/orders', requireShopifySession, listAppOrders);
 
 apiRouter.use('/auth', authRoutes);
 apiRouter.use('/notifications', authenticate, notificationRoutes);
