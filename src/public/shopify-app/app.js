@@ -125,7 +125,6 @@
             <s-option value="customer"${c.stitch_mode === 'customer' ? ' selected' : ''}>The customer ticked Stitch&amp;Ship on the product page and the product allows it (recommended)</s-option>
             <s-option value="enabled"${c.stitch_mode === 'enabled' ? ' selected' : ''}>Every product that allows Stitch&amp;Ship (no tick needed from the customer)</s-option>
           </s-select>
-          <s-text-field label="Cash on delivery payment names" data-field="cod" value="${esc(c.cod_gateway_names.join(', '))}" placeholder="Cash on Delivery (COD)" details="Only needed if your store's cash on delivery method has its own name. Separate several names with commas."></s-text-field>
           <s-switch label="Also text the customer" data-field="sms" details="${c.sms_available ? 'Sends a text message with the &quot;add your sizes&quot; link, as well as the email.' : 'Text messages are not switched on for your account yet.'}"${c.sms_enabled ? ' checked' : ''}${c.sms_available ? '' : ' disabled'}></s-switch>
           <s-stack direction="inline" gap="base"><s-button variant="primary" data-act="save">Save settings</s-button></s-stack>
         </div>
@@ -220,7 +219,6 @@
       withBusy(el, async () => {
         const body = {};
         if ('stitch_mode' in form) body.stitch_mode = form.stitch_mode;
-        if ('cod' in form) body.cod_gateway_names = form.cod.split(',').map((n) => n.trim()).filter(Boolean);
         if ('sms' in form) body.sms_enabled = form.sms;
         state = await call('PUT', '/settings', body);
         form = {};
@@ -238,9 +236,6 @@
     const f = t.dataset?.field;
     if (f === 'stitch_mode') form.stitch_mode = t.value;
     if (f === 'sms') form.sms = !!t.checked;
-  });
-  root.addEventListener('input', (e) => {
-    if (e.target.dataset?.field === 'cod') form.cod = e.target.value;
   });
   root.addEventListener('dismiss', (e) => {
     const key = e.target.dataset?.dismiss;

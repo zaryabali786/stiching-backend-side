@@ -130,7 +130,6 @@ const buildState = async (store) => {
     settings: {
       sms_enabled: settings.sms_enabled === true,
       sms_available: smsEnabled(),
-      cod_gateway_names: settings.cod_gateway_names || [],
       stitch_mode: settings.stitch_mode || 'customer',
     },
     counts: {
@@ -145,14 +144,13 @@ const buildState = async (store) => {
 /** GET /api/shopify/embedded/state */
 export const getAppState = catchAsync(async (req, res) => ApiResponse.success(res, await buildState(req.shopifyStore)));
 
-/** PUT /api/shopify/embedded/settings  body: { sms_enabled?, cod_gateway_names?, stitch_mode? } */
+/** PUT /api/shopify/embedded/settings  body: { sms_enabled?, stitch_mode? } */
 export const saveAppSettings = catchAsync(async (req, res) => {
   const store = req.shopifyStore;
   const body = req.body || {};
-  // the page may change these three only; nothing else in the stored settings is theirs to write
+  // the brand may change these two only (the cash on delivery names are set by us, in the admin portal); nothing else in the stored settings is theirs to write
   const incoming = {};
   if (typeof body.sms_enabled === 'boolean') incoming.sms_enabled = body.sms_enabled && smsEnabled();
-  if (Array.isArray(body.cod_gateway_names)) incoming.cod_gateway_names = body.cod_gateway_names;
   if (body.stitch_mode !== undefined) incoming.stitch_mode = body.stitch_mode;
   const settings = mergeStoreSettings(store.settings, incoming);
   const { error } = await supabaseAdmin.from('shopify_stores').update({ settings, updated_at: new Date().toISOString() }).eq('id', store.id);
