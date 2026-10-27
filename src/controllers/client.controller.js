@@ -231,11 +231,52 @@ export const getClientOverview = catchAsync(async (req, res) => {
 // ─────────────────────────────── Orders ───────────────────────────────
 
 const LIST_COLS = 'id, reference, brand, brand_order_number, external_source, tracking_number, status, has_issue, import_source, created_at, destination_city, destination_country';
-const LIST_SELECT = `${LIST_COLS}, order_kind, units:order_units!order_units_order_id_fkey(review_status, return_status, return_to, return_courier, return_tracking, held_at, hold_resolved_at)`;
-const LIST_SELECT_LEGACY = `${LIST_COLS}, units:order_units!order_units_order_id_fkey(id)`;
+const LIST_SELECT = `${LIST_COLS}, order_kind, units:order_units!order_units_order_id_fkey(line_no, unit_title, product_image_url, reference_images, review_status, return_status, return_to, return_courier, return_tracking, held_at, hold_resolved_at)`;
+const LIST_SELECT_LEGACY = `${LIST_COLS}, units:order_units!order_units_order_id_fkey(id, line_no, unit_title, product_image_url, reference_images)`;
+
+/** The first article of an order (by its line number): its name and a picture for the order list. A brand's product picture comes first, else the first photo the customer attached. */
+const firstArticle = (units) => {
+  const first = [...(units || [])].sort((a, b) => (a.line_no ?? 0) - (b.line_no ?? 0))[0];
+  if (!first) return { first_title: null, picture_url: null };
+  const photo = (Array.isArray(first.reference_images) ? first.reference_images : []).find((m) => m?.url && (!m.type || String(m.type).startsWith('image')));
+  return { first_title: first.unit_title || null, picture_url: first.product_image_url || photo?.url || null };
+};
+
+/** The stages on the customer's order list, in journey order (each is a set of order statuses). `return` and `hold` come from the articles. */
+export const CLIENT_STAGES = {
+  placed: ['submitted'],
+  received: ['received', 'assigned'],
+  tailoring: ['cutting', 'stitching'],
+  qc: ['qc_passed', 'customer_approval'],
+  ready: ['packed', 'invoice_issued', 'awaiting_payment', 'paid'],
+  on_the_way: ['at_admin_warehouse', 'partner_dispatch', 'shipped'],
+  delivered: ['delivered'],
+  cancelled: ['cancelled'],
+};
+
+/** Ids of this customer's orders that have an article put on hold (`hold`) or returned / being returned (`return`). */
+const orderIdsWithArticles = async (userId, key) => {
+  let q = supabaseAdmin.from('order_units').select('order_id, orders!order_units_order_id_fkey!inner(customer_id)').eq('orders.customer_id', userId);
+  q = key === 'hold' ? q.eq('return_status', 'held') : q.not('return_status', 'in', '(none,held)').not('return_status', 'is', null);
+  const rows = unwrap(await q, 'Could not load orders');
+  return [...new Set(rows.map((r) => r.order_id))];
+};
+
+/** Narrow an orders query to a status filter: a stage, a group (active / completed / draft), one status, or a return / hold. */
+const applyStatusFilter = async (query, userId, status) => {
+  if (!status) return query;
+  if (status === 'return' || status === 'hold') {
+    const ids = await orderIdsWithArticles(userId, status);
+    return query.in('id', ids.length ? ids : ['00000000-0000-0000-0000-000000000000']);
+  }
+  if (CLIENT_STAGES[status]) return query.in('status', CLIENT_STAGES[status]);
+  if (STATUS_GROUPS[status]) return query.in('status', STATUS_GROUPS[status]);
+  if (STATUS_LABELS[status]) return query.eq('status', status);
+  return query;
+};
 
 /**
- * GET /api/client/orders?page&limit&search&status=active|completed|all|<status>
+ * GET /api/client/orders?page&limit&search&status=all|draft|placed|received|tailoring|qc|ready|on_the_way|delivered|return|hold|cancelled
  */
 export const getClientOrders = catchAsync(async (req, res) => {
   const q = parseListQuery(req, { defaultLimit: 10, sortable: ['created_at', 'reference'] });
@@ -247,13 +288,11 @@ export const getClientOrders = catchAsync(async (req, res) => {
     .range(q.from, q.to);
 
   const status = req.query.status;
-  if (status && STATUS_GROUPS[status]) query = query.in('status', STATUS_GROUPS[status]);
-  else if (status && STATUS_LABELS[status]) query = query.eq('status', status);
+  query = await applyStatusFilter(query, req.userId, status);
   if (q.search) query = query.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
-  const rebuild = (select) => {
+  const rebuild = async (select) => {
     let qq = supabaseAdmin.from('orders').select(select, { count: 'exact' }).eq('customer_id', req.userId).order(q.sort, { ascending: q.ascending }).range(q.from, q.to);
-    if (status && STATUS_GROUPS[status]) qq = qq.in('status', STATUS_GROUPS[status]);
-    else if (status && STATUS_LABELS[status]) qq = qq.eq('status', status);
+    qq = await applyStatusFilter(qq, req.userId, status);
     if (q.search) qq = qq.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
     return qq;
   };
@@ -266,6 +305,7 @@ export const getClientOrders = catchAsync(async (req, res) => {
   const rows = unwrap(result, 'Could not load orders').map((o) => ({
     ...o,
     units_count: o.units?.length ?? 0,
+    ...firstArticle(o.units),
     return_badge: returnBadge(o.units),
     groups: groupSummary(o.reference, o.units),
     units: undefined,
@@ -274,19 +314,24 @@ export const getClientOrders = catchAsync(async (req, res) => {
   return sendPage(res, rows, q, result.count);
 });
 
-/** GET /api/client/orders/counts -> { all, draft, active, completed } for the tab bubbles. */
+/** GET /api/client/orders/counts -> { all, draft, active, completed, placed, received, tailoring, qc, ready, on_the_way, delivered, return, hold, cancelled } for the filter bubbles. */
 export const getClientOrderCounts = catchAsync(async (req, res) => {
-  const count = async (statuses) => {
+  const count = async (statuses, ids) => {
     let q = supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).eq('customer_id', req.userId);
     if (statuses) q = q.in('status', statuses);
+    if (ids) q = q.in('id', ids.length ? ids : ['00000000-0000-0000-0000-000000000000']);
     const r = await q;
     if (r.error) throw new Error('Could not count orders');
     return r.count || 0;
   };
-  const [all, draft, active, completed] = await Promise.all([
+  const keys = Object.keys(CLIENT_STAGES);
+  const [all, draft, active, completed, returned, held, ...stages] = await Promise.all([
     count(null), count(STATUS_GROUPS.draft), count(STATUS_GROUPS.active), count(STATUS_GROUPS.completed),
+    orderIdsWithArticles(req.userId, 'return').then((ids) => count(null, ids)),
+    orderIdsWithArticles(req.userId, 'hold').then((ids) => count(null, ids)),
+    ...keys.map((k) => count(CLIENT_STAGES[k])),
   ]);
-  return ApiResponse.success(res, { all, draft, active, completed });
+  return ApiResponse.success(res, { all, draft, active, completed, return: returned, hold: held, ...Object.fromEntries(keys.map((k, i) => [k, stages[i]])) });
 });
 
 export const getClientOrder = catchAsync(async (req, res) => {
@@ -758,7 +803,7 @@ export const listPendingApprovals = catchAsync(async (req, res) => {
   const cards = unwrap(
     await supabaseAdmin
       .from('job_cards')
-      .select('order_id, approval_requested_at, order:orders!inner(customer_id)')
+      .select('order_id, approval_requested_at, order:orders!order_units_order_id_fkey!inner(customer_id)')
       .in('approval_status', ['pending', 'approved', 'changes_requested'])
       .eq('order.customer_id', req.userId)
       .order('approval_requested_at', { ascending: false, nullsFirst: false })

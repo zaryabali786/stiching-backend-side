@@ -116,6 +116,16 @@ test('the payload names its recipient, order and link; every data value is a str
   assert.equal(m.apns.payload.aps.sound, 'default');
 });
 
+test('the notification carries the Stitch&Ship mark: the small icon and colour on Android, the icon and badge in a browser', async () => {
+  await notifications.notifyUser(C1, { type: 'order', title: 'Packed: STX-1', body: 'Soon on its way', orderId: ORDER });
+  await settle();
+  const m = sent[0].message;
+  assert.equal(m.android.notification.icon, 'ic_stat_logo');
+  assert.equal(m.android.notification.color, '#62003E');
+  assert.match(m.webpush.notification.icon, /\/assets\/icon\/notification-192\.png$/);
+  assert.match(m.webpush.notification.badge, /\/assets\/icon\/badge-96\.png$/);
+});
+
 test('a new order for admins reaches admins only: never customers or partners', async () => {
   await notifications.notifyAdmins({ type: 'alert', title: 'New order STX-1', orderId: ORDER, link: { admin: '/admin/orders?ref=STX-1' } });
   await settle();

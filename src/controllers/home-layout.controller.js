@@ -3,7 +3,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { catchAsync, ApiResponse, BadRequestError } from '../utils/error.helper.js';
 import { unwrap } from '../utils/db.js';
 import { parseListQuery, sendPage } from '../utils/pagination.js';
-import { uploadCatalogueImage } from '../services/storage.service.js';
+import { uploadCatalogueImage, uploadIconImage } from '../services/storage.service.js';
 
 /**
  * The customer app's home page is built from sections (announcement bar, banners, articles, ...) that the admin
@@ -46,6 +46,22 @@ const imageUrl = (v) => {
 const uuidOrEmpty = (v) => (typeof v === 'string' && UUID.test(v) ? v : '');
 const ids = (max) => (v) => (Array.isArray(v) ? [...new Set(v.filter((x) => typeof x === 'string' && UUID.test(x)))].slice(0, max) : []);
 
+/** One card of a "steps" section (How it works): a title, a short text, a picture / emoji, and two colours that make its background. */
+const cleanStep = (s) => {
+  const bg = color('#F3E8FF')(s?.bg);
+  return {
+    title: oneLine(60)(s?.title),
+    text: oneLine(220)(s?.text),
+    icon_url: imageUrl(s?.icon_url),
+    emoji: oneLine(8)(s?.emoji),
+    bg,
+    bg2: HEX.test(String(s?.bg2)) ? String(s.bg2).toUpperCase() : bg,
+    color: color('#1F2937')(s?.color),
+    link: link(s?.link),
+  };
+};
+const steps = (max) => (v) => (Array.isArray(v) ? v.slice(0, max).map(cleanStep) : []);
+
 /** What each section type may store. Anything not listed here is discarded. */
 const SCHEMAS = {
   announcement: {
@@ -73,6 +89,10 @@ const SCHEMAS = {
   collection: {
     title: oneLine(100), article_ids: ids(24), layout: oneOf(['grid', 'list', 'slider'], 'slider'),
     columns: int(1, 3, 2), autoplay: bool(false), button_label: oneLine(40), button_link: link,
+  },
+  // "How it works": a row of cards (swipeable, or a grid), each with a picture or emoji, a number and its own colours
+  steps: {
+    title: oneLine(100), highlight: oneLine(40), highlight_color: color('#6D1D3A'), subtitle: oneLine(200), layout: oneOf(['slider', 'grid'], 'slider'), show_numbers: bool(true), number_color: color('#FFFFFF'), items: steps(12),
   },
   custom: {
     heading: oneLine(120), body: text(1500), align: oneOf(['left', 'center'], 'left'),
@@ -166,6 +186,14 @@ export const uploadHomeImage = catchAsync(async (req, res) => {
   const upload = req.body?.image_upload;
   if (!upload?.dataUrl) throw new BadRequestError('Choose a picture.');
   const { url } = await uploadCatalogueImage('home', upload);
+  return ApiResponse.created(res, { url }, 'Picture uploaded.');
+});
+
+/** POST /admin/home-layout/icon  body: { image_upload: { name, dataUrl } } → { url } for a card of a "steps" section (keeps transparency, accepts SVG) */
+export const uploadHomeIcon = catchAsync(async (req, res) => {
+  const upload = req.body?.image_upload;
+  if (!upload?.dataUrl) throw new BadRequestError('Choose a picture.');
+  const { url } = await uploadIconImage('home', upload);
   return ApiResponse.created(res, { url }, 'Picture uploaded.');
 });
 

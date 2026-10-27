@@ -32,7 +32,7 @@ const shapeListRow = (row) => ({
   import_id: row.import_id,
   match: shapeMatch(row),
   draft: row.order_imports
-    ? { status: row.order_imports.status, brand: row.order_imports.extracted?.brand ?? null, items: row.order_imports.extracted?.items?.length ?? 0 }
+    ? { status: row.order_imports.status, brand: row.order_imports.extracted?.brand ?? null, items: row.order_imports.extracted?.items?.length ?? 0, picture_url: (row.order_imports.extracted?.items ?? []).find((i) => i?.image_url)?.image_url ?? null }
     : null,
 });
 

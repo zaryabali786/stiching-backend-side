@@ -120,9 +120,15 @@ export const resolveEmailTarget = async (userId, extracted) => {
  * Save the courier and tracking number from an email on its order.
  * @returns {Promise<{ changed: boolean, stale?: boolean, summary: string }>}
  */
+/** A reader of the email may answer "null", "none" or "n/a" for a detail that is not there: that is no detail. */
+const detail = (v, max) => {
+  const t = String(v ?? '').trim().slice(0, max);
+  return /^(null|undefined|none|n\/a|na|nil|-+)$/i.test(t) ? '' : t;
+};
+
 export const applyShippingUpdate = async (order, extracted, { receivedAt }) => {
-  const tracking = String(extracted?.tracking_number ?? '').trim().slice(0, 60);
-  const courierText = String(extracted?.courier_name ?? '').trim().slice(0, 80);
+  const tracking = detail(extracted?.tracking_number, 60);
+  const courierText = detail(extracted?.courier_name, 80);
   if (!tracking && !courierText) return { changed: false, summary: 'No shipping details in this email.' };
 
   const sentAt = new Date(receivedAt);
@@ -162,7 +168,7 @@ export const applyShippingUpdate = async (order, extracted, { receivedAt }) => {
     return fresh ? applyShippingUpdate(fresh, extracted, { receivedAt }) : { changed: false, summary: 'The order is no longer available.' };
   }
 
-  const summary = [courierLabel, tracking || order.tracking_number].filter(Boolean).join(' · ') || 'shipping details';
+  const summary = [detail(courierLabel, 80), tracking || detail(order.tracking_number, 60)].filter(Boolean).join(' · ') || 'shipping details';
   await addEvent(order.id, updated.status, `Shipping details updated from an email: ${summary}`, null);
   return { changed: true, summary };
 };

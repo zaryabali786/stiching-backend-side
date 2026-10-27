@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../config/supabase.js';
+import { ilikeAny } from '../utils/pagination.js';
 import { config } from '../config/env.js';
 import { ConflictError, NotFoundError } from '../utils/error.helper.js';
 import { atelierCountryName, atelierMailingAddress, loadShipTo } from './ship-to.service.js';
@@ -640,21 +641,48 @@ export const resendCustomerEmail = async (rowId) => {
 };
 
 /** Everything an admin has to look at: failed orders, held addresses, customers who were not emailed, a tag or an address that did not go through. */
+const QUEUE_SELECT = 'id, store_id, shopify_order_id, shopify_order_name, order_id, customer_email, ref_code, state, address_state, hold_state, notified_at, last_error, created_at, store:shopify_stores!shopify_orders_store_id_fkey(shop_domain), order:orders!shopify_orders_order_id_fkey(id, reference)';
+
+const needsAttention = (r) =>
+  r.state === 'failed' ||
+  ['split_failed', 'split_pending'].includes(r.state) ||
+  (r.address_state === 'address_mismatch' && r.hold_state === 'held') ||
+  r.hold_state === 'failed' ||
+  (r.state === 'draft_created' && !r.notified_at) ||
+  (r.state === 'draft_created' && /Could not (tag|set the atelier)/i.test(r.last_error || ''));
+
+const decorate = (r) => ({ ...r, store: Array.isArray(r.store) ? r.store[0] : r.store, order: Array.isArray(r.order) ? r.order[0] : r.order, needs_attention: needsAttention(r) });
+
 export const shopifyQueue = async () => {
-  const { data, error } = await supabaseAdmin
-    .from('shopify_orders')
-    .select('id, store_id, shopify_order_id, shopify_order_name, order_id, customer_email, ref_code, state, address_state, hold_state, notified_at, last_error, created_at, store:shopify_stores!shopify_orders_store_id_fkey(shop_domain), order:orders!shopify_orders_order_id_fkey(id, reference)')
-    .order('created_at', { ascending: false })
-    .limit(200);
+  const { data, error } = await supabaseAdmin.from('shopify_orders').select(QUEUE_SELECT).order('created_at', { ascending: false }).limit(200);
   if (error) throw error;
-  const attention = (r) =>
-    r.state === 'failed' ||
-    ['split_failed', 'split_pending'].includes(r.state) ||
-    (r.address_state === 'address_mismatch' && r.hold_state === 'held') ||
-    r.hold_state === 'failed' ||
-    (r.state === 'draft_created' && !r.notified_at) ||
-    (r.state === 'draft_created' && /Could not (tag|set the atelier)/i.test(r.last_error || ''));
-  return (data || []).map((r) => ({ ...r, store: Array.isArray(r.store) ? r.store[0] : r.store, order: Array.isArray(r.order) ? r.order[0] : r.order, needs_attention: attention(r) }));
+  return (data || []).map(decorate);
+};
+
+/**
+ * One page of the Shopify orders (newest first) for the admin table: searched on the server by Shopify order number, customer email, store or
+ * the app order reference (SA-…), and optionally limited to one store. `list` is parseListQuery's result (page, limit, search, from, to).
+ * @returns {Promise<{ rows: object[], total: number }>}
+ */
+export const shopifyOrdersPage = async (list, { storeId = null } = {}) => {
+  let query = supabaseAdmin.from('shopify_orders').select(QUEUE_SELECT, { count: 'exact' }).order('created_at', { ascending: false }).range(list.from, list.to);
+  if (storeId) query = query.eq('store_id', storeId);
+  if (list.search) {
+    // the store's address and the app order's reference live in other tables: find their ids first, then match on them as well
+    const [stores, orders] = await Promise.all([
+      supabaseAdmin.from('shopify_stores').select('id').ilike('shop_domain', `%${list.search}%`).limit(50),
+      supabaseAdmin.from('orders').select('id').ilike('reference', `%${list.search}%`).limit(50),
+    ]);
+    const parts = [ilikeAny(['shopify_order_name', 'shopify_order_id', 'customer_email', 'ref_code'], list.search)];
+    const storeIds = (stores.data || []).map((r) => r.id);
+    const orderIds = (orders.data || []).map((r) => r.id);
+    if (storeIds.length) parts.push(`store_id.in.(${storeIds.join(',')})`);
+    if (orderIds.length) parts.push(`order_id.in.(${orderIds.join(',')})`);
+    query = query.or(parts.join(','));
+  }
+  const { data, error, count } = await query;
+  if (error) throw error;
+  return { rows: (data || []).map(decorate), total: count || 0 };
 };
 
 export { getActiveStore };

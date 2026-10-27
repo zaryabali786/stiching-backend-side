@@ -5,7 +5,8 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { config } from '../config/env.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, NotFoundError } from '../utils/error.helper.js';
 import { buildInstallUrl, completeInstall, connectPaymentRule, connectProductMetafield, connectShipping, connectWebhooks, normaliseShop, readInstallState, shopFromInput, shopifyConfigured, verifyOAuthHmac, verifyWebhookHmac } from '../services/shopify.service.js';
-import { confirmAtelierAddress, importShopifyOrder, resendCustomerEmail, retryShopifyOrder, shopifyQueue } from '../services/shopify-orders.service.js';
+import { confirmAtelierAddress, importShopifyOrder, resendCustomerEmail, retryShopifyOrder, shopifyOrdersPage, shopifyQueue } from '../services/shopify-orders.service.js';
+import { parseListQuery, sendPage } from '../utils/pagination.js';
 import { processWebhookEvent, recordWebhookEvent } from '../services/shopify-events.service.js';
 import { atelierCountryName, loadShipTo, shipToView } from '../services/ship-to.service.js';
 import { smsEnabled } from '../services/sms.service.js';
@@ -201,6 +202,14 @@ export const setupShopifyShipping = catchAsync(async (req, res) => {
 
 /** GET /api/admin/shopify/queue — failed orders, held addresses, customers who were not emailed. */
 export const getShopifyQueue = catchAsync(async (req, res) => ApiResponse.success(res, await shopifyQueue()));
+
+/** GET /api/admin/shopify/orders?page=&limit=&search=&store= — one page of the Shopify orders, searched on the server. */
+export const listShopifyOrdersPage = catchAsync(async (req, res) => {
+  const list = parseListQuery(req, { defaultLimit: 15, maxLimit: 50 });
+  const storeId = /^[0-9a-f-]{36}$/i.test(String(req.query.store || '')) ? String(req.query.store) : null;
+  const { rows, total } = await shopifyOrdersPage(list, { storeId });
+  return sendPage(res, rows, list, total);
+});
 
 export const retryShopifyOrderRequest = catchAsync(async (req, res) => {
   const result = await retryShopifyOrder(req.params.id);

@@ -40,6 +40,7 @@ before(async () => {
       importShopifyOrder: async () => ({}),
       retryShopifyOrder: async () => ({}),
       shopifyQueue: async () => [],
+      shopifyOrdersPage: async () => ({ rows: [], total: 0 }),
     },
   });
   ctl = await import('../src/controllers/shopify.controller.js');

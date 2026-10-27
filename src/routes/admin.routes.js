@@ -1,4 +1,4 @@
-import { addShopifyStore, createShopifyTickBox, setupShopifyShipping, getShopifyQueue, importShopifyOrderRequest, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, reconnectShopifyWebhooks, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
+import { addShopifyStore, createShopifyTickBox, setupShopifyShipping, getShopifyQueue, importShopifyOrderRequest, listShopifyOrdersPage, listShopifyStores, resendShopifyEmailRequest, retryShopifyEvent, reconnectShopifyWebhooks, retryShopifyOrderRequest, updateShopifyStore } from '../controllers/shopify.controller.js';
 import { checkStaffCodPayment, getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
@@ -70,13 +70,13 @@ import {
   markParcelDelivered,
 } from '../controllers/finance.controller.js';
 
-import { listHomeArticles, getAdminHomeLayout, saveAdminHomeLayout, uploadHomeImage } from '../controllers/home-layout.controller.js';
+import { listHomeArticles, getAdminHomeLayout, saveAdminHomeLayout, uploadHomeImage, uploadHomeIcon } from '../controllers/home-layout.controller.js';
 import { getClientTheme, setClientTheme, createClientPreset, deleteClientPreset } from '../controllers/theme.controller.js';
 import { getDashboard, getDashboardLayout, setDashboardLayout, resetDashboardLayout } from '../controllers/dashboard.controller.js';
 import { getPortalTheme, setPortalTheme, resetPortalTheme, createPortalPreset, deletePortalPreset } from '../controllers/portal-theme.controller.js';
 import { getBanners, createBanner, updateBanner, deleteBanner } from '../controllers/banner.controller.js';
 
-import { getSupportConversations, getSupportThread, sendSupportAsAdmin, readSupportAsAdmin } from '../controllers/support.controller.js';
+import { getSupportConversations, getSupportThread, sendSupportAsAdmin, uploadSupportVoiceAsAdmin, readSupportAsAdmin } from '../controllers/support.controller.js';
 import { inActivePartnerOrder } from '../middlewares/ownership.middleware.js';
 
 const router = Router();
@@ -85,6 +85,7 @@ const router = Router();
 router.get('/support/conversations', getSupportConversations);
 router.get('/support/:customerId/messages', getSupportThread);
 router.post('/support/:customerId/messages', sendSupportAsAdmin);
+router.post('/support/:customerId/voice-upload', uploadSupportVoiceAsAdmin);
 router.post('/support/:customerId/read', readSupportAsAdmin);
 
 router.get('/overview', getAdminOverview);
@@ -104,6 +105,7 @@ router.post('/shopify/stores/:id/tick-box', createShopifyTickBox);
 router.post('/shopify/stores/:id/shipping', setupShopifyShipping);
 router.post('/shopify/stores/:id/import', importShopifyOrderRequest);
 router.get('/shopify/queue', getShopifyQueue);
+router.get('/shopify/orders', listShopifyOrdersPage);
 
 // Ecommerce (the Shop): brands, catalog, orders, commission. Full admins only (the module gate closes unknown prefixes to restricted admins).
 router.get('/shop/brands', adminShopBrands);
@@ -189,6 +191,7 @@ router.get('/home-layout', getAdminHomeLayout);
 router.get('/home-layout/articles', listHomeArticles);
 router.put('/home-layout', saveAdminHomeLayout);
 router.post('/home-layout/image', uploadHomeImage);
+router.post('/home-layout/icon', uploadHomeIcon);
 
 // Customer app appearance (colours, fonts)
 router.get('/settings/client-theme', getClientTheme);

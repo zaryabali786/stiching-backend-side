@@ -86,6 +86,50 @@ export const uploadCatalogueImage = async (folder, file) => {
   return { url: uploaded.url, path: uploaded.path };
 };
 
+// ─────────── Icons and illustrations for home page cards (public bucket; PNG with transparency, WebP, JPG, GIF or SVG) ───────────
+
+const ICON_MAX_BYTES = 2 * 1024 * 1024;
+const ICON_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'image/svg+xml': 'svg' };
+
+/**
+ * An SVG is a small program: it is only accepted as a plain drawing. Scripts, event handlers, embedded pages, DOCTYPE / ENTITY tricks and
+ * references to other files or web addresses are refused, so the file is safe to show in an <img> and to open on its own.
+ */
+const LOCAL_REF = /^(#|data:image\/(?:png|jpe?g|webp|gif);base64,)/i;
+/** True when any href points somewhere other than the drawing itself (#id) or a small picture stored inside it. */
+const hasOutsideHref = (text) =>
+  [...text.matchAll(/(?:xlink:)?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/gi)].some((m) => !LOCAL_REF.test((m[1] ?? m[2] ?? m[3] ?? '').trim()));
+
+export const assertSafeSvg = (markup) => {
+  const text = String(markup || '');
+  const head = text.replace(/^\uFEFF/, '').replace(/<\?xml[\s\S]*?\?>/i, '').replace(/<!--[\s\S]*?-->/g, '').trimStart();
+  if (!/^<svg[\s>]/i.test(head)) throw new BadRequestError('This file is not a valid SVG drawing.');
+  const bad =
+    /<\s*(script|foreignObject|iframe|object|embed|audio|video)\b/i.test(text) ||
+    /<!(DOCTYPE|ENTITY)/i.test(text) ||
+    /\son[a-z]+\s*=/i.test(text) ||
+    /javascript\s*:/i.test(text) ||
+    /@import/i.test(text) ||
+    /url\(\s*["']?\s*(https?:|\/\/|data:(?!image\/))/i.test(text) ||
+    hasOutsideHref(text);
+  if (bad) throw new BadRequestError('This SVG contains something that is not allowed (scripts, links or other files). Export it again as a plain drawing.');
+};
+
+/** Upload one card icon (data URL). The transparent background of a PNG / SVG is kept. @returns {{ url: string, path: string }} */
+export const uploadIconImage = async (folder, file) => {
+  const match = /^data:(image\/(?:png|jpe?g|webp|gif|svg\+xml));base64,(.+)$/s.exec(file?.dataUrl || '');
+  if (!match) throw new BadRequestError('Upload a PNG, SVG, WebP or JPG picture.');
+  const [, mime, base64] = match;
+  const buffer = Buffer.from(base64, 'base64');
+  if (!buffer.length) throw new BadRequestError('The picture is empty.');
+  if (buffer.length > ICON_MAX_BYTES) throw new BadRequestError('The picture must be smaller than 2 MB.');
+  if (mime === 'image/svg+xml') assertSafeSvg(buffer.toString('utf8'));
+  const path = `${folder}/${randomUUID()}.${ICON_EXT[mime]}`;
+  const { error } = await supabaseAdmin.storage.from(BUCKET).upload(path, buffer, { contentType: mime, upsert: false });
+  if (error) throw new BadRequestError(`Upload failed: ${error.message}`);
+  return { url: supabaseAdmin.storage.from(BUCKET).getPublicUrl(path).data.publicUrl, path };
+};
+
 /**
  * Save one product picture (bytes) in the public bucket under a stable name, so the same picture is stored only once.
  * @returns {Promise<string>} its public URL

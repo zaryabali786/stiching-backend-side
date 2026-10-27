@@ -41,7 +41,7 @@ import {
 } from '../controllers/catalogue.controller.js';
 import { listClientPartners } from '../controllers/partner-directory.controller.js';
 import { getInbox, getMailbox, getUnreadCount, getEmail, readAll, removeEmail, send as sendInboxEmail } from '../controllers/inbox.controller.js';
-import { getMySupport, sendMySupport, readMySupport, getMySupportUnread } from '../controllers/support.controller.js';
+import { getMySupport, sendMySupport, uploadMySupportVoice, readMySupport, getMySupportUnread } from '../controllers/support.controller.js';
 import { previewProduct } from '../controllers/client.controller.js';
 import { getMessages, postMessage, uploadVoice, readMessages, uploadVoiceNote, getConversationScopes, getMyConversations } from '../controllers/chat.controller.js';
 import { createPaymentIntent, confirmPayment } from '../controllers/payment.controller.js';
@@ -60,6 +60,7 @@ router.get('/home-layout', getClientHomeLayout);
 // General chat with the admin team (not about an order)
 router.get('/support/messages', getMySupport);
 router.post('/support/messages', sendMySupport);
+router.post('/support/voice-upload', uploadMySupportVoice);
 router.post('/support/read', readMySupport);
 router.get('/support/unread', getMySupportUnread);
 

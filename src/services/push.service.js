@@ -4,6 +4,12 @@ import { getMessaging } from 'firebase-admin/messaging';
 import { config } from '../config/env.js';
 import { supabaseAdmin } from '../config/supabase.js';
 
+/** The picture of a browser notification and its small badge: the Stitch&Ship mark, served by the customer site. */
+const webIcons = () => {
+  const base = String(config.urls?.clientApp || '').replace(/\/$/, '');
+  return base ? { icon: `${base}/assets/icon/notification-192.png`, badge: `${base}/assets/icon/badge-96.png` } : {};
+};
+
 /**
  * Push notifications through Firebase Cloud Messaging.
  * A push only goes to the devices registered by the user the notification belongs to (push_devices.user_id).
@@ -64,13 +70,14 @@ export const pushToUser = async (userId, n) => {
         userId: String(userId),
       },
       // a retried send replaces the earlier tray entry instead of stacking a copy (tag = notification id)
-      android: { priority: 'high', notification: { channelId: 'default', ...(notificationId ? { tag: notificationId } : {}) } },
+      // Android: the small mark in the status bar is the white Stitch&Ship shape in the app (drawable ic_stat_logo), in the brand's dark red
+      android: { priority: 'high', notification: { channelId: 'default', icon: 'ic_stat_logo', color: '#62003E', ...(notificationId ? { tag: notificationId } : {}) } },
       // iOS: delivered through APNs (the APNs key is uploaded in Firebase). Same collapse-id as above; thread-id groups one order
       apns: {
         headers: { 'apns-priority': '10', 'apns-push-type': 'alert', ...(notificationId ? { 'apns-collapse-id': notificationId.slice(0, 64) } : {}) },
         payload: { aps: { sound: 'default', 'thread-id': orderId || n.type || 'update' } },
       },
-      webpush: { fcmOptions: n.link ? { link: n.link } : undefined },
+      webpush: { notification: webIcons(), fcmOptions: n.link ? { link: n.link } : undefined },
     });
 
     const dead = [];
