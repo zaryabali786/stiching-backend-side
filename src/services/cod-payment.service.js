@@ -6,6 +6,7 @@ import { addEvent, STATUS_LABELS } from './order.service.js';
 import { isCod } from './email-order-match.service.js';
 import { notifyUser, notifyAdmins } from './notification.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
+import { gatewayFor, startPayfastCheckout, latestPayfastPayment } from './payfast.service.js';
 import { cancelPaymentIntent, createCheckoutSession, createCodPaymentIntent, expireCheckoutSession, isStripeEnabled, retrieveCheckoutSession, retrievePaymentIntent, toMinorUnits } from './stripe.service.js';
 
 /**
@@ -450,12 +451,15 @@ export const createCodCheckout = async ({ order, customer }) => {
  * the same amount is reused, so reopening the sheet or clicking twice never creates a second payable intent.
  */
 export const startCodPayment = async ({ order, customer }) => {
-  if (!isStripeEnabled()) throw new BadRequestError('Card payments are not available yet.');
   const view = codView(order);
   if (order.payment_type !== 'COD') throw new BadRequestError('This is not a cash on delivery order.');
   if (view.payment_status === 'PAID') throw new ConflictError('This order is already paid.');
   if (view.needs_verification || !view.can_pay) throw new ConflictError('Our team is still confirming the total of this order. You can pay once it is confirmed.');
   const { amount, currency } = view;
+
+  // delivered inside Pakistan (and the total is in PKR): paid with PayFast; everything else keeps using Stripe
+  if (gatewayFor({ order, currency }) === 'payfast') return startCodPayfast({ order, customer, amount });
+  if (!isStripeEnabled()) throw new BadRequestError('Card payments are not available yet.');
   const minor = toMinorUnits(amount, currency);
   const currencyLow = String(currency).toLowerCase();
 
@@ -503,12 +507,24 @@ export const startCodPayment = async ({ order, customer }) => {
   return { clientSecret: intent.client_secret, paymentIntentId: intent.id, amount, currency, reference: order.reference, publishableKey: config.stripe.publishableKey, reused: false };
 };
 
+/** The PayFast form for this COD order (PKR total from the database). The customer is sent to PayFast; the order is marked paid only by the verified callback. */
+const startCodPayfast = async ({ order, customer, amount }) => {
+  const checkout = await startPayfastCheckout({ kind: 'cod', order, amount, customer });
+  const { data, error } = await notPaid(supabaseAdmin.from('orders').update({ cod_payment_status: 'PENDING', updated_at: new Date().toISOString() }).eq('id', order.id))
+    .select('id')
+    .maybeSingle();
+  if (error) dbError(error, 'save the payment');
+  if (!data) throw new ConflictError('This order was just paid.');
+  emitPaymentUpdate({ ...order, cod_payment_status: 'PENDING' });
+  return { provider: 'payfast', payfast: { action: checkout.action, method: checkout.method, fields: checkout.fields }, amount: checkout.amount, currency: 'PKR', reference: order.reference, reused: false };
+};
+
 const alertAdmins = (order, body) =>
   notifyAdmins({ type: 'alert', title: `Check payment for ${order.reference}`, body, link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
 
 /** Everyone who needs to know that a COD order was paid: the order's history, the customer, the admins, and every open screen. */
-const announcePaid = async (order) => {
-  await addEvent(order.id, order.status, `Cash on delivery payment received · ${order.cod_currency} ${round2(order.cod_amount)} (Stripe)`, order.customer_id);
+const announcePaid = async (order, via = 'Stripe') => {
+  await addEvent(order.id, order.status, `Cash on delivery payment received · ${order.cod_currency} ${round2(order.cod_amount)} (${via})`, order.customer_id);
   await notifyUser(order.customer_id, { type: 'invoice', title: `Payment confirmed: ${order.reference}`, body: 'Thank you! Your payment is confirmed. Your parcel can now be received.', link: `/app/orders/${order.id}`, orderId: order.id });
   await notifyAdmins({ type: 'invoice', title: `COD payment received: ${order.reference}`, body: `${order.cod_currency} ${round2(order.cod_amount)} · ${order.customer_name || ''}`.trim(), link: `/admin/orders?ref=${order.reference}`, orderId: order.id });
   emitPaymentUpdate({ ...order, cod_payment_status: 'PAID' });
@@ -595,6 +611,42 @@ export const settleCodIntent = async (intent) => {
 };
 
 /**
+ * A PayFast payment whose signature, result code and amount were already verified (see payfast-payment.service.js) becomes PAID here.
+ * The order must still be COD, unpaid, and its saved total must equal what PayFast was asked to charge; otherwise nothing is marked
+ * paid and an administrator is told.
+ * @param {{ order_id: string, amount: number|string, basket_id: string }} row the payfast_payments row
+ */
+export const settleCodPayfast = async (row, transactionId) => {
+  const order = await reload(row.order_id);
+  if (!order) return { settled: false, reason: 'order not found' };
+  if (order.cod_payment_status === 'PAID') return { settled: false, reason: 'already paid' };
+  const paid = Number(row.amount);
+  const matches = order.payment_type === 'COD' && String(order.cod_currency).toUpperCase() === 'PKR' && order.cod_amount != null && Math.abs(Number(order.cod_amount) - paid) < 0.005;
+  if (!matches) {
+    await alertAdmins(order, `PayFast received PKR ${paid.toFixed(2)} (${transactionId || row.basket_id}) but the order expects ${order.cod_currency || '-'} ${order.cod_amount ?? '-'} (${order.payment_type || 'no payment type'}). Check it and refund if needed.`);
+    return { settled: false, reason: 'amount or order state mismatch' };
+  }
+  const now = new Date().toISOString();
+  const { data: flipped, error } = await notPaid(
+    supabaseAdmin.from('orders').update({ cod_payment_status: 'PAID', cod_paid_at: now, cod_paid_minor: Math.round(paid * 100), updated_at: now }).eq('id', order.id)
+  )
+    .select('id')
+    .maybeSingle();
+  if (error) dbError(error, 'mark the order paid');
+  if (!flipped) return { settled: false, reason: 'already paid' };
+  await announcePaid(order, 'PayFast');
+  return { settled: true };
+};
+
+/** A PayFast attempt failed or was cancelled: an unpaid COD order drops back to Unpaid so Pay Now works again. */
+export const releaseCodPayfast = async (orderId) => {
+  const { data } = await notPaid(supabaseAdmin.from('orders').update({ cod_payment_status: 'UNPAID', updated_at: new Date().toISOString() }).eq('id', orderId).eq('cod_payment_status', 'PENDING'))
+    .select('id, reference, customer_id, partner_id, status')
+    .maybeSingle();
+  if (data) emitPaymentUpdate(data);
+};
+
+/**
  * Shopify itself now reports the brand order as fully paid (the customer paid the brand after all): there is nothing to collect, so a COD
  * order that has not been paid here becomes Non-COD, its open payment is closed, and receiving is no longer blocked. A COD order the
  * customer already paid here keeps its payment (that money is on our ledger; it is never silently dropped).
@@ -653,6 +705,11 @@ export const releaseCodSession = async (session) => {
  */
 export const confirmCodPayment = async (order) => {
   if (order.cod_payment_status === 'PAID') return { paid: true, status: 'PAID' };
+  // PayFast: nothing is trusted from the customer's browser; "paid" is only set by the verified callback, this just reports it
+  if (!order.cod_stripe_payment_intent && !order.cod_stripe_session_id) {
+    const attempt = await latestPayfastPayment(order.id, 'cod').catch(() => null);
+    if (attempt) return { paid: false, status: order.cod_payment_status || 'UNPAID', payfast_status: attempt.status };
+  }
   if (order.cod_stripe_payment_intent && isStripeEnabled()) {
     let intent = null;
     try {

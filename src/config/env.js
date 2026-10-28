@@ -44,6 +44,24 @@ export const config = {
     publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || '',
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
   },
+  // PayFast (Pakistan, PKR): used for orders delivered inside Pakistan; Stripe stays for deliveries abroad. The secured key is server-only.
+  payfast: (() => {
+    const live = (process.env.PAYFAST_ENV || '').trim().toLowerCase() === 'live';
+    return {
+      live,
+      merchantId: (process.env.PAYFAST_MERCHANT_ID || '').trim(),
+      securedKey: (process.env.PAYFAST_SECURED_KEY || '').trim(),
+      merchantName: (process.env.PAYFAST_MERCHANT_NAME || process.env.PLATFORM_NAME || 'V360').trim(),
+      storeId: (process.env.PAYFAST_STORE_ID || '').trim(),
+      // sandbox by default; PAYFAST_ENV=live switches to the real gateway
+      baseUrl: (process.env.PAYFAST_BASE_URL || (live ? 'https://ipg1.apps.net.pk/Ecommerce/api/Transaction' : 'https://ipguat.apps.net.pk/Ecommerce/api/Transaction')).trim().replace(/\/$/, ''),
+      // the public address of THIS server: PayFast calls <apiUrl>/api/webhooks/payfast (IPN) and sends the customer to <apiUrl>/api/payfast/return
+      apiUrl: (process.env.PAYFAST_API_URL || process.env.SHOPIFY_APP_URL || '').trim().replace(/\/$/, ''),
+      // DEVELOPMENT ONLY (ignored when PAYFAST_ENV=live): settle from the customer's return redirect when PayFast's server-to-server call cannot reach localhost
+      trustReturn: !live && String(process.env.PAYFAST_TRUST_RETURN || '').toLowerCase() === 'true',
+      timeoutMs: Number(process.env.PAYFAST_TIMEOUT_MS) || 15000,
+    };
+  })(),
   // Google sign-in (authorization-code flow). The secret never leaves the server.
   // PostEx (Pakistan) merchant API. Without a token PostEx works like any other courier: the CN is typed in. The token stays on the server.
   postex: {

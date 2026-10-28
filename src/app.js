@@ -5,6 +5,7 @@ import apiRouter from './routes/index.js';
 import { notFoundHandler, errorHandler } from './middlewares/error.middleware.js';
 import { stripeWebhook } from './controllers/payment.controller.js';
 import { shopifyWebhook } from './controllers/shopify.controller.js';
+import { payfastIpn, payfastReturn } from './controllers/payfast.controller.js';
 
 const app = express();
 
@@ -26,6 +27,10 @@ app.use('/api/inbound/email', express.json({ limit: '45mb' }));
 // Large enough for a few base64-encoded photos (issue evidence, QC photos)
 app.use(express.json({ limit: '30mb' }));
 app.use(express.urlencoded({ extended: true, limit: '30mb' }));
+
+// PayFast (Pakistan): its server-to-server notification and the customer's return. Fields arrive as a query string or a form (parsed above).
+app.all('/api/webhooks/payfast', payfastIpn);
+app.all('/api/payfast/return', payfastReturn);
 
 // Root welcome endpoint
 app.get('/', (req, res) => {

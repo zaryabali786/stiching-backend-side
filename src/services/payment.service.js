@@ -49,6 +49,11 @@ export const settleSucceededIntent = async (intent) => {
     return { settled: false, reason: 'amount or invoice state mismatch' };
   }
 
+  return markInvoicePaid({ invoice, order, expected, via: 'Card' });
+};
+
+/** Flip an issued invoice to paid (only the first caller wins), move the order to paid and tell everyone. Shared by Stripe and PayFast. */
+const markInvoicePaid = async ({ invoice, order, expected, via }) => {
   // only the first caller gets a row back here
   const now = new Date().toISOString();
   const { data: flipped } = await supabaseAdmin
@@ -60,7 +65,7 @@ export const settleSucceededIntent = async (intent) => {
   if (!flipped?.length) return { settled: false, reason: 'already paid' };
 
   await setOrderStatus(order.id, 'paid', {
-    note: `Card payment received · ${expected.currency} ${round2(expected.amount)} (invoice ${invoice.number})`,
+    note: `${via} payment received · ${expected.currency} ${round2(expected.amount)} (invoice ${invoice.number})`,
     actorId: order.customer_id,
     extra: { paid_at: now },
   });
@@ -68,6 +73,40 @@ export const settleSucceededIntent = async (intent) => {
   await notifyPartner({ type: 'invoice', title: `Paid: ${order.reference}`, body: 'Choose the dispatch route in Warehouse.', link: '/partner/warehouse?tab=paid', orderId: order.id }, null, { module: 'warehouse' });
   await notifyAdmins({ type: 'invoice', title: `Payment received: ${order.reference}`, body: `${expected.currency} ${round2(expected.amount)} · ${order.customer_name}`, link: '/admin/invoices?tab=paid', orderId: order.id });
   return { settled: true };
+};
+
+/**
+ * A PayFast payment whose signature, result code and amount were already verified (payfast-payment.service.js) becomes "invoice paid".
+ * The invoice must still be open and its PKR total must equal what PayFast was asked to charge; otherwise nothing is marked paid.
+ */
+export const settleInvoicePayfast = async (row, transactionId) => {
+  const { data: invoice } = await supabaseAdmin.from('invoices').select('*').eq('id', row.invoice_id).maybeSingle();
+  if (!invoice) return { settled: false, reason: 'invoice not found' };
+  const { data: order } = await supabaseAdmin.from('orders').select('*').eq('id', invoice.order_id).maybeSingle();
+  if (!order) return { settled: false, reason: 'order not found' };
+  if (invoice.status === 'paid') return { settled: false, reason: 'already paid' };
+
+  const paid = Number(row.amount);
+  if (invoice.status !== 'issued' || Math.abs(Number(invoice.total_pkr) - paid) >= 0.005) {
+    await notifyAdmins({
+      type: 'alert',
+      title: `Check payment for ${order.reference}`,
+      body: `PayFast received PKR ${paid.toFixed(2)} (${transactionId || row.basket_id}) but invoice ${invoice.number} is ${invoice.status} / expects PKR ${invoice.total_pkr}. Check it and refund if needed.`,
+      link: `/admin/orders?ref=${order.reference}`,
+      orderId: order.id,
+    });
+    return { settled: false, reason: 'amount or invoice state mismatch' };
+  }
+
+  // keep the payments history in step with Stripe payments (one row per attempt: the basket id is the reference)
+  const { data: existingRow } = await supabaseAdmin.from('payments').select('id, status').eq('provider_ref', row.basket_id).maybeSingle();
+  if (existingRow) {
+    if (existingRow.status !== 'succeeded') await supabaseAdmin.from('payments').update({ status: 'succeeded' }).eq('id', existingRow.id);
+  } else {
+    const { error } = await supabaseAdmin.from('payments').insert({ invoice_id: invoice.id, order_id: order.id, amount_pkr: invoice.total_pkr, amount_foreign: invoice.total_foreign, currency: 'PKR', method: 'card', provider_ref: row.basket_id, status: 'succeeded', created_by: order.customer_id });
+    if (error) console.warn('[Payment] could not record the PayFast payment:', error.message);
+  }
+  return markInvoicePaid({ invoice, order, expected: { currency: 'PKR', amount: paid }, via: 'PayFast' });
 };
 
 /** A card was declined or authentication failed: mark the attempt and tell the customer. */

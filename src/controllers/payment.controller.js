@@ -5,6 +5,7 @@ import { catchAsync, ApiResponse, BadRequestError, NotFoundError } from '../util
 import { unwrap } from '../utils/db.js';
 import { constructWebhookEvent, createOrReusePaymentIntent, isStripeEnabled, retrievePaymentIntent } from '../services/stripe.service.js';
 import { recordFailedIntent, settleSucceededIntent } from '../services/payment.service.js';
+import { gatewayFor, latestPayfastPayment, startPayfastCheckout } from '../services/payfast.service.js';
 import { releaseCodIntent, releaseCodSession, settleCodIntent, settleCodSession } from '../services/cod-payment.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
@@ -28,10 +29,20 @@ const loadOwnOrderWithInvoice = async (req) => {
  * -> { clientSecret, paymentIntentId, amount, currency, invoiceNumber, reference, publishableKey }
  */
 export const createPaymentIntent = catchAsync(async (req, res) => {
-  if (!isStripeEnabled()) throw new BadRequestError('Card payments are not available yet.');
   const { order, invoice } = await loadOwnOrderWithInvoice(req);
   if (!invoice || invoice.status !== 'issued') throw new BadRequestError('There is no unpaid invoice for this order.');
   if (!['awaiting_payment', 'invoice_issued'].includes(order.status)) throw new BadRequestError('This order is not awaiting payment.');
+
+  // delivered inside Pakistan: pay the invoice's PKR total with PayFast; deliveries abroad keep using Stripe
+  if (gatewayFor({ order, currency: 'PKR' }) === 'payfast') {
+    const checkout = await startPayfastCheckout({ kind: 'invoice', order, invoice, amount: invoice.total_pkr, customer: req.profile });
+    return ApiResponse.success(
+      res,
+      { provider: 'payfast', payfast: { action: checkout.action, method: checkout.method, fields: checkout.fields }, amount: checkout.amount, currency: 'PKR', invoiceNumber: invoice.number, reference: order.reference },
+      'Payment started.'
+    );
+  }
+  if (!isStripeEnabled()) throw new BadRequestError('Card payments are not available yet.');
 
   const { intent, charge, reused } = await createOrReusePaymentIntent({ order, invoice, customer: req.profile });
   return ApiResponse.success(
@@ -56,8 +67,14 @@ export const createPaymentIntent = catchAsync(async (req, res) => {
  * -> { paid: boolean, status }
  */
 export const confirmPayment = catchAsync(async (req, res) => {
+  const { order, invoice } = await loadOwnOrderWithInvoice(req);
+  // PayFast: the customer comes back from PayFast's page; "paid" is only ever set by the verified callback, this reports what it found
+  if (!req.body?.payment_intent_id && gatewayFor({ order, currency: 'PKR' }) === 'payfast') {
+    const attempt = await latestPayfastPayment(order.id, 'invoice');
+    const paid = invoice?.status === 'paid';
+    return ApiResponse.success(res, { paid, status: paid ? 'succeeded' : attempt?.status === 'pending' ? 'processing' : attempt?.status || 'requires_payment_method' }, paid ? 'Payment received.' : 'Payment not completed yet.');
+  }
   if (!isStripeEnabled()) throw new BadRequestError('Card payments are not available yet.');
-  const { order } = await loadOwnOrderWithInvoice(req);
   const id = String(req.body?.payment_intent_id || '');
   if (!/^pi_[A-Za-z0-9]+$/.test(id)) throw new BadRequestError('Missing payment reference.');
 

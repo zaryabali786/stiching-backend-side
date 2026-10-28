@@ -803,7 +803,7 @@ export const listPendingApprovals = catchAsync(async (req, res) => {
   const cards = unwrap(
     await supabaseAdmin
       .from('job_cards')
-      .select('order_id, approval_requested_at, order:orders!order_units_order_id_fkey!inner(customer_id)')
+      .select('order_id, approval_requested_at, order:orders!job_cards_order_id_fkey!inner(customer_id)')
       .in('approval_status', ['pending', 'approved', 'changes_requested'])
       .eq('order.customer_id', req.userId)
       .order('approval_requested_at', { ascending: false, nullsFirst: false })
