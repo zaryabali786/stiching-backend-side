@@ -1,5 +1,6 @@
 import { checkStaffCodPayment, getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { Router } from 'express';
+import { partnerNotificationCenter as nc } from '../controllers/notification-center.controller.js';
 import {
   getPartnerOverview,
   getReceiving,
@@ -238,6 +239,14 @@ router.post('/orders/:id/messages/read', need('messages.view'), ownsOrder(), rea
 // The partner's own users (each with their own login and permissions)
 router.get('/users', need('users.view'), listPartnerUsers);
 router.get('/users/team-members', need('users.view'), listTaggableTeamMembers);
+router.get('/notification-center/options', need('notifications.view'), nc.options);
+router.get('/notification-center/recipients', need('notifications.create'), nc.recipients);
+router.get('/notification-center', need('notifications.view'), nc.list);
+router.post('/notification-center', need('notifications.create'), nc.create);
+router.get('/notification-center/:id', need('notifications.view'), nc.get);
+router.patch('/notification-center/:id', need('notifications.edit'), nc.update);
+router.post('/notification-center/:id/cancel', need('notifications.cancel'), nc.cancel);
+router.post('/notification-center/:id/retry', need('notifications.send'), nc.retry);
 router.get('/roles', need('users.view'), listPartnerRoles);
 router.post('/roles', need('users.create'), createPartnerRole);
 router.patch('/roles/:id', need('users.update'), updatePartnerRole);

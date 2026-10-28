@@ -20,6 +20,8 @@ import { syncAtelierEverywhere } from '../services/shopify.service.js';
 import { postexSettingsView, savePostexSettings, getOperationalCities, listMerchantAddresses } from '../services/postex.service.js';
 import { loadExpressStitching, saveExpressStitching } from '../services/express-stitching.service.js';
 import { loadExpressShipping, saveExpressShipping } from '../services/express-shipping.service.js';
+import { loadQcApproval, saveQcApproval } from '../services/qc-approval.service.js';
+import { resetPublicConfigCache } from './auth.controller.js';
 import { resolveCourier } from '../services/courier.service.js';
 
 const one = (v) => (Array.isArray(v) ? v[0] ?? null : v ?? null);
@@ -574,6 +576,21 @@ export const setExpressStitching = catchAsync(async (req, res) => {
   return ApiResponse.success(res, saved, 'Priority stitching saved. Customers now see it when they create an order.');
 });
 
+
+// ─────────────────────────────── Client approval after QC ───────────────────────────────
+
+/** GET /api/admin/settings/qc-approval -> { required } */
+export const getQcApproval = catchAsync(async (req, res) => ApiResponse.success(res, await loadQcApproval()));
+
+/** PUT /api/admin/settings/qc-approval  body: { required: boolean } */
+export const setQcApproval = catchAsync(async (req, res) => {
+  if (typeof req.body?.required !== 'boolean') throw new BadRequestError('Send required: true or false.');
+  const saved = await saveQcApproval(req.body.required, req.userId);
+  resetPublicConfigCache();
+  return ApiResponse.success(res, saved, saved.required
+    ? 'Client approval is on: the customer must approve the QC photos before Pressing.'
+    : 'Client approval is off: QC sends articles straight to Pressing.');
+});
 
 // ─────────────────────────────── Fast shipping ───────────────────────────────
 

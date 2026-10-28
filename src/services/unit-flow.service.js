@@ -45,19 +45,37 @@ export const resolveScanRole = ({ staffType, memberRole, qualityOnly, isSupervis
 };
 
 /**
+ * What the customer's approval of the QC photos means for an article, by the admin's setting `approvalRequired`:
+ *   true       the article may leave Quality check for Pressing only once the customer approved its photos
+ *   false      approval is not asked: nothing waits for the customer (a request already sent is left as it is)
+ *   undefined  the older rule: only a request that is still waiting blocks the article
+ * @returns {string | null} why the article is held back, or null
+ */
+export const approvalHold = (card, approvalRequired, title = 'This article') => {
+  if (approvalRequired === false) return null;
+  if (card.approval_status === 'pending') return `${title} is waiting for the customer to approve its photos.`;
+  if (approvalRequired === true && card.stage === 'qc' && card.approval_status !== 'approved') {
+    return card.approval_status === 'changes_requested'
+      ? `${title}: the customer asked for changes to the photos. Send new photos for approval.`
+      : `${title} needs the customer's approval of its QC photos first. Send the photos from Quality check.`;
+  }
+  return null;
+};
+
+/**
  * May this person mark the article's CURRENT stage as finished (Scan to complete)?
  * Master: cutting, tailor: stitching, QA: quality check, pressing: pressing. Packed is the last stage: nothing comes after it.
  * Owners / admins ('supervisor') may complete any stage. Master / tailor only their own articles.
  * @returns {{ ok: true, assign: object } | { ok: false, code: 'duplicate' | 'invalid_transition' | 'blocked' | 'forbidden', message: string }}
  */
-export const checkComplete = ({ role, card, member, title = 'This article' }) => {
+export const checkComplete = ({ role, card, member, title = 'This article', approvalRequired }) => {
   const stage = card.stage;
   if (stage === 'to_assign') return { ok: false, code: 'invalid_transition', message: `${title} has not been received by a master yet. Use Scan to receive first.` };
   if (stage === 'packed') return { ok: false, code: 'invalid_transition', message: `${title} is already packed. Packed is the last stage.` };
   const mine = role === 'supervisor' ? stage : SCAN_ROLES[role]?.stage;
   if (mine !== stage) return { ok: false, code: 'forbidden', message: `${title} is in ${STAGE_LABELS[stage]}. Only the ${STAGE_LABELS[stage]} person can complete it.` };
   if (card.stage_done) return { ok: false, code: 'duplicate', message: `${title} is already completed in ${STAGE_LABELS[stage]}. Waiting for ${STAGE_LABELS[NEXT_STAGE[stage]]} to receive it.` };
-  if (card.approval_status === 'pending') return { ok: false, code: 'blocked', message: `${title} is waiting for the customer to approve its photos.` };
+  if (approvalRequired === false ? false : card.approval_status === 'pending') return { ok: false, code: 'blocked', message: `${title} is waiting for the customer to approve its photos.` };
   if (stage === 'qc' && !card.qc_passed) return { ok: false, code: 'blocked', message: `${title} has not passed quality check yet.` };
   const assign = {};
   if (role === 'master' || role === 'tailor') {
@@ -76,7 +94,7 @@ export const permissionForStage = (stage) => Object.values(SCAN_ROLES).find((r) 
  * @param {{ role: string, stage: string, card: object, member: { id: string } | null, title?: string }} input
  * @returns {{ ok: true, assign: object } | { ok: false, code: 'duplicate' | 'invalid_transition' | 'blocked' | 'forbidden', message: string }}
  */
-export const checkReceive = ({ role, stage, card, member, title = 'This article' }) => {
+export const checkReceive = ({ role, stage, card, member, title = 'This article', approvalRequired }) => {
   if (card.stage === stage) {
     return { ok: false, code: 'duplicate', message: `${title} was already received for ${STAGE_LABELS[stage]}.` };
   }
@@ -85,12 +103,12 @@ export const checkReceive = ({ role, stage, card, member, title = 'This article'
     const where = STAGE_LABELS[card.stage] || card.stage;
     return { ok: false, code: 'invalid_transition', message: `${title} is in ${where} now. It can only be received for ${STAGE_LABELS[stage]} after ${STAGE_LABELS[from]}.` };
   }
-  if (card.approval_status === 'pending') {
-    return { ok: false, code: 'blocked', message: `${title} is waiting for the customer to approve its photos.` };
-  }
+  const held = approvalHold(card, approvalRequired, title);
+  if (held && (card.approval_status === 'pending' || card.qc_passed)) return { ok: false, code: 'blocked', message: held };
   if (stage === 'pressing' && !card.qc_passed) {
     return { ok: false, code: 'blocked', message: `${title} has not passed quality check yet.` };
   }
+  if (held) return { ok: false, code: 'blocked', message: held };
   // the stage before has to be finished (Scan to complete) before the next person may take the article; owners / admins may override
   if (from !== 'to_assign' && role !== 'supervisor' && !card.stage_done) {
     return { ok: false, code: 'blocked', message: `${title} is not completed in ${STAGE_LABELS[from]} yet. The ${STAGE_LABELS[from]} person must scan it to complete first.` };
@@ -312,12 +330,12 @@ export const groupSummary = (reference, units) => {
  *   not_ready  it has not reached their stage yet, is held back (customer approval, QC), or is not released
  *   assigned   it is the right stage but assigned to someone else
  */
-export const classifyForStage = ({ stage, card, unit, receipt, member, role }) => {
+export const classifyForStage = ({ stage, card, unit, receipt, member, role, approvalRequired }) => {
   if (!card) return { kind: 'not_ready', reason: unit?.review_status === 'pending' ? 'Waiting for the customer to approve' : unit?.review_status === 'rejected' ? 'Rejected by the customer' : 'Not in production yet' };
   if (card.stage === stage) return { kind: 'received' };
   if (STAGE_RANK[card.stage] > STAGE_RANK[stage]) return { kind: 'done' };
   if (card.stage !== PREVIOUS_STAGE[stage]) return { kind: 'not_ready', reason: `Still in ${STAGE_LABELS[card.stage] || card.stage}` };
-  if (card.approval_status === 'pending') return { kind: 'not_ready', reason: 'Waiting for the customer to approve the photos' };
+  if (approvalHold(card, approvalRequired)) return { kind: 'not_ready', reason: card.approval_status === 'pending' ? 'Waiting for the customer to approve the photos' : 'Waiting for the customer to approve the QC photos' };
   if (stage === 'pressing' && !card.qc_passed) return { kind: 'not_ready', reason: 'Quality check not passed yet' };
   if (PREVIOUS_STAGE[stage] !== 'to_assign' && role !== 'supervisor' && !card.stage_done) return { kind: 'not_ready', reason: `${STAGE_LABELS[card.stage]} is not completed yet` };
   if (role === 'master' || role === 'tailor') {
@@ -328,14 +346,14 @@ export const classifyForStage = ({ stage, card, unit, receipt, member, role }) =
 };
 
 /** Counts and the article list for one order at one stage (the numbers the receiving screen shows). */
-export const progressFor = ({ order, units, cards, receipts, stage, userId, member, role }) => {
+export const progressFor = ({ order, units, cards, receipts, stage, userId, member, role, approvalRequired }) => {
   const cardOf = new Map(cards.map((c) => [c.unit_id, c]));
   const lastReceipt = new Map();
   for (const r of receipts) if (r.stage === stage) lastReceipt.set(r.unit_id, r); // oldest first, so the last one wins
   const articles = units.map((u) => {
     const card = cardOf.get(u.id) || null;
     const receipt = lastReceipt.get(u.id) || null;
-    const c = classifyForStage({ stage, card, unit: u, receipt, member, role });
+    const c = classifyForStage({ stage, card, unit: u, receipt, member, role, approvalRequired });
     const received = c.kind === 'received' || c.kind === 'done';
     return {
       unit_id: u.id, code: u.code, line_no: u.line_no, title: u.unit_title,

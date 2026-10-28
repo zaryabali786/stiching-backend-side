@@ -14,6 +14,7 @@ const MODULE_OF = {
   'price-items': 'price_list', 'shipping-rates': 'shipping', reports: 'reports', support: 'support',
   banners: 'app_builder', 'home-layout': 'app_builder',
   settings: 'settings', shopify: 'settings',
+  'notification-center': 'notification_center',
   badges: null,
   users: '*full*', 'admin-modules': '*full*', roles: '*full*',
 };
@@ -33,6 +34,8 @@ export const adminModuleGate = (req, res, next) => {
   if (needed === null) return next();
   if (needed === '*full*') return next(new ForbiddenError('Only a full admin can do this.'));
   if (!modules.has(needed)) return next(new ForbiddenError('You do not have access to this part of the admin portal.'));
+  // the Notification Center checks its detailed actions (send, schedule, urgent, ...) itself, per request
+  if (needed === 'notification_center') return next();
   // what they may do inside the module: view (GET), create and edit (POST, PUT, PATCH), delete (DELETE)
   const allowed = req.access.adminActions?.get(needed);
   const action = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS' ? 'view' : req.method === 'DELETE' ? 'delete' : 'edit';

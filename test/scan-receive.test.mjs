@@ -157,6 +157,10 @@ test('QA, pressing and packing follow in order; pressing needs QC passed', async
   card(1).qc_passed = true;
   assert.equal((await scan(pressing, 'SA-3001-1')).err.statusCode, 400, 'quality check has to be completed first');
   assert.equal((await complete(qa, 'SA-3001-1')).ok, true);
+  const unapproved = await scan(pressing, 'SA-3001-1');
+  assert.equal(unapproved.err.statusCode, 400, 'client approval is on by default: the customer has to approve the QC photos first');
+  assert.match(unapproved.err.message, /approval/i);
+  card(1).approval_status = 'approved';
   assert.equal((await scan(pressing, 'SA-3001-1')).ok, true);
   assert.equal(card(1).stage, 'pressing');
   await complete(pressing, 'SA-3001-1');

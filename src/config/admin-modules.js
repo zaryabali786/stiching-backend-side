@@ -22,6 +22,7 @@ export const ADMIN_MODULES = [
   { id: 'settings', label: 'Settings', description: 'Ship-to address, priority & fast, PostEx and own account (not user management)' },
   { id: 'app_builder', label: 'App build & theme', description: 'Customer app layout, banners and theme' },
   { id: 'portal_theme', label: 'Portal theme', description: 'Look of the admin and partner portals' },
+  { id: 'notification_center', label: 'Notification Center', description: 'Send web and push notifications to clients, staff and partners' },
 ];
 
 export const ADMIN_LIMITED = 'admin.limited';
@@ -39,7 +40,26 @@ export const ADMIN_ACTIONS = [
   { id: 'delete', label: 'Delete', description: 'Remove items' },
 ];
 const ACTION_IDS = new Set(ADMIN_ACTIONS.map((a) => a.id));
-export const ADMIN_PERMISSIONS = ADMIN_MODULES.flatMap((m) => ADMIN_ACTIONS.map((a) => `${m.id}.${a.id}`));
+
+/**
+ * Detailed actions of one admin module (one tick per button). `<module>.edit` still means "every change in this module", so it
+ * brings all of them; a role that ticks single actions gets exactly those and the server checks the matching action.
+ */
+export const ADMIN_ACTION_DETAIL = {
+  notification_center: [
+    { id: 'create', label: 'Create notifications', description: 'Write a notification and choose its audience' },
+    { id: 'send', label: 'Send notifications now', description: 'Send immediately' },
+    { id: 'schedule', label: 'Schedule notifications', description: 'Choose a future date and time' },
+    { id: 'edit', label: 'Edit pending scheduled notifications', description: 'Change one that has not been sent yet' },
+    { id: 'cancel', label: 'Cancel pending scheduled notifications', description: 'Stop one that has not been sent yet' },
+    { id: 'urgent', label: 'Send urgent notifications', description: 'Mark a notification as urgent' },
+    { id: 'image', label: 'Attach images', description: 'Add a picture to a notification' },
+    { id: 'history', label: 'View notification history', description: 'See what was sent' },
+    { id: 'status', label: 'View delivery status', description: 'See who received it and what failed' },
+  ],
+};
+const DETAIL_ACTION_IDS = new Set(Object.entries(ADMIN_ACTION_DETAIL).flatMap(([m, list]) => list.map((d) => `${m}.${d.id}`)));
+export const ADMIN_PERMISSIONS = ADMIN_MODULES.flatMap((m) => [...ADMIN_ACTIONS.map((a) => `${m.id}.${a.id}`), ...(ADMIN_ACTION_DETAIL[m.id] || []).map((d) => `${m.id}.${d.id}`)]);
 
 /** Marks a login that was given a role (the role's id). The effective permissions are saved next to the marks. */
 export const ROLE_MARK = 'role:';
@@ -58,10 +78,14 @@ export const adminActionsOf = (profile) => {
     if (!IDS.has(module)) continue;
     const set = map.get(module) || new Set();
     if (!action) ADMIN_ACTIONS.forEach((a) => set.add(a.id));
-    else if (ACTION_IDS.has(action)) set.add(action);
+    else if (ACTION_IDS.has(action) || DETAIL_ACTION_IDS.has(`${module}.${action}`)) set.add(action);
     map.set(module, set);
   }
-  for (const set of map.values()) if (set.size) set.add('view');
+  for (const [module, set] of map) {
+    if (set.size) set.add('view');
+    // "create and edit" in a module that has detailed actions means every one of them
+    if (set.has('edit')) for (const d of ADMIN_ACTION_DETAIL[module] || []) set.add(d.id);
+  }
   return map;
 };
 

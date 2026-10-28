@@ -5,7 +5,7 @@ import { parseListQuery, sanitizeSearch, ilikeAny, sendPage } from '../utils/pag
 import { unwrap, unwrapOne, todayISO } from '../utils/db.js';
 import { syncOrderFromCards, setOrderStatus, getOrderOr404, addEvent, articleDisplayStatus, STATUS_LABELS } from '../services/order.service.js';
 import { scoped, scopeOf, assertMemberOfPartner, can } from '../services/access.service.js';
-import { STAGES, STAGE_RANK, STAGE_LABELS, PREVIOUS_STAGE, NEXT_STAGE, SCAN_ROLES, resolveScanRole, permissionForStage, checkReceive, checkComplete, progressFor, articleState, ARTICLE_STATE_LABELS } from '../services/unit-flow.service.js';
+import { STAGES, STAGE_RANK, STAGE_LABELS, PREVIOUS_STAGE, NEXT_STAGE, SCAN_ROLES, resolveScanRole, permissionForStage, checkReceive, checkComplete, approvalHold, progressFor, articleState, ARTICLE_STATE_LABELS } from '../services/unit-flow.service.js';
 import { emitUnitUpdate } from '../services/unit-review.service.js';
 import { buildMasterTracking } from '../services/master-tracking.service.js';
 import { suggestAssignees } from '../services/team.service.js';
@@ -15,6 +15,7 @@ import { notifyArticleTeam, notifyAssignedMember } from '../services/article-not
 import { withSizeSnapshot } from '../utils/measurements.js';
 import { cleanVoiceNote, signNoteAudio } from '../services/voice-note.service.js';
 import { logUnitEvent } from '../services/order.service.js';
+import { isQcApprovalRequired } from '../services/qc-approval.service.js';
 import { attachStageDone, markStageDone, clearStageDone } from '../services/stage-done.service.js';
 
 export { STAGES };
@@ -276,7 +277,8 @@ export const moveCard = catchAsync(async (req, res) => {
     if (NEXT_STAGE[card.stage] !== stage) {
       throw new BadRequestError(`"${card.unit_title}" is in ${STAGE_LABELS[card.stage]}. It goes to ${STAGE_LABELS[NEXT_STAGE[card.stage]]} next, not straight to ${STAGE_LABELS[stage]}.`);
     }
-    if (card.approval_status === 'pending') throw new BadRequestError(`"${card.unit_title}" is waiting for the customer to approve its photos.`);
+    const held = approvalHold(card, await isQcApprovalRequired(), `"${card.unit_title}"`);
+    if (held) throw new BadRequestError(held);
     if (stage === 'pressing' && !card.qc_passed) throw new BadRequestError(`"${card.unit_title}" has not passed quality check yet.`);
   }
 
@@ -459,8 +461,9 @@ const receivingProgress = async ({ orderIds, stage, userId, member, role }) => {
     supabaseAdmin.from('unit_stage_receipts').select('unit_id, order_id, stage, role, user_id, user_name, received_at').in('order_id', orderIds).eq('stage', stage).order('received_at'),
   ].map((p) => p.then((r) => unwrap(r))));
   await attachStageDone(cards);
+  const approvalRequired = await isQcApprovalRequired();
   return orders.map((o) => progressFor({
-    order: o, stage, userId, member, role,
+    order: o, stage, userId, member, role, approvalRequired,
     units: units.filter((u) => u.order_id === o.id), cards: cards.filter((c) => c.order_id === o.id), receipts: receipts.filter((r) => r.order_id === o.id),
   }));
 };
@@ -506,7 +509,7 @@ export const scanReceive = catchAsync(async (req, res) => {
   }
 
   const member = role.supervisor ? null : role.member || (await teamMemberOf(req.userId, card.partner_id));
-  const verdict = checkReceive({ role: role.role, stage, card, member, title: unit.code || unit.unit_title });
+  const verdict = checkReceive({ role: role.role, stage, card, member, title: unit.code || unit.unit_title, approvalRequired: await isQcApprovalRequired() });
   if (!verdict.ok) {
     if (verdict.code === 'duplicate' || verdict.code === 'invalid_transition') throw new ConflictError(verdict.message);
     if (verdict.code === 'forbidden') throw new ForbiddenError(verdict.message);
@@ -573,7 +576,7 @@ export const scanComplete = catchAsync(async (req, res) => {
   }
   const member = role.supervisor ? null : role.member || (await teamMemberOf(req.userId, card.partner_id));
   const title = unit.code || unit.unit_title;
-  const verdict = checkComplete({ role: role.role, card, member, title });
+  const verdict = checkComplete({ role: role.role, card, member, title, approvalRequired: await isQcApprovalRequired() });
   if (!verdict.ok) {
     if (verdict.code === 'duplicate' || verdict.code === 'invalid_transition') throw new ConflictError(verdict.message);
     if (verdict.code === 'forbidden') throw new ForbiddenError(verdict.message);
@@ -821,6 +824,11 @@ export const failQc = catchAsync(async (req, res) => {
   return ApiResponse.success(res, { orderStatus: order.status }, 'Sent back to the tailor.');
 });
 
+/** Photos are only sent to the customer while the admin keeps "Client approval required after QC" on. */
+const assertApprovalSwitchedOn = async () => {
+  if (!(await isQcApprovalRequired())) throw new BadRequestError('Client approval after QC is switched off. Send the article straight to Pressing.');
+};
+
 /**
  * POST /api/partner/qc/cards/:id/request-approval  body: { photos: [{ name, dataUrl }] }
  * Send finished photos of ONE article (one ticket) to the customer. Each article is approved on its own,
@@ -836,6 +844,7 @@ export const requestCardApproval = catchAsync(async (req, res) => {
     'Card not found'
   );
   const order = card.order;
+  await assertApprovalSwitchedOn();
   if (!(card.stage === 'qc' && card.qc_passed)) throw new BadRequestError('Pass QC for this article first.');
   if (card.approval_status === 'approved') throw new BadRequestError('The customer already approved this article.');
   const photos = req.body?.photos || [];
@@ -872,6 +881,7 @@ export const requestCardApproval = catchAsync(async (req, res) => {
  */
 export const requestCustomerApproval = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.orderId);
+  await assertApprovalSwitchedOn();
   const cards = unwrap(await supabaseAdmin.from('job_cards').select('id, stage, qc_passed, approval_status, unit_title, unit_id').eq('order_id', order.id));
   const photos = req.body?.photos || [];
   if (!photos.length) throw new BadRequestError('Add at least one photo for the customer.');
@@ -906,10 +916,14 @@ export const requestCustomerApproval = catchAsync(async (req, res) => {
 export const sendOrderToPressing = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.orderId);
   const cards = unwrap(await supabaseAdmin.from('job_cards').select('id, unit_id, stage, qc_passed, approval_status, unit_title').eq('order_id', order.id));
-  const waiting = cards.filter((c) => c.approval_status === 'pending');
+  const approvalRequired = await isQcApprovalRequired();
+  const waiting = approvalRequired ? cards.filter((c) => c.approval_status === 'pending') : [];
   if (waiting.length) throw new BadRequestError(`Waiting for the customer to approve: ${waiting.map((c) => c.unit_title).join(', ')}.`);
-  const ready = cards.filter((c) => c.stage === 'qc' && c.qc_passed);
-  if (!ready.length) throw new BadRequestError('No article of this order has passed quality check and is waiting for Pressing.');
+  const passed = cards.filter((c) => c.stage === 'qc' && c.qc_passed);
+  if (!passed.length) throw new BadRequestError('No article of this order has passed quality check and is waiting for Pressing.');
+  // approval ON: only articles whose QC photos the customer approved go on; OFF: every article that passed QC
+  const ready = approvalRequired ? passed.filter((c) => c.approval_status === 'approved') : passed;
+  if (!ready.length) throw new BadRequestError(`Send the QC photos to the customer first. Pressing needs their approval: ${passed.map((c) => c.unit_title).join(', ')}.`);
   let position = await computePosition('pressing', null, null, null, order.partner_id);
   for (const c of ready) {
     unwrap(await supabaseAdmin.from('job_cards').update({
@@ -931,7 +945,7 @@ export const sendOrderToPressing = catchAsync(async (req, res) => {
 export const packOrder = catchAsync(async (req, res) => {
   const order = await getOrderOr404(req.params.orderId);
   const cards = unwrap(await supabaseAdmin.from('job_cards').select('id, unit_id, stage, qc_passed, approval_status, unit_title').eq('order_id', order.id));
-  const waiting = cards.filter((c) => c.approval_status === 'pending');
+  const waiting = (await isQcApprovalRequired()) ? cards.filter((c) => c.approval_status === 'pending') : [];
   if (waiting.length) throw new BadRequestError(`Waiting for the customer to approve: ${waiting.map((c) => c.unit_title).join(', ')}.`);
   if (!cards.length) throw new BadRequestError('This order has no articles in production.');
   const notPressed = cards.filter((c) => c.stage !== 'pressing' && c.stage !== 'packed');

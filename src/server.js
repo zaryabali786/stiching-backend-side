@@ -6,6 +6,7 @@ import { startPostexPolling } from './services/postex-tracking.service.js';
 import { startShopifyRetry } from './services/shopify-events.service.js';
 import { startShopCatalogTimer } from './services/shop-catalog.service.js';
 import { startShopOrderTimer } from './services/shop-orders.service.js';
+import { startBroadcastScheduler } from './services/broadcast.service.js';
 
 const server = app.listen(config.port, () => {
   console.log(`=========================================`);
@@ -27,6 +28,8 @@ loadPostexSettings().catch(() => ({})).finally(applyPostexSettings);
 startShopifyRetry();
 startShopCatalogTimer();
 startShopOrderTimer();
+// Notification Center: scheduled notifications go out from here, never from a browser tab
+startBroadcastScheduler();
 
 // Real-time order conversations share the HTTP server (same port, path /socket.io)
 initSocket(server);

@@ -23,6 +23,7 @@ export const PARTNER_MODULES = [
   { id: 'general_messages', label: 'General messages', description: 'Customer chats about the order itself (not tied to one article). Admin only unless the admin enables it', actions: ['view', 'update'] },
   { id: 'catalogue', label: 'Catalogue', description: 'Brands, couriers, article types and articles', actions: ['view', 'update'] },
   { id: 'users', label: 'Users', description: 'Create and manage the partner’s own users', actions: ['view', 'create', 'update'] },
+  { id: 'notifications', label: 'Notification Center', description: 'Send notifications to the partner’s own staff', actions: ['view', 'update'] },
 ];
 
 /**
@@ -49,6 +50,17 @@ export const PARTNER_ACTION_DETAIL = {
     { id: 'approval', label: 'Send photos for approval', description: 'Ask the customer to approve finished photos' },
     { id: 'pack', label: 'Pressing and packing', description: 'Send the order to pressing and pack it' },
     { id: 'scan', label: 'Scan QR (quality check)', description: 'Receive and complete articles in quality check by scanning' },
+  ],
+  notifications: [
+    { id: 'create', label: 'Create notifications', description: 'Write a notification for your own staff' },
+    { id: 'send', label: 'Send notifications now', description: 'Send to your own staff immediately' },
+    { id: 'schedule', label: 'Schedule notifications', description: 'Choose a future date and time' },
+    { id: 'edit', label: 'Edit pending scheduled notifications', description: 'Change a notification that has not been sent yet' },
+    { id: 'cancel', label: 'Cancel pending scheduled notifications', description: 'Stop a notification that has not been sent yet' },
+    { id: 'urgent', label: 'Send urgent notifications', description: 'Mark a notification as urgent' },
+    { id: 'image', label: 'Attach images', description: 'Add a picture to a notification' },
+    { id: 'history', label: 'View notification history', description: 'See what your team has sent' },
+    { id: 'status', label: 'View delivery status', description: 'See who received it and what failed' },
   ],
   warehouse: [
     { id: 'book', label: 'Weight, route and book CN', description: 'Set weight and route, book or cancel a courier CN, bulk book' },

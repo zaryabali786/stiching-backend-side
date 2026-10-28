@@ -4,6 +4,7 @@ import { config } from '../config/env.js';
 import { loadShipTo } from '../services/ship-to.service.js';
 import { loadExpressStitching } from '../services/express-stitching.service.js';
 import { loadExpressShipping } from '../services/express-shipping.service.js';
+import { loadQcApproval } from '../services/qc-approval.service.js';
 import { loadClientTheme } from './theme.controller.js';
 import { loadPortalTheme } from './portal-theme.controller.js';
 import { catchAsync, BadRequestError, UnauthorizedError, ForbiddenError, ApiResponse } from '../utils/error.helper.js';
@@ -371,10 +372,11 @@ const PUBLIC_CONFIG_TTL_MS = 15_000;
 let publicConfigCache = { at: 0, data: null };
 
 const buildPublicConfig = async () => {
-  const [shipTo, expressStitching, expressShipping, theme, portalTheme] = await Promise.all([
+  const [shipTo, expressStitching, expressShipping, qcApproval, theme, portalTheme] = await Promise.all([
     loadShipTo().catch(() => ({})), // the admin's own address wins over the .env defaults
     loadExpressStitching().catch(() => ({ enabled: true, days: 5 })),
     loadExpressShipping().catch(() => ({ enabled: true, days: 3 })),
+    loadQcApproval().catch(() => ({ required: true })),
     loadClientTheme(),
     loadPortalTheme(),
   ]);
@@ -383,12 +385,19 @@ const buildPublicConfig = async () => {
     ...shipTo,
     expressStitching,
     expressShipping,
+    // whether the customer approves QC photos (also decides the client app's header)
+    qcApproval,
     // the publishable key is safe to expose; the secret key never leaves the server
     google: { enabled: isGoogleEnabled(), clientId: isGoogleEnabled() ? config.google.clientId : null, iosClientId: isGoogleEnabled() ? config.google.iosClientId || null : null },
     payments: { stripe: { enabled: !!config.stripe.secretKey && !!config.stripe.publishableKey, publishableKey: config.stripe.publishableKey || null } },
     theme,
     portalTheme,
   };
+};
+
+/** The admin changed a setting the apps read from /config: the next request builds it again. */
+export const resetPublicConfigCache = () => {
+  publicConfigCache = { at: 0, data: null };
 };
 
 export const getPublicConfig = catchAsync(async (req, res) => {

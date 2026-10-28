@@ -2,6 +2,7 @@ import { addShopifyStore, createShopifyTickBox, setupShopifyShipping, getShopify
 import { checkStaffCodPayment, getOrderCod, setStaffPaymentType, setStaffCodAmount } from '../controllers/cod-payment.controller.js';
 import { decideOrderExtra } from '../controllers/extra-costs.controller.js';
 import { Router } from 'express';
+import { adminNotificationCenter as nc } from '../controllers/notification-center.controller.js';
 import { adminCancelOrder, adminCommissionCsv, adminCommissions, adminCreateSettlement, adminDispute, adminPatchBrand, adminPatchProduct, adminRetryBrandOrder, adminSettlements, adminShopBrands, adminShopOrder, adminShopOrders, adminShopProducts, adminSyncBrand, adminSyncBrandOrder } from '../controllers/shop.controller.js';
 import { getAdminModules, createAdminUser, setAdminUserAccess, resetAdminUserPassword, listAdminRoles, createAdminRole, updateAdminRole, deleteAdminRole } from '../controllers/admin-users.controller.js';
 import {
@@ -22,6 +23,8 @@ import {
   setShipTo,
   getExpressStitching,
   getExpressShipping,
+  getQcApproval,
+  setQcApproval,
   getPostexSettings,
   setPostexSettings,
   testPostexSettings,
@@ -160,6 +163,16 @@ router.put('/settings/postex', setPostexSettings);
 router.post('/settings/postex/test', testPostexSettings);
 router.get('/settings/postex/addresses', getPostexAddresses);
 router.put('/settings/express-stitching', setExpressStitching);
+router.get('/notification-center/options', nc.options);
+router.get('/notification-center/recipients', nc.recipients);
+router.get('/notification-center', nc.list);
+router.post('/notification-center', nc.create);
+router.get('/notification-center/:id', nc.get);
+router.patch('/notification-center/:id', nc.update);
+router.post('/notification-center/:id/cancel', nc.cancel);
+router.post('/notification-center/:id/retry', nc.retry);
+router.get('/settings/qc-approval', getQcApproval);
+router.put('/settings/qc-approval', setQcApproval);
 router.get('/settings/express-shipping', getExpressShipping);
 router.put('/settings/express-shipping', setExpressShipping);
 router.get('/partners', listPartners);

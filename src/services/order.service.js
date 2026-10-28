@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../config/supabase.js';
+import { isQcApprovalRequired } from './qc-approval.service.js';
 import { unwrap, unwrapOne } from '../utils/db.js';
 import { notifyUser, notifyAdmins, notifyPartner } from './notification.service.js';
 import { emitTo, rooms } from '../realtime/io.js';
@@ -275,7 +276,8 @@ export const syncOrderFromCards = async (orderId, actorId) => {
   if (heldBack) target = 'received';
 
   // Approval is per piece: while any piece waits for the customer, the order shows "awaiting your approval"
-  if (cards.some((c) => c.approval_status === 'pending')) target = 'customer_approval';
+  // (only while the admin keeps approval on: switched off, nothing waits for the customer and the order carries on)
+  if (cards.some((c) => c.approval_status === 'pending') && (await isQcApprovalRequired())) target = 'customer_approval';
   if (target === order.status) return order;
 
   const extra = target === 'packed' ? { packed_at: new Date().toISOString() } : {};

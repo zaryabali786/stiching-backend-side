@@ -3,7 +3,7 @@ import UserModel from '../models/user.model.js';
 import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { catchAsync, ApiResponse, BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/error.helper.js';
 import { unwrap } from '../utils/db.js';
-import { ADMIN_MODULES, ADMIN_ACTIONS, ADMIN_LIMITED, isAdminModule, adminModulesOf, adminActionsOf, roleIdsOf, toStoredAdminPermissions } from '../config/admin-modules.js';
+import { ADMIN_MODULES, ADMIN_ACTIONS, ADMIN_ACTION_DETAIL, ADMIN_LIMITED, isAdminModule, adminModulesOf, adminActionsOf, roleIdsOf, toStoredAdminPermissions } from '../config/admin-modules.js';
 import { listRoles, createRole, updateRole, deleteRole, resolveRoleIds } from '../services/roles.service.js';
 import { temporaryPassword } from '../services/partner-users.service.js';
 import { notifyUser } from '../services/notification.service.js';
@@ -143,7 +143,7 @@ export { ADMIN_LIMITED };
 
 /** GET /api/admin/roles — the roles, plus the modules and actions a role is built from */
 export const listAdminRoles = catchAsync(async (req, res) =>
-  ApiResponse.success(res, { roles: await listRoles('admin', null), modules: ADMIN_MODULES, actions: ADMIN_ACTIONS }));
+  ApiResponse.success(res, { roles: await listRoles('admin', null), modules: ADMIN_MODULES.map((m) => ({ ...m, detail: ADMIN_ACTION_DETAIL[m.id] || [] })), actions: ADMIN_ACTIONS }));
 
 /** POST /api/admin/roles  body: { name, description?, permissions: ['orders.view', 'orders.edit', ...] } */
 export const createAdminRole = catchAsync(async (req, res) => {
