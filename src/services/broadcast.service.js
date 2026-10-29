@@ -6,6 +6,7 @@ import { uploadDataUrls } from './storage.service.js';
 import { pushToUserDetailed } from './push.service.js';
 import { pageMeta } from '../utils/pagination.js';
 import { STAFF_TYPES } from './unit-flow.service.js';
+import { cleanDestination, linkFor, pageOptions } from './notification-destination.service.js';
 
 /**
  * Notification Center: one "broadcast" is one message that an admin (to clients, staff or partners) or a partner (to its own
@@ -185,6 +186,7 @@ const toPublic = (b) => ({
   channels: b.channels,
   category: b.category,
   audience: b.audience,
+  destination: b.destination ?? null,
   status: b.status,
   is_scheduled: b.is_scheduled,
   send_at: b.send_at,
@@ -258,6 +260,8 @@ export const createBroadcast = async (actor, input, now = Date.now()) => {
   const scheduled = !!input.schedule;
   checkAbilities(actor, { scheduled, urgent: priority === 'urgent', image: !!input.image?.dataUrl });
   const audience = cleanAudience(actor, input.audience);
+  // where a tap leads: optional, validated against the audience (an order only for its own client, a product only for clients)
+  const destination = await cleanDestination(input.destination, audience, actor.kind);
   const when = scheduled ? cleanSchedule(input.schedule, now) : { at: new Date(now).toISOString(), timezone: null };
 
   // the sender must be allowed to reach every selected person: checked now (and again when it goes out)
@@ -270,6 +274,7 @@ export const createBroadcast = async (actor, input, now = Date.now()) => {
     created_by: actor.userId,
     partner_id: actor.kind === 'partner' ? actor.partnerId : null,
     audience,
+    destination,
     category: audience.category,
     title,
     body,
@@ -337,11 +342,19 @@ const deliverChunk = async (broadcast, rows, now) => {
     }
     webRows.splice(0, webRows.length, ...webRows.filter((r) => !already.has(r.user_id)));
   }
+  // the app each person uses decides which route the destination becomes for them (a client and a staff member open different pages)
+  const roleOf = new Map();
+  if (broadcast.destination && rows.length) {
+    const { data: people } = await supabaseAdmin.from('profiles').select('id, role').in('id', rows.map((r) => r.user_id));
+    (people || []).forEach((p) => roleOf.set(p.id, p.role));
+  }
+  const linkOf = (userId) => (broadcast.destination ? linkFor(broadcast.destination, roleOf.get(userId)) : { link: null, external_url: null });
   if (webRows.length) {
     const { data, error } = await supabaseAdmin
       .from('notifications')
       .insert(webRows.map((r) => ({
-        user_id: r.user_id, type: 'broadcast', title: broadcast.title, body: broadcast.body, link: null,
+        user_id: r.user_id, type: 'broadcast', title: broadcast.title, body: broadcast.body, link: linkOf(r.user_id).link,
+        destination: broadcast.destination ?? null,
         priority: broadcast.priority, image_url: broadcast.image_url, broadcast_id: broadcast.id,
       })))
       .select('*');
@@ -366,6 +379,8 @@ const deliverChunk = async (broadcast, rows, now) => {
     const res = await pushToUserDetailed(r.user_id, {
       id: n?.id || r.notification_id || '', title: broadcast.title, body: broadcast.body, type: 'broadcast',
       imageUrl: broadcast.image_url || '', priority: urgent ? 'urgent' : 'normal',
+      // the tap goes through the server's destination check (by notification id); the route is only a fallback for older apps
+      link: linkOf(r.user_id).link, hasDestination: !!broadcast.destination,
     });
     r.push_devices = res.devices;
     r.push_status = res.status === 'off' ? 'failed' : res.status;
@@ -556,6 +571,10 @@ export const updateBroadcast = async (actor, id, input) => {
     patch.category = audience.category;
     patch.recipient_count = ids.length;
   }
+  // the destination is always checked against the audience that will receive it (the new one when it changed too)
+  if (input.destination !== undefined || input.audience !== undefined) {
+    patch.destination = await cleanDestination(input.destination !== undefined ? input.destination : b.destination, patch.audience || b.audience, actor.kind);
+  }
   if (input.remove_image === true) {
     patch.image_url = null;
     patch.image_path = null;
@@ -655,6 +674,8 @@ export const formOptions = async (actor) => {
     channels: CHANNELS,
     staff_types: STAFF_TYPES.map((id) => ({ id, label: id === 'qa' ? 'Quality check' : id.charAt(0).toUpperCase() + id.slice(1), subordinates: SUBORDINATE_TYPES[id] || [] })),
     partners,
+    // the pages a notification may open, per audience (generated from the page table of the destination service)
+    destinations: Object.fromEntries(CATEGORIES.map((c) => [c, pageOptions(c, actor.kind)])),
     limits: { title: MAX_TITLE, body: MAX_BODY, image_mb: MAX_IMAGE_BYTES / 1024 / 1024 },
   };
 };

@@ -70,6 +70,8 @@ export const pushToUserDetailed = async (userId, n) => {
       // `userId` is still the signed-in user (a device that switched accounts must not open somebody else's page)
       data: {
         link: n.link || '',
+        // set when the notification has a configured destination: the app asks the server where to go (and whether this person may)
+        dest: n.hasDestination ? '1' : '',
         type: n.type || 'update',
         orderId,
         notificationId,

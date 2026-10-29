@@ -3,6 +3,8 @@ import { catchAsync, ApiResponse, BadRequestError } from '../utils/error.helper.
 import { registerDevice, unregisterDevice } from '../services/push.service.js';
 import { parseListQuery, sendPage } from '../utils/pagination.js';
 import { unwrap } from '../utils/db.js';
+import { NotFoundError } from '../utils/error.helper.js';
+import { resolveDestination } from '../services/notification-destination.service.js';
 
 const unreadCount = async (userId) => {
   const { count } = await supabaseAdmin
@@ -99,4 +101,16 @@ export const unregisterPushDevice = catchAsync(async (req, res) => {
   const token = String(req.body?.token || '').trim();
   if (token) await unregisterDevice(req.userId, token);
   return ApiResponse.success(res, { registered: false }, 'Push notifications are off for this device.');
+});
+
+/**
+ * GET /api/notifications/:id/destination — where tapping this notification leads for the signed-in person. Only their own
+ * notification is ever read; the answer is re-checked against their current role, permissions and the record itself, so a
+ * notification never opens anything the person could not open on their own.
+ */
+export const getNotificationDestination = catchAsync(async (req, res) => {
+  const { data: n } = await supabaseAdmin.from('notifications').select('id, link, destination').eq('id', req.params.id).eq('user_id', req.userId).maybeSingle();
+  if (!n) throw new NotFoundError('This notification no longer exists.');
+  const viewer = { profile: req.profile, access: req.access, userId: req.userId };
+  return ApiResponse.success(res, await resolveDestination(viewer, n));
 });

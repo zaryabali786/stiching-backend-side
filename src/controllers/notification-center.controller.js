@@ -4,6 +4,7 @@ import {
   createBroadcast, sendNow, listBroadcasts, getBroadcast, updateBroadcast, cancelBroadcast, retryBroadcast, dispatchBroadcast,
   searchRecipients, formOptions,
 } from '../services/broadcast.service.js';
+import { searchProducts, searchProductBrands, searchClientOrders } from '../services/notification-destination.service.js';
 
 /**
  * The Notification Center API, mounted twice: /api/admin/notification-center (clients, staff, partners) and
@@ -43,6 +44,26 @@ const make = (actor) => ({
   recipients: catchAsync(async (req, res) => {
     const { items, meta } = await searchRecipients(actor(req), req.query);
     return ApiResponse.success(res, items, 'Success', 200, meta);
+  }),
+
+  // pickers for the destination of a notification (admin only: a partner reaches its own staff, who have no product or client-order links)
+  products: catchAsync(async (req, res) => {
+    const a = actor(req);
+    if (a.kind !== 'admin' || !a.can('create')) throw new ForbiddenError('You do not have permission to do this.');
+    const { items, meta } = await searchProducts(req.query);
+    return ApiResponse.success(res, items, 'Success', 200, meta);
+  }),
+
+  productBrands: catchAsync(async (req, res) => {
+    const a = actor(req);
+    if (a.kind !== 'admin' || !a.can('create')) throw new ForbiddenError('You do not have permission to do this.');
+    return ApiResponse.success(res, await searchProductBrands());
+  }),
+
+  orders: catchAsync(async (req, res) => {
+    const a = actor(req);
+    if (a.kind !== 'admin' || !a.can('create')) throw new ForbiddenError('You do not have permission to do this.');
+    return ApiResponse.success(res, await searchClientOrders(req.query));
   }),
 
   list: catchAsync(async (req, res) => {

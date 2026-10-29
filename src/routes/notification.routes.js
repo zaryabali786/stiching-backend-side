@@ -5,6 +5,7 @@ import {
   markRead,
   markAllRead,
   markOrdersRead,
+  getNotificationDestination,
   deleteNotification,
   registerPushDevice,
   unregisterPushDevice,
@@ -18,6 +19,7 @@ router.post('/devices', registerPushDevice);
 router.post('/devices/remove', unregisterPushDevice);
 router.post('/read-all', markAllRead);
 router.post('/read-orders', markOrdersRead);
+router.get('/:id/destination', getNotificationDestination);
 router.post('/:id/read', markRead);
 router.delete('/:id', deleteNotification);
 
