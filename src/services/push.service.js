@@ -46,22 +46,42 @@ export const pushEnabled = () => !!getFcm();
 const DEAD_TOKEN_CODES = new Set(['messaging/registration-token-not-registered', 'messaging/invalid-registration-token', 'messaging/invalid-argument']);
 
 /**
- * Push one notification (`{ title, body, link, type, orderId, id, imageUrl, priority }`) to every device of ONE user and report what
- * Firebase answered: { status: 'sent' | 'failed' | 'no_device' | 'off', devices, delivered, error }.
- * It never throws. 'sent' means Firebase accepted it for at least one device; it does not prove the phone showed or opened it.
+ * A picture the phone can load on its own: https only (iOS refuses plain http, Android blocks it), a sane length. Anything else is
+ * dropped and the notification goes out without a picture, never lost.
  */
-export const pushToUserDetailed = async (userId, n) => {
+export const safeImageUrl = (value) => {
+  const text = String(value || '').trim();
+  if (!text || text.length > 2000) return '';
+  try {
+    const url = new URL(text);
+    return url.protocol === 'https:' && !url.username && !url.password ? url.toString() : '';
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * Push one notification (`{ title, body, link, type, orderId, id, imageUrl, priority }`) to the devices of ONE user and report what
+ * Firebase answered: { status: 'sent' | 'failed' | 'no_device' | 'off', devices, delivered, error, messageIds, byPlatform }.
+ * `platforms` limits it to some kinds of device (the Notification Center's "Mobile application" is ['android', 'ios']); without it
+ * every device of the user is used, as before.
+ * It never throws. 'sent' means Firebase ACCEPTED it for at least one device (messageIds are Firebase's receipts); it does not prove
+ * the phone showed or opened it: Firebase gives no delivery receipt.
+ */
+export const pushToUserDetailed = async (userId, n, { platforms } = {}) => {
   try {
     const fcm = getFcm();
     if (!fcm || !userId) return { status: 'off', devices: 0, delivered: 0, error: 'Push is not set up on the server.' };
-    const { data, error } = await supabaseAdmin.from('push_devices').select('token').eq('user_id', userId);
+    const { data, error } = await supabaseAdmin.from('push_devices').select('token, platform').eq('user_id', userId);
     if (error) throw error;
-    const tokens = (data || []).map((d) => d.token);
-    if (!tokens.length) return { status: 'no_device', devices: 0, delivered: 0, error: null };
+    const rows = (data || []).filter((d) => !platforms || platforms.includes(d.platform));
+    const tokens = rows.map((d) => d.token);
+    if (!tokens.length) return { status: 'no_device', devices: 0, delivered: 0, error: null, messageIds: [], byPlatform: {} };
 
     const orderId = n.orderId || n.order_id || '';
     const notificationId = n.id || '';
-    const imageUrl = n.imageUrl || n.image_url || '';
+    const imageUrl = safeImageUrl(n.imageUrl || n.image_url);
+    if ((n.imageUrl || n.image_url) && !imageUrl) console.warn(`[Push] the picture of notification ${notificationId || '?'} is not a valid https address: sent without it`);
     const urgent = n.priority === 'urgent';
     const res = await fcm.sendEachForMulticast({
       tokens,
@@ -91,9 +111,16 @@ export const pushToUserDetailed = async (userId, n) => {
     });
 
     const dead = [];
+    const messageIds = [];
+    const byPlatform = {};
     const problems = new Map(); // error code -> how many devices (anything that is not just a stale token: wrong project, API off, ...)
     res.responses.forEach((r, i) => {
-      if (r.success) return;
+      if (r.success) {
+        if (r.messageId) messageIds.push(r.messageId);
+        const kind = rows[i]?.platform || 'unknown';
+        byPlatform[kind] = (byPlatform[kind] || 0) + 1;
+        return;
+      }
       if (DEAD_TOKEN_CODES.has(r.error?.code)) dead.push(tokens[i]);
       else problems.set(r.error?.code || 'unknown', (problems.get(r.error?.code || 'unknown') || 0) + 1);
     });
@@ -103,7 +130,7 @@ export const pushToUserDetailed = async (userId, n) => {
     if (dead.length) await supabaseAdmin.from('push_devices').delete().in('token', dead);
     const delivered = res.successCount;
     const reason = [...problems].map(([c, k]) => `${c} x${k}`).join(', ') || (dead.length ? 'The device registration had expired.' : null);
-    return { status: delivered > 0 ? 'sent' : 'failed', devices: tokens.length, delivered, error: delivered > 0 ? null : reason };
+    return { status: delivered > 0 ? 'sent' : 'failed', devices: tokens.length, delivered, error: delivered > 0 ? null : reason, messageIds, byPlatform };
   } catch (err) {
     console.warn('[Push] send failed:', err.message);
     return { status: 'failed', devices: 0, delivered: 0, error: String(err.message || 'Push failed').slice(0, 200) };

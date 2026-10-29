@@ -26,8 +26,8 @@ before(async () => {
   });
   mock.module('../src/services/push.service.js', {
     namedExports: {
-      pushToUserDetailed: async (userId, n) => {
-        pushLog.push({ userId, n });
+      pushToUserDetailed: async (userId, n, options) => {
+        pushLog.push({ userId, n, options });
         return pushImpl(userId, n);
       },
       pushToUser: async () => {},
@@ -200,6 +200,15 @@ test('urgent is stored, shown on the notification and sent with the push', async
   assert.equal(done.priority, 'urgent');
   assert.equal(received(C1)[0].priority, 'urgent');
   assert.ok(pushLog.every((p) => p.n.priority === 'urgent'));
+});
+
+test('"Mobile application" (the push channel) asks for Android and iPhone devices only; web-only sends no push at all', async () => {
+  await send(admin, form({ title: 'Mobile', channels: ['push'] }));
+  assert.ok(pushLog.length > 0);
+  assert.ok(pushLog.every((p) => JSON.stringify(p.options?.platforms) === JSON.stringify(['android', 'ios'])));
+  pushLog.length = 0;
+  await send(admin, form({ title: 'Web only', channels: ['web'] }));
+  assert.equal(pushLog.length, 0);
 });
 
 test('scheduled: stays pending, is not sent early, goes out once when due, and cannot be sent twice', async () => {

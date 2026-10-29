@@ -21,6 +21,11 @@ import { cleanDestination, linkFor, pageOptions } from './notification-destinati
 
 export const CATEGORIES = ['clients', 'staff', 'partners'];
 export const CHANNELS = ['web', 'push'];
+/**
+ * What each channel means. web = the web application: the notification in the app's bell, live over the socket. push = the MOBILE
+ * application: a Firebase push to the person's registered phones (Android and iPhone) only, never to a browser or to anybody else.
+ */
+export const MOBILE_PLATFORMS = ['android', 'ios'];
 export { STAFF_TYPES };
 /**
  * Who sits below whom, from the data the platform has: general office staff ('staff') supervise the production floor, and a master
@@ -381,7 +386,8 @@ const deliverChunk = async (broadcast, rows, now) => {
       imageUrl: broadcast.image_url || '', priority: urgent ? 'urgent' : 'normal',
       // the tap goes through the server's destination check (by notification id); the route is only a fallback for older apps
       link: linkOf(r.user_id).link, hasDestination: !!broadcast.destination,
-    });
+    }, { platforms: MOBILE_PLATFORMS });
+    r.push_message_ids = res.messageIds || [];
     r.push_devices = res.devices;
     r.push_status = res.status === 'off' ? 'failed' : res.status;
     if (res.status !== 'sent' && res.status !== 'no_device') r.error = `Push: ${res.error || 'not delivered'}`.slice(0, 200);
@@ -389,10 +395,13 @@ const deliverChunk = async (broadcast, rows, now) => {
   });
 
   for (const r of rows) {
-    const { error } = await supabaseAdmin.from('broadcast_deliveries').update({
+    const record = {
       web_status: r.web_status ?? null, push_status: r.push_status ?? null, push_devices: r.push_devices ?? 0,
       notification_id: r.notification_id ?? null, error: r.error ?? null, attempts: (r.attempts || 0) + 1, updated_at: new Date(now).toISOString(),
-    }).eq('id', r.id);
+    };
+    // Firebase's receipts (message ids) of the accepted pushes. Needs migration 0053; until it has run, everything else is still recorded.
+    let { error } = await supabaseAdmin.from('broadcast_deliveries').update(r.push_message_ids?.length ? { ...record, push_message_ids: r.push_message_ids } : record).eq('id', r.id);
+    if (error && r.push_message_ids?.length) ({ error } = await supabaseAdmin.from('broadcast_deliveries').update(record).eq('id', r.id));
     if (error) console.warn('[Broadcast] could not record a delivery:', error.message);
   }
 };

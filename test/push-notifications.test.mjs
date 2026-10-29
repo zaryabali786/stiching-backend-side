@@ -77,7 +77,8 @@ before(async () => {
       getMessaging: () => ({
         sendEachForMulticast: async (message) => {
           sent.push(...message.tokens.map((t) => ({ token: t, message })));
-          return { responses: message.tokens.map((t) => (failTokens.has(t) ? { success: false, error: { code: 'messaging/registration-token-not-registered' } } : { success: true })) };
+          const responses = message.tokens.map((t) => (failTokens.has(t) ? { success: false, error: { code: 'messaging/registration-token-not-registered' } } : { success: true, messageId: `projects/test/messages/${t.slice(0, 12)}` }));
+          return { responses, successCount: responses.filter((r) => r.success).length };
         },
       }),
     },
@@ -208,4 +209,62 @@ test('a user without devices, or an unknown user, is skipped quietly', async () 
   await notifications.notifyUser('nobody', { type: 'update', title: 'Hello' });
   await settle();
   assert.deepEqual(sent, []);
+});
+
+// ───────────── the Notification Center's "Mobile application" ─────────────
+
+const MOBILE = { platforms: ['android', 'ios'] };
+
+test('mobile push goes to Android and iPhone devices only: never to a browser, never to anybody else', async () => {
+  const webToken = `web-${'w'.repeat(30)}`;
+  const iosToken = `ios-${'i'.repeat(30)}`;
+  db.table('push_devices').push({ user_id: C2, token: webToken, platform: 'web', app: 'client' }, { user_id: C2, token: iosToken, platform: 'ios', app: 'client' });
+  const res = await push.pushToUserDetailed(C2, { id: 'n1', title: 'Hello', body: 'Body', type: 'broadcast' }, MOBILE);
+  assert.deepEqual(sent.map((s) => s.token).sort(), [iosToken, tok(C2, 1)].sort());
+  assert.ok(!sent.some((s) => s.token === webToken), 'the browser token is left alone');
+  assert.equal(res.status, 'sent');
+  assert.deepEqual(res.byPlatform, { android: 1, ios: 1 });
+  assert.equal(res.messageIds.length, 2, 'Firebase receipts are returned');
+  assert.deepEqual([...new Set(sent.map((s) => s.message.data.userId))], [C2]);
+});
+
+test('a person with only a browser registered has no mobile device: nothing is sent', async () => {
+  db.table('push_devices').splice(0, db.table('push_devices').length, { user_id: C1, token: `web-${'w'.repeat(30)}`, platform: 'web', app: 'client' });
+  const res = await push.pushToUserDetailed(C1, { id: 'n2', title: 'Hello' }, MOBILE);
+  assert.equal(res.status, 'no_device');
+  assert.deepEqual(sent, []);
+});
+
+test('without a platform limit every device is used, as before (order and chat pushes)', async () => {
+  db.table('push_devices').push({ user_id: C2, token: `web-${'w'.repeat(30)}`, platform: 'web', app: 'client' });
+  const res = await push.pushToUserDetailed(C2, { id: 'n3', title: 'Hello' });
+  assert.equal(res.devices, 2);
+});
+
+test('a picture is sent only as a safe https address; anything else goes out as a plain notification', async () => {
+  for (const bad of ['http://cdn.example.com/a.png', 'javascript:alert(1)', 'not a url', 'https://user:pw@cdn.example.com/a.png']) {
+    sent = [];
+    await push.pushToUserDetailed(C2, { id: 'n4', title: 'Hello', imageUrl: bad }, MOBILE);
+    const m = sent[0].message;
+    assert.equal(m.notification.imageUrl, undefined, bad);
+    assert.equal(m.android.notification.imageUrl, undefined);
+    assert.equal(m.apns.payload.aps['mutable-content'], undefined);
+  }
+  sent = [];
+  await push.pushToUserDetailed(C2, { id: 'n5', title: 'Hello', imageUrl: 'https://cdn.example.com/a.png' }, MOBILE);
+  const m = sent[0].message;
+  assert.equal(m.notification.imageUrl, 'https://cdn.example.com/a.png');
+  assert.equal(m.android.notification.imageUrl, 'https://cdn.example.com/a.png');
+  assert.equal(m.apns.payload.aps['mutable-content'], 1, 'iOS runs the notification service extension');
+  assert.equal(m.apns.fcmOptions.imageUrl, 'https://cdn.example.com/a.png');
+});
+
+test('the destination travels with the push: the notification id and the flag the app uses to ask the server where to go', async () => {
+  await push.pushToUserDetailed(C2, { id: 'n6', title: 'Hello', type: 'broadcast', link: '/app/orders', hasDestination: true }, MOBILE);
+  const m = sent[0].message;
+  assert.equal(m.data.notificationId, 'n6');
+  assert.equal(m.data.dest, '1');
+  assert.equal(m.data.link, '/app/orders');
+  await push.pushToUserDetailed(C2, { id: 'n7', title: 'Plain', type: 'broadcast' }, MOBILE);
+  assert.equal(sent.at(-1).message.data.dest, '');
 });
