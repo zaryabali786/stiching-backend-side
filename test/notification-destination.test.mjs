@@ -21,7 +21,7 @@ const tables = {
     { id: OTHER_ORDER, reference: 'SA-1002', customer_id: OTHER_CLIENT },
   ],
   shop_products: [
-    { id: PRODUCT, title: 'Linen shirt', store_id: STORE, sellable: true, hidden: false, handle: 'linen-shirt' },
+    { id: PRODUCT, title: 'Linen shirt', store_id: STORE, sellable: true, hidden: false, handle: 'linen-shirt', image_url: 'https://cdn.shopify.com/s/files/shirt.jpg?v=1' },
     { id: HIDDEN_PRODUCT, title: 'Secret', store_id: STORE, sellable: true, hidden: true, handle: 'secret' },
   ],
   shopify_stores: [{ id: STORE, shop_domain: 'brand.myshopify.com' }],
@@ -86,7 +86,7 @@ test('one order can only be linked for the client who owns it', async () => {
 
 test('a product is checked against the Shop rules and keeps its store', async () => {
   const d = await svc.cleanDestination({ type: 'product', product_id: PRODUCT }, toAllClients);
-  assert.deepEqual(d, { type: 'product', product_id: PRODUCT, store_id: STORE, label: 'Linen shirt' });
+  assert.deepEqual(d, { type: 'product', product_id: PRODUCT, store_id: STORE, label: 'Linen shirt', image_url: 'https://cdn.shopify.com/s/files/shirt.jpg?v=1' });
   await rejects(svc.cleanDestination({ type: 'product', product_id: HIDDEN_PRODUCT }, toAllClients), /not available/);
   await rejects(svc.cleanDestination({ type: 'product', product_id: U(98) }, toAllClients), /not available/);
   await rejects(svc.cleanDestination({ type: 'product', product_id: PRODUCT }, toStaff), /only be linked/);
@@ -198,4 +198,11 @@ test('the form is offered only the pages that exist for the audience', () => {
   assert.ok(!keys('staff').includes('order'));
   assert.deepEqual(keys('staff', 'partner').filter((k) => ['customers', 'reports'].includes(k)), []);
   assert.ok(keys('partners').includes('production'));
+});
+
+test('the product picture is made ready for a push: https only, a phone-sized width for the Shopify CDN', () => {
+  assert.equal(svc.productPicture('https://cdn.shopify.com/s/files/shirt.jpg?v=1'), 'https://cdn.shopify.com/s/files/shirt.jpg?v=1&width=800');
+  assert.equal(svc.productPicture('https://cdn.shopify.com/a.jpg?width=300'), 'https://cdn.shopify.com/a.jpg?width=300');
+  assert.equal(svc.productPicture('https://images.example.com/a.jpg'), 'https://images.example.com/a.jpg');
+  for (const bad of ['', null, 'http://cdn.shopify.com/a.jpg', 'javascript:alert(1)', 'https://u:p@cdn.shopify.com/a.jpg', 'nope']) assert.equal(svc.productPicture(bad), '');
 });

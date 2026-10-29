@@ -6,7 +6,7 @@ import { uploadDataUrls } from './storage.service.js';
 import { pushToUserDetailed } from './push.service.js';
 import { pageMeta } from '../utils/pagination.js';
 import { STAFF_TYPES } from './unit-flow.service.js';
-import { cleanDestination, linkFor, pageOptions } from './notification-destination.service.js';
+import { cleanDestination, linkFor, pageOptions, productPicture } from './notification-destination.service.js';
 
 /**
  * Notification Center: one "broadcast" is one message that an admin (to clients, staff or partners) or a partner (to its own
@@ -274,7 +274,12 @@ export const createBroadcast = async (actor, input, now = Date.now()) => {
   if (invalid.length) throw new ForbiddenError('Some of the selected people are not available to you.');
   if (!ids.length) throw new BadRequestError('Nobody is eligible to receive this notification.');
 
-  const image = await storeImage(`notifications/${actor.partnerId || 'admin'}`, input.image);
+  let image = await storeImage(`notifications/${actor.partnerId || 'admin'}`, input.image);
+  // a product link brings the product's own picture, unless the sender uploaded another one or switched it off (and may attach pictures)
+  if (!image.url && destination?.type === 'product' && input.use_product_image !== false && actor.can('image')) {
+    const picture = productPicture(destination.image_url);
+    if (picture) image = { url: picture, path: null };
+  }
   const row = {
     created_by: actor.userId,
     partner_id: actor.kind === 'partner' ? actor.partnerId : null,

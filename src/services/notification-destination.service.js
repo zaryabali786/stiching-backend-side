@@ -137,7 +137,7 @@ export const parseUrl = (raw) => {
 const loadShowableProduct = async (id) => {
   if (!UUID.test(String(id))) throw new BadRequestError('Choose a product.');
   const brands = await approvedBrands();
-  const { data: p } = await supabaseAdmin.from('shop_products').select('id, title, store_id, sellable, hidden').eq('id', id).maybeSingle();
+  const { data: p } = await supabaseAdmin.from('shop_products').select('id, title, store_id, sellable, hidden, image_url').eq('id', id).maybeSingle();
   if (!p || !p.sellable || p.hidden || !brands.has(p.store_id)) throw new NotFoundError('This product is not available.');
   return p;
 };
@@ -172,7 +172,22 @@ const parseStoreProductUrl = (text) => {
 
 // ───────────────────────────── creating ─────────────────────────────
 
-const productDestination = (p) => ({ type: 'product', product_id: p.id, store_id: p.store_id, label: p.title });
+const productDestination = (p) => ({ type: 'product', product_id: p.id, store_id: p.store_id, label: p.title, ...(p.image_url ? { image_url: p.image_url } : {}) });
+
+/**
+ * The product's own picture, made ready to travel in a push: https only, and a brand's Shopify picture is asked for at a phone-sized
+ * width (a push picture must stay small: the phone downloads it before showing the notification). '' = no usable picture.
+ */
+export const productPicture = (value) => {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || url.username || url.password) return '';
+    if (/(^|\.)cdn\.shopify\.com$/i.test(url.hostname) && !url.searchParams.has('width')) url.searchParams.set('width', '800');
+    return url.toString();
+  } catch {
+    return '';
+  }
+};
 
 const loadOrder = async (id) => {
   if (!UUID.test(String(id))) throw new BadRequestError('Choose an order.');
