@@ -76,13 +76,13 @@ export const settleShopIntent = async (intent) => {
   if (!order) return { status: 'unknown_order' };
   if (intent.status !== 'succeeded') return { status: 'not_paid' };
   if (intent.currency !== String(order.currency).toLowerCase() || (intent.amount_received ?? intent.amount) !== toMinorUnits(order.total, order.currency)) {
-    await notifyAdmins({ type: 'alert', title: `Shop payment mismatch ${order.reference}`, body: `Stripe took ${(intent.amount_received ?? intent.amount) / 100} ${intent.currency} but the order is ${order.total} ${order.currency}. Nothing was started: check it in Stripe.`, link: '/admin/ecommerce' }).catch(() => undefined);
+    await notifyAdmins({ type: 'alert', title: `Shop payment mismatch ${order.reference}`, body: `Stripe took ${(intent.amount_received ?? intent.amount) / 100} ${intent.currency} but the order is ${order.total} ${order.currency}. Nothing was started: check it in Stripe.`, link: '/admin/shop-orders' }).catch(() => undefined);
     return { status: 'mismatch' };
   }
   await supabaseAdmin.from('shop_payments').upsert({ shop_order_id: order.id, provider_ref: intent.id, amount: order.total, currency: order.currency, status: 'succeeded', updated_at: now() }, { onConflict: 'provider_ref' });
   if (order.payment_status === 'paid') {
     if (order.payment_intent_id && order.payment_intent_id !== intent.id) {
-      await notifyAdmins({ type: 'alert', title: `Shop order ${order.reference} was paid twice`, body: `A second payment (${intent.id}) succeeded for an order that was already paid. Refund one of them in Stripe.`, link: '/admin/ecommerce' }).catch(() => undefined);
+      await notifyAdmins({ type: 'alert', title: `Shop order ${order.reference} was paid twice`, body: `A second payment (${intent.id}) succeeded for an order that was already paid. Refund one of them in Stripe.`, link: '/admin/shop-orders' }).catch(() => undefined);
     }
     return { status: 'already_paid' };
   }
@@ -93,7 +93,7 @@ export const settleShopIntent = async (intent) => {
     // paid after the attempt was closed (a late payment): the order is revived, an administrator is told
     await supabaseAdmin.from('shop_orders').update({ cancelled_at: null }).eq('id', order.id);
     await supabaseAdmin.from('shop_brand_orders').update({ state: 'pending', commission_status: 'estimated' }).eq('shop_order_id', order.id).eq('state', 'cancelled');
-    await notifyAdmins({ type: 'alert', title: `Shop order ${order.reference} paid after it was closed`, body: 'The customer paid a payment that had been replaced by a newer attempt. The order was revived.', link: '/admin/ecommerce' }).catch(() => undefined);
+    await notifyAdmins({ type: 'alert', title: `Shop order ${order.reference} paid after it was closed`, body: 'The customer paid a payment that had been replaced by a newer attempt. The order was revived.', link: '/admin/shop-orders' }).catch(() => undefined);
   }
   await logEvent(order.id, `Payment of ${Number(order.total).toFixed(2)} ${order.currency} received.`);
   // the cart is emptied of what was bought
@@ -199,7 +199,7 @@ export const createBrandOrderInShopify = async (brandOrderId, { manual = false }
     const text = denied ? `The brand has not granted the permission to create orders (write_orders): ask it to open the install link again and approve. (${message})`.slice(0, 500) : message;
     await supabaseAdmin.from('shop_brand_orders').update({ state: 'failed', last_error: text, updated_at: now() }).eq('id', bo.id);
     await logEvent(order.id, `Could not create the order in the brand's store: ${text}`, bo.id);
-    await notifyAdmins({ type: 'alert', title: `Shop order ${order.reference}: a brand order failed`, body: text, link: '/admin/ecommerce' }).catch(() => undefined);
+    await notifyAdmins({ type: 'alert', title: `Shop order ${order.reference}: a brand order failed`, body: text, link: '/admin/shop-orders' }).catch(() => undefined);
   }
   await refreshParentStatus(order.id);
   const { data: after } = await supabaseAdmin.from('shop_brand_orders').select('*').eq('id', bo.id).single();
