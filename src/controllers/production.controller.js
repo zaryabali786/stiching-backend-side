@@ -617,17 +617,20 @@ export const scanComplete = catchAsync(async (req, res) => {
 export const getProductionReceiving = catchAsync(async (req, res) => {
   const role = await scanRoleFor(req);
   const stages = role.stage ? [role.stage] : Object.keys(PREVIOUS_STAGE);
-  const entries = [];
-  for (const stage of stages) {
-    const from = PREVIOUS_STAGE[stage];
-    const rows = unwrap(await scoped(req.access, supabaseAdmin.from('job_cards').select('order_id, stage').eq('stage', from).limit(300)));
-    const orderIds = [...new Set(rows.map((r) => r.order_id))].slice(0, 30);
-    // orders where the person already received some articles at this stage and has more to scan belong on the screen too
-    const recent = unwrap(await scoped(req.access, supabaseAdmin.from('unit_stage_receipts').select('order_id').eq('stage', stage).order('received_at', { ascending: false }).limit(60), 'partner_id'));
-    const ids = [...new Set([...orderIds, ...recent.map((r) => r.order_id)])].slice(0, 40);
-    const progress = await receivingProgress({ orderIds: ids, stage, userId: req.userId, member: role.member, role: role.role });
-    for (const p of progress) if (p.awaiting > 0 || (p.received > 0 && p.remaining > 0)) entries.push(p);
-  }
+  // the stages do not depend on each other: look them all up at once (one after the other made this screen take 5-6 seconds)
+  const perStage = await Promise.all(
+    stages.map(async (stage) => {
+      const from = PREVIOUS_STAGE[stage];
+      const rows = unwrap(await scoped(req.access, supabaseAdmin.from('job_cards').select('order_id, stage').eq('stage', from).limit(300)));
+      const orderIds = [...new Set(rows.map((r) => r.order_id))].slice(0, 30);
+      // orders where the person already received some articles at this stage and has more to scan belong on the screen too
+      const recent = unwrap(await scoped(req.access, supabaseAdmin.from('unit_stage_receipts').select('order_id').eq('stage', stage).order('received_at', { ascending: false }).limit(60), 'partner_id'));
+      const ids = [...new Set([...orderIds, ...recent.map((r) => r.order_id)])].slice(0, 40);
+      const progress = await receivingProgress({ orderIds: ids, stage, userId: req.userId, member: role.member, role: role.role });
+      return progress.filter((p) => p.awaiting > 0 || (p.received > 0 && p.remaining > 0));
+    }),
+  );
+  const entries = perStage.flat();
   entries.sort((a, b) => (b.awaiting > 0) - (a.awaiting > 0) || a.reference.localeCompare(b.reference));
   return ApiResponse.success(res, { role: role.role, supervisor: role.supervisor, stage: role.stage, stageLabel: role.stage ? STAGE_LABELS[role.stage] : null, orders: entries });
 });

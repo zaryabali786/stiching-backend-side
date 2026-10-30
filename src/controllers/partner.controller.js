@@ -1208,15 +1208,18 @@ export const getPartnerOrder = catchAsync(async (req, res) => {
  */
 export const getPartnerBadges = catchAsync(async (req, res) => {
   const zero = Promise.resolve({ count: 0 });
-  const [receiving, qc, warehouse, transfers, messages] = await Promise.all([
+  const [receiving, qc, warehouse, transfers, messages, toAssign] = await Promise.all([
     can(req.access, 'receiving.view') ? scoped(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).eq('status', 'submitted')) : zero,
     can(req.access, 'quality.view') ? scoped(req.access, supabaseAdmin.from('job_cards').select('id', { count: 'exact', head: true }).eq('stage', 'qc').eq('qc_passed', false)) : zero,
     can(req.access, 'warehouse.view') ? scoped(req.access, supabaseAdmin.from('orders').select('id', { count: 'exact', head: true }).eq('status', 'paid').is('partner_route', null)) : zero,
     can(req.access, 'warehouse.view') ? scoped(req.access, supabaseAdmin.from('transfers').select('id', { count: 'exact', head: true }).eq('status', 'open')) : zero,
     can(req.access, 'messages.view') ? unreadConversationCount(scopeOf(req.access), { excludeGeneral: !can(req.access, 'general_messages.view') }) : 0,
+    // new articles that reached Production and still wait for a master / tailor (the "To assign" tab)
+    can(req.access, 'production.view') ? scoped(req.access, supabaseAdmin.from('job_cards').select('id', { count: 'exact', head: true }).eq('stage', 'to_assign')) : zero,
   ]);
   return ApiResponse.success(res, {
     messages,
+    production: toAssign.count || 0,
     receiving: receiving.count || 0,
     qualityCheck: qc.count || 0,
     warehouse: (warehouse.count || 0) + (transfers.count || 0),

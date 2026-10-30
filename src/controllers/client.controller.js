@@ -262,13 +262,16 @@ const orderIdsWithArticles = async (userId, key) => {
   return [...new Set(rows.map((r) => r.order_id))];
 };
 
-/** Narrow an orders query to a status filter: a stage, a group (active / completed / draft), one status, or a return / hold. */
-const applyStatusFilter = async (query, userId, status) => {
+/** The orders a "return" / "hold" filter means (they depend on the articles, so they are looked up first; everything else is a plain filter). */
+const statusFilterIds = async (userId, status) => (status === 'return' || status === 'hold' ? orderIdsWithArticles(userId, status) : null);
+
+/**
+ * Adds the status filter to the query. Must stay synchronous: an async function hands back a promise, and awaiting a Supabase
+ * query builder RUNS it, so the caller got a result object instead of a builder and every search crashed with "query.or is not a function".
+ */
+const applyStatusFilter = (query, status, ids) => {
   if (!status) return query;
-  if (status === 'return' || status === 'hold') {
-    const ids = await orderIdsWithArticles(userId, status);
-    return query.in('id', ids.length ? ids : ['00000000-0000-0000-0000-000000000000']);
-  }
+  if (ids) return query.in('id', ids.length ? ids : ['00000000-0000-0000-0000-000000000000']);
   if (CLIENT_STAGES[status]) return query.in('status', CLIENT_STAGES[status]);
   if (STATUS_GROUPS[status]) return query.in('status', STATUS_GROUPS[status]);
   if (STATUS_LABELS[status]) return query.eq('status', status);
@@ -288,11 +291,12 @@ export const getClientOrders = catchAsync(async (req, res) => {
     .range(q.from, q.to);
 
   const status = req.query.status;
-  query = await applyStatusFilter(query, req.userId, status);
+  const statusIds = await statusFilterIds(req.userId, status);
+  query = applyStatusFilter(query, status, statusIds);
   if (q.search) query = query.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
   const rebuild = async (select) => {
     let qq = supabaseAdmin.from('orders').select(select, { count: 'exact' }).eq('customer_id', req.userId).order(q.sort, { ascending: q.ascending }).range(q.from, q.to);
-    qq = await applyStatusFilter(qq, req.userId, status);
+    qq = applyStatusFilter(qq, status, statusIds);
     if (q.search) qq = qq.or(ilikeAny(['reference', 'brand', 'brand_order_number', 'tracking_number'], q.search));
     return qq;
   };
