@@ -6,6 +6,7 @@ import { startPostexPolling } from './services/postex-tracking.service.js';
 import { startShopifyRetry } from './services/shopify-events.service.js';
 import { startShopCatalogTimer } from './services/shop-catalog.service.js';
 import { startShopOrderTimer } from './services/shop-orders.service.js';
+import { startReviewScheduler } from './services/review.service.js';
 import { startBroadcastScheduler } from './services/broadcast.service.js';
 
 const server = app.listen(config.port, () => {
@@ -30,6 +31,8 @@ startShopCatalogTimer();
 startShopOrderTimer();
 // Notification Center: scheduled notifications go out from here, never from a browser tab
 startBroadcastScheduler();
+// Customer reviews: the review email goes out from here, a few days after delivery
+startReviewScheduler();
 
 // Real-time order conversations share the HTTP server (same port, path /socket.io)
 initSocket(server);

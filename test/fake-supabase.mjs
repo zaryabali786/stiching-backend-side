@@ -35,10 +35,13 @@ export const createFakeDb = (seed = {}, { uniques = {} } = {}) => {
       lt(c, v) { state.filters.push((r) => r[c] !== undefined && r[c] !== null && String(r[c]) < String(v)); return api; },
       // simple "col.is.null,col.neq.X" lists are applied; anything with and(...) / not(...) stays a no-op as before
       or(expr) {
-        const terms = String(expr || '').split(',');
-        if (terms.length && terms.every((t) => /^[a-z_]+\.(is|eq|neq)\.[^.(),]+$/i.test(t))) {
+        const terms = String(expr || '').split(/,(?![^()]*\))/);
+        const ok = (t) => /^[a-z_]+\.(is|eq|neq)\.[^.(),]+$/i.test(t) || /^[a-z_]+\.ilike\..+$/i.test(t) || /^[a-z_]+\.in\.\(.*\)$/i.test(t);
+        if (terms.length && terms.every(ok)) {
           const fns = terms.map((t) => {
-            const [c, op, v] = t.split('.');
+            const [, c, op, v] = t.match(/^([a-z_]+)\.(is|eq|neq|ilike|in)\.(.*)$/i);
+            if (op === 'ilike') { const re = new RegExp(`^${v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*')}$`, 'i'); return (r) => re.test(String(r[c] ?? '')); }
+            if (op === 'in') { const set = v.slice(1, -1).split(','); return (r) => set.includes(r[c]); }
             return (r) => (op === 'is' ? (r[c] ?? null) === (v === 'null' ? null : v) : op === 'neq' ? r[c] !== v : r[c] === v);
           });
           state.filters.push((r) => fns.some((f) => f(r)));

@@ -6,6 +6,7 @@ import clientRoutes from './client.routes.js';
 import notificationRoutes from './notification.routes.js';
 import { authenticate, requireRole } from '../middlewares/auth.middleware.js';
 import { adminModuleGate, partnerPortalGateForAdmins } from '../middlewares/admin-modules.middleware.js';
+import { getReviewByToken, postReviewByToken } from '../controllers/review.controller.js';
 import { getPublicConfig } from '../controllers/auth.controller.js';
 import { getRedisStatus } from '../config/redis.js';
 import { pushEnabled } from '../services/push.service.js';
@@ -26,6 +27,10 @@ apiRouter.get('/health', (req, res) => {
 });
 
 apiRouter.get('/config', getPublicConfig);
+
+// Customer review: the link in the review email (a signed token names the invitation; no sign-in needed)
+apiRouter.get('/reviews/invite/:token', getReviewByToken);
+apiRouter.post('/reviews/invite/:token', postReviewByToken);
 
 // Inbound-mail provider webhook (forwarded brand emails) — authenticated by a shared secret, not a user token
 apiRouter.post('/inbound/email', inboundEmailWebhook);

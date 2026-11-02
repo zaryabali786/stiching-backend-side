@@ -14,6 +14,7 @@ export const ADMIN_MODULES = [
   { id: 'support', label: 'Support chat', description: 'General support conversations' },
   { id: 'warehouse', label: 'Warehouse', description: 'Admin warehouse: parcels, transfers, labels and handover' },
   { id: 'invoices', label: 'Invoices', description: 'Build and issue invoices, payments' },
+  { id: 'reviews', label: 'Customer reviews', description: 'Ratings and comments customers leave after delivery' },
   { id: 'reports', label: 'Reports', description: 'Revenue and order reports' },
   { id: 'customers', label: 'Customers', description: 'Customer list and details' },
   { id: 'partners', label: 'Partners & teams', description: 'Partners, their modules and their users; the partner portal' },

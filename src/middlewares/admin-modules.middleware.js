@@ -15,6 +15,7 @@ const MODULE_OF = {
   banners: 'app_builder', 'home-layout': 'app_builder',
   settings: 'settings', shopify: 'settings',
   'notification-center': 'notification_center',
+  reviews: 'reviews',
   badges: null,
   users: '*full*', 'admin-modules': '*full*', roles: '*full*',
 };

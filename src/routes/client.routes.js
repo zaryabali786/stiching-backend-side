@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { getOrderReview, postOrderReview } from '../controllers/review.controller.js';
 import { deleteShopCartItem, getShopCart, getShopFilters, getShopOrder, getShopOrders, getShopProduct, getShopProducts, postShopCheckout, postShopConfirmPayment, postShopRetryPayment, putShopCartItem } from '../controllers/shop.controller.js';
 import {
   getClientOverview,
@@ -68,6 +69,8 @@ router.get('/orders', getClientOrders);
 router.get('/orders/counts', getClientOrderCounts);
 router.post('/orders', createClientOrder);
 router.get('/orders/:id', getClientOrder);
+router.get('/orders/:id/review', getOrderReview);
+router.post('/orders/:id/review', postOrderReview);
 router.patch('/orders/:id', updateClientOrder);
 router.post('/orders/:id/approve-parcel', approveParcel);
 router.post('/orders/:id/units/:unitId/review', reviewArticle);
