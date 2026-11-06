@@ -15,7 +15,7 @@ import { invalidateProfile } from '../middlewares/auth.middleware.js';
 import { randomBytes } from 'node:crypto';
 import { notifyAdmins } from '../services/notification.service.js';
 import { addressForToken, getForwardAddress, tokenForCode } from '../services/order-import.service.js';
-import { deleteCustomerAccount } from '../services/account-deletion.service.js';
+import { deleteCustomerAccount, previewDeletion } from '../services/account-deletion.service.js';
 import { issueLoginCode, normaliseEmail, redeemLoginCode } from '../services/login-code.service.js';
 import { renderEmail, sendTransactionalEmail } from '../services/transactional-email.service.js';
 
@@ -300,11 +300,18 @@ export const changePassword = catchAsync(async (req, res) => {
  * stay without personal details (see services/account-deletion.service.js). Refused while an order is still in progress.
  */
 export const deleteMyAccount = catchAsync(async (req, res) => {
-  const { confirm, password, idToken, provider, name } = req.body || {};
+  const { confirm, password, idToken, provider, name, cancelOrders } = req.body || {};
   const profile = await UserModel.getProfile(req.userId);
   if (!profile) throw new UnauthorizedError('Account not found.');
-  await deleteCustomerAccount({ profile, confirm, password, idToken, provider, name });
+  await deleteCustomerAccount({ profile, confirm, password, idToken, provider, name, cancelOrders: cancelOrders === true });
   return ApiResponse.success(res, { deleted: true }, 'Your account has been deleted.');
+});
+
+/** GET /api/auth/delete-account/preview : the orders that would be cancelled, for the confirmation popup. */
+export const deleteAccountPreview = catchAsync(async (req, res) => {
+  const profile = await UserModel.getProfile(req.userId);
+  if (!profile) throw new UnauthorizedError('Account not found.');
+  return ApiResponse.success(res, await previewDeletion(profile));
 });
 
 // ───────── sign in with a one-time code sent to the customer's email ─────────

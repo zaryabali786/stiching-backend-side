@@ -12,6 +12,7 @@ import {
   resetPassword,
   changePassword,
   deleteMyAccount,
+  deleteAccountPreview,
   requestLoginCode,
   verifyLoginCode,
 } from '../controllers/auth.controller.js';
@@ -33,6 +34,7 @@ router.patch('/me', authenticate, updateMe);
 router.post('/change-password', authenticate, changePassword);
 router.post('/code/request', requestLoginCode);
 router.post('/code/verify', verifyLoginCode);
+router.get('/delete-account/preview', authenticate, deleteAccountPreview);
 router.post('/delete-account', authenticate, deleteMyAccount);
 router.post('/logout', authenticate, logout);
 
