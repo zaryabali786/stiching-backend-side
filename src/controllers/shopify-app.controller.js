@@ -74,7 +74,10 @@ const STEPS = [
 ];
 
 /** What the brand should know when the "show only this method" rule is not running (it needs a Shopify Plus store). */
-const shippingNote = (rule) => (rule && !rule.ok ? 'The "Ship to Stitch & Ship" option is in your store. Hiding your other shipping options at checkout needs Shopify Plus, so customers may still see them.' : null);
+const shippingNote = (rule) =>
+  rule && !rule.ok
+    ? `The "Ship to Stitch & Ship" option is in your store, but the rule that hides your other shipping options at checkout is not running, so customers may still see them. Reason: ${rule.error || 'unknown'}. (Shopify runs this rule only on Shopify Plus and development stores, unless the app is a public App Store app.)`
+    : null;
 
 const autoDone = (settings) => ({
   notifications: !!settings.webhooks?.ok,
