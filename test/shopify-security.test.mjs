@@ -81,7 +81,7 @@ test('access tokens are stored encrypted, each time differently, and a changed b
   assert.throws(() => sh.decryptToken('nonsense'));
 });
 
-// ───────────── one-time sign-in codes ─────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ one-time sign-in codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 test('a sign-in code works once, for its own email only', async () => {
   const code = await codes.issueLoginCode('ali@example.com');
@@ -125,7 +125,7 @@ test('emails are normalised and checked', () => {
   assert.equal(codes.normaliseEmail('a@b'), null);
 });
 
-// ───────────── install and the store's webhooks ─────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ install and the store's webhooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const withFetch = async (fake, fn) => {
   const real = globalThis.fetch;
@@ -181,7 +181,7 @@ test('Shopify refusing the code stops the install and stores nothing', async () 
   assert.equal(db.table('shopify_stores').length, 0);
 });
 
-// ───────────── the "Stitch&Ship available" tick box on products ─────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ the "Stitch&Ship available" tick box on products â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /** Fakes Shopify's GraphQL endpoint with one answer per call; records what was asked. */
 const withShopify = async (answer, run) => {
@@ -263,7 +263,7 @@ test('a store that has not approved write_payment_customizations is told what to
   });
 });
 
-// ───────────── the shipping method "Ship to Stitch & Ship" ─────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ the shipping method "Ship to Stitch & Ship" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const ONE_PK_PROFILE = (methods) => ({
   id: 'gid://shopify/DeliveryProfile/1',
@@ -317,9 +317,9 @@ test('the shipping method copies the Pakistan rates (cheapest named rate, all it
     assert.ok(created.every((m) => m.name === 'Ship to Stitch & Ship' && m.active === true));
     assert.deepEqual(created.map((m) => m.rateDefinition.price.amount), ['250.0', '400.0']);
     assert.deepEqual(created[0].weightConditionsToCreate, [{ operator: 'LESS_THAN_OR_EQUAL_TO', criteria: { value: 5, unit: 'KILOGRAMS' } }]);
-    assert.match(created[0].description, /includes a Stitch&Ship product/);
+    assert.match(created[0].description, /Select this shipping method if any product in your order has Stitch&Ship enabled/);
     assert.match(created[0].description, /House 12 Street 4, Unit 4, Lahore, Punjab, 54000, Pakistan/);
-    assert.match(created[0].description, /2-5 working days/);
+    assert.match(created[0].description, /2-8 working days/);
   });
 });
 
@@ -418,7 +418,7 @@ const PK_MARKET = { id: 'gid://shopify/Market/7', name: 'pakistan', status: 'ACT
 const flatOption = (name, amount, extra = {}) => ({ __typename: 'DeliveryFlatRateOptionDefinition', id: `gid://shopify/DeliveryFlatRateOptionDefinition/${name}`, currency: 'PKR', isActive: true, freeDeliveryMinimumValue: null, name, description: null, rateGroups: { nodes: [{ rate: { price: { amount, currencyCode: 'PKR' }, transitTimeMinSeconds: null, transitTimeMaxSeconds: null } }] }, ...extra });
 const marketDetail = (options, shipping = {}) => ({ id: PK_MARKET.id, name: 'pakistan', delivery: { shipping: { isEnabled: true, optionDefinitions: { nodes: options }, ...shipping } } });
 
-test('market-driven shipping: the method is added to the Pakistan market as a copy of its flat-rate option, 2-5 days, with the atelier address', async () => {
+test('market-driven shipping: the method is added to the Pakistan market as a copy of its flat-rate option, 2-8 days, with the atelier address', async () => {
   const detail = marketDetail([flatOption('flat shipping', '300.0', { freeDeliveryMinimumValue: { amount: '5000.0', currencyCode: 'PKR' } }), flatOption('Pricey', '900.0')]);
   await withShopify(marketsAnswer({ markets: [{ id: 'gid://shopify/Market/1', name: 'Canada', status: 'ACTIVE', conditions: { regionsCondition: { regions: { nodes: [{ code: 'CA' }] } } } }, PK_MARKET], detail }), async (asked) => {
     const r = await sh.ensureShippingMethod(aStore(), ATELIER_ROW);
@@ -429,8 +429,8 @@ test('market-driven shipping: the method is added to the Pakistan market as a co
     assert.equal(flat.name, 'Ship to Stitch & Ship');
     assert.equal(flat.currency, 'PKR');
     assert.deepEqual(flat.freeDeliveryMinimumValue, { amount: '5000.0', currencyCode: 'PKR' });
-    assert.deepEqual(flat.rateGroups, [{ rate: { price: { amount: '300.0', currencyCode: 'PKR' }, transitTimeMinSeconds: 172800, transitTimeMaxSeconds: 432000 } }]);
-    assert.match(flat.description, /includes a Stitch&Ship product/);
+    assert.deepEqual(flat.rateGroups, [{ rate: { price: { amount: '300.0', currencyCode: 'PKR' }, transitTimeMinSeconds: 172800, transitTimeMaxSeconds: 691200 } }]);
+    assert.match(flat.description, /Select this shipping method if any product in your order has Stitch&Ship enabled/);
     assert.match(flat.description, /House 12 Street 4, Unit 4, Lahore/);
     assert.ok(!asked.some((a) => /deliveryProfiles\(/.test(a.body.query)), 'the profile way is not needed');
   });
@@ -508,7 +508,7 @@ test('which products are enabled is read from Shopify, in one request, and only 
   });
 });
 
-// ───────────── letting go of our hold ─────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ letting go of our hold â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const hold = [{ fo: 'gid://shopify/FulfillmentOrder/1', hold: 'gid://shopify/FulfillmentHold/9' }];
 

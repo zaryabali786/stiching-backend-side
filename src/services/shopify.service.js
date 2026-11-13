@@ -311,7 +311,7 @@ const DELIVERY_FUNCTION_HANDLE = 'stitchship-delivery';
 export const shippingDescription = (atelier) => {
   const place = [atelier?.shipToCity, atelier?.shipToState, atelier?.shipToZip].filter(Boolean).join(', ');
   const address = [atelier?.shipToName, atelier?.shipToCompany, atelier?.shipToAddress, atelier?.shipToAddress2, place, atelier?.shipToCountry].filter(Boolean).join(', ');
-  return `This order includes a Stitch&Ship product, which needs to be delivered to our stitching atelier${address ? `: ${address}` : ''}. 2-5 working days.`.slice(0, 500);
+  return `Select this shipping method if any product in your order has Stitch&Ship enabled. Your order is then delivered to our stitching atelier${address ? `: ${address}` : ''}. 2-8 working days.`.slice(0, 500);
 };
 
 // Shopify refuses a query whose cost is over 1000, so the profiles are read one at a time: first the list, then each profile with its zones and rates.
@@ -435,8 +435,8 @@ const MARKETS_QUERY = `query { markets(first: 50) { nodes { id name status condi
 const MARKET_SHIPPING_QUERY = `query($id: ID!) { market(id: $id) { id name delivery { shipping { isEnabled optionDefinitions(first: 25) { nodes { __typename id currency isActive freeDeliveryMinimumValue { amount currencyCode }
   ... on DeliveryFlatRateOptionDefinition { name description rateGroups(first: 10) { nodes { rate { price { amount currencyCode } transitTimeMinSeconds transitTimeMaxSeconds } } } } } } } } } }`;
 const MARKET_UPDATE = `mutation($id: ID!, $input: MarketUpdateInput!) { marketUpdate(id: $id, input: $input) { market { id } userErrors { field message } } }`;
-const TRANSIT_MIN_SECONDS = 2 * 24 * 3600; // 2-5 working days
-const TRANSIT_MAX_SECONDS = 5 * 24 * 3600;
+const TRANSIT_MIN_SECONDS = 2 * 24 * 3600; // 2-8 working days
+const TRANSIT_MAX_SECONDS = 8 * 24 * 3600;
 
 /** Add the method to one market, a copy of its cheapest active flat-rate option (price, free-delivery threshold), or refresh its description. */
 const addMethodToMarket = async (store, market, description) => {
@@ -494,6 +494,16 @@ const ensureShippingViaMarkets = async (store, description) => {
       if (detail?.market) results.push(await addMethodToMarket(store, detail.market, description));
     }
     if (!results.length) return { handled: false, note: 'The Pakistan market could not be read.' };
+    // every OTHER market where the brand added a method with our name (by hand) gets the same text; a method is never created there
+    for (const m of markets.filter((x) => !pk.includes(x) && x.status !== 'DRAFT')) {
+      try {
+        const detail = await shopifyGraphql(store, MARKET_SHIPPING_QUERY, { id: m.id });
+        const options = detail?.market?.delivery?.shipping?.optionDefinitions?.nodes || [];
+        if (options.some((o) => o.name === SHIP_METHOD_NAME)) await addMethodToMarket(store, detail.market, description);
+      } catch (err) {
+        console.warn(`[Shopify] the text of "${SHIP_METHOD_NAME}" could not be updated in the market ${m.name}:`, err.message);
+      }
+    }
     const done = results.filter((r) => r.ok);
     if (done.length) return { handled: true, res: { ok: true, error: null, created: done.reduce((n, r) => n + (r.created || 0), 0), updated: done.reduce((n, r) => n + (r.updated || 0), 0) } };
     return { handled: true, res: { ok: false, error: results.map((r) => r.error).join(' ').slice(0, 700) } };
